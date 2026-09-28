@@ -1,0 +1,1199 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 修复：移除重复声明 —— 原文件把三条 @tailwind 指令写了两遍，
+   导致 preflight 与全部 utilities 在产物 CSS 里生成两次（体积翻倍且干扰 !important 覆盖可预测性）。 */
+
+/* ================================================================
+   UI 精修 · 设计令牌（2026-09-09）
+   纯视觉层：只引入变量与增强规则，不触碰任何页面业务逻辑。
+   品牌基调沿用项目既有企业蓝白（主色 #4D9EFF / 强调 #2E7CF0），
+   功能语义色只保留 amber(警告) / red(危险)，不引入新彩色。
+   ================================================================ */
+:root {
+  /* —— 品牌蓝色阶（统一深浅层次，替代散落的 #1677ff/#3b82f6/#2563eb）—— */
+  --brand-050: #F0F7FF;
+  --brand-100: #E1F0FF;
+  --brand-200: #B9DCFF;
+  --brand-300: #8FC5FF;
+  --brand-400: #5FAEFF;
+  --brand-500: #4D9EFF;   /* 主色（项目既有，保持不变） */
+  --brand-600: #2E7CF0;   /* hover/深档（项目既有） */
+  --brand-700: #1F66D6;
+
+  /* —— 中性色阶 —— */
+  --ink-900: #1d2129;   /* 主标题/正文最高级 */
+  --ink-700: #4e5969;   /* 正文次级 */
+  --ink-500: #86909c;   /* 说明文字 */
+  --ink-400: #a9aeb8;   /* 弱化占位 */
+  --line-200: #e5e6eb;  /* 常规描边 */
+  --line-100: #f2f3f5;  /* 内部细分隔 */
+
+  /* —— 圆角 —— */
+  --radius-lg: 14px;
+  --radius-md: 10px;
+  --radius-sm: 8px;
+
+  /* —— 阴影（双层柔和：环境 + 弥散）—— */
+  --shadow-card: 0 1px 2px rgba(16,24,40,.05), 0 8px 26px -8px rgba(16,24,40,.06);
+  --shadow-float: 0 2px 4px rgba(16,24,40,.05), 0 16px 40px -12px rgba(16,24,40,.12);
+  --shadow-brand: 0 4px 14px rgba(77,158,255,.28);
+}
+
+:root {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif;
+  color: #1d2129;
+  background: #f4f6f9;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+/* 数字/时间默认等宽数字，避免跳动（页面内 tabular-nums 类已启用，这里全局兜底） */
+.num, .stat-value, .hd-clock-time, .hd-weather-temp, .text-2xl, .text-3xl, .text-xl {
+  font-variant-numeric: tabular-nums;
+}
+* {
+  box-sizing: border-box;
+}
+html {
+  scroll-behavior: smooth;
+}
+html, body, #app, .ops-app {
+  min-height: 100%;
+  margin: 0;
+}
+body {
+  min-width: 320px;
+  overflow-x: hidden;
+}
+button, input, textarea, select {
+  font: inherit;
+}
+button {
+  cursor: pointer;
+}
+button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
+  outline: 2px solid #2E7CF0;
+  outline-offset: 3px;
+}
+
+/* ====== 运维工作台壳层（主题3 OPS 版） ====== */
+.workspace-shell {
+  display: flex;
+  min-height: 100vh;
+  color: #1d2129;
+  background: #f2f3f5;
+  /* 入场动画刻意不写 fill-mode（原来是 both）：both 会让 Chrome 在动画播完后
+     把 transform 保留成 matrix(1, 0, 0, 1, 0, 0)，而非 none 的 transform 会让
+     本元素成为 position:fixed 后代的包含块 —— 页面内所有弹窗都会被按「整页高度」
+     居中，落到页面很下方，看起来就是"弹窗没固定住"。
+     去掉 fill-mode 后，动画结束即释放该属性，终值回到元素自身样式
+     （opacity:1 / transform:none），入场观感不变，弹窗恢复按视口定位。 */
+  animation: workspace-appear .45s ease;
+}
+.workspace-sidebar {
+  position: sticky;
+  top: 0;
+  display: flex;
+  width: 238px;
+  height: 100vh;
+  flex: none;
+  flex-direction: column;
+  padding: 21px 14px;
+  border-right: 1px solid #e5e6eb;
+  color: #4e5969;
+  background: #ffffff;
+}
+.workspace-brand {
+  display: flex;
+  height: 50px;
+  align-items: center;
+  gap: 12px;
+  padding: 0 8px;
+  border: 0;
+  color: #1d2129;
+  background: transparent;
+  text-align: left;
+  font: 600 11px Rajdhani, monospace;
+  letter-spacing: .13em;
+}
+.workspace-brand b {
+  display: block;
+  width: 36px;
+  height: 36px;
+  background: url('/brand/vequo-app-icon.svg') center/contain no-repeat;
+}
+.workspace-sidebar nav {
+  display: grid;
+  gap: 5px;
+  margin-top: 34px;
+}
+.workspace-sidebar nav button, .back-home {
+  position: relative;
+  display: flex;
+  height: 46px;
+  align-items: center;
+  gap: 13px;
+  padding: 0 13px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  color: #4e5969;
+  background: transparent;
+  text-align: left;
+  font-size: 13px;
+  transition: .18s;
+}
+.workspace-sidebar nav button:hover, .back-home:hover {
+  border-color: transparent;
+  color: #1d2129;
+  background: #f2f3f5;
+  transform: translateY(-1px);
+}
+.workspace-sidebar nav button.active {
+  border-color: transparent;
+  color: #1677ff;
+  background: #e8f3ff;
+  font-weight: 600;
+}
+/* 精修：active 导航左侧加品牌色指示条 + 图标底色轻微加深，增强层级感 */
+.workspace-sidebar nav button.active::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3.5px;
+  height: 18px;
+  border-radius: 0 4px 4px 0;
+  background: #4D9EFF;
+  box-shadow: 0 0 8px rgba(77, 158, 255, .45);
+}
+.workspace-sidebar nav button.active i {
+  color: #2E7CF0;
+}
+.workspace-sidebar i {
+  width: 20px;
+  font-size: 18px;
+  font-style: normal;
+  text-align: center;
+}
+/* 侧栏消息中心未读角标 */
+.workspace-sidebar nav button { position: relative; }
+.menu-unread {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  min-width: 16px;
+  height: 15px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: #f53f3f;
+  color: #fff;
+  font-size: 9.5px;
+  font-weight: 600;
+  font-style: normal;
+  line-height: 15px;
+  text-align: center;
+  box-shadow: 0 0 0 2px #fff;
+}
+.back-home {
+  margin-top: auto;
+  width: 100%;
+  color: #86909c;
+}
+/* ====== 可收纳侧边栏（折叠态：只显示图标 + 折叠按钮，宽 238 → 76） ====== */
+.workspace-sidebar {
+  transition:
+    width .35s cubic-bezier(.4, 0, .2, 1),
+    padding .35s cubic-bezier(.4, 0, .2, 1),
+    border-color .35s ease;
+  will-change: width;
+}
+.workspace-sidebar.collapsed {
+  width: 76px;
+  padding: 21px 10px;
+}
+.sidebar-head {
+  display: flex;
+  align-items: center;
+  flex-direction: row;
+  justify-content: space-between;
+  gap: 6px;
+  min-height: 50px;
+  transition: gap .35s cubic-bezier(.4, 0, .2, 1);
+}
+.workspace-sidebar.collapsed .sidebar-head {
+  flex-direction: column;
+  justify-content: flex-start;
+  gap: 14px;
+  min-height: 0;
+}
+.workspace-brand {
+  flex: 1;
+  min-width: 0;
+  order: 1;
+  transition:
+    gap .35s cubic-bezier(.4, 0, .2, 1),
+    padding .35s cubic-bezier(.4, 0, .2, 1),
+    justify-content .35s cubic-bezier(.4, 0, .2, 1);
+}
+.workspace-brand b {
+  transition: width .35s cubic-bezier(.4, 0, .2, 1), height .35s cubic-bezier(.4, 0, .2, 1), font-size .35s cubic-bezier(.4, 0, .2, 1);
+}
+.workspace-brand span {
+  display: inline-block;
+  white-space: nowrap;
+  overflow: hidden;
+  max-width: 180px;
+  opacity: 1;
+  transition:
+    max-width .35s cubic-bezier(.4, 0, .2, 1),
+    opacity .14s ease .05s;
+}
+.workspace-sidebar.collapsed .workspace-brand {
+  gap: 0;
+  padding: 0;
+}
+.workspace-sidebar.collapsed .workspace-brand b {
+  width: 30px;
+  height: 30px;
+}
+.workspace-sidebar.collapsed .workspace-brand span {
+  max-width: 0;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    max-width .35s cubic-bezier(.4, 0, .2, 1),
+    opacity .12s ease 0s;
+}
+.sidebar-toggle {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  place-items: center;
+  order: 2;
+  border: 1px solid #c9cdd4;
+  border-radius: 9px;
+  background: #fff;
+  color: #4e5969;
+  cursor: pointer;
+  transition:
+    background .18s ease,
+    border-color .18s ease,
+    color .18s ease,
+    box-shadow .18s ease,
+    transform .12s ease;
+}
+.sidebar-toggle:hover {
+  border-color: #1677ff;
+  color: #1d2129;
+  background: #ffffff;
+  box-shadow: 0 4px 12px rgba(77, 158, 255, .12);
+}
+.sidebar-toggle:active {
+  transform: scale(.94);
+}
+.toggle-icon {
+  display: inline-block;
+  font-size: 14px;
+  font-weight: 700;
+  font-family: Rajdhani, sans-serif;
+  line-height: 1;
+  transition: transform .35s cubic-bezier(.4, 0, .2, 1);
+}
+.workspace-sidebar.collapsed .sidebar-toggle {
+  order: 1;
+}
+.workspace-sidebar.collapsed .toggle-icon {
+  transform: rotate(180deg);
+}
+.workspace-sidebar nav button, .back-home {
+  transition:
+    padding .35s cubic-bezier(.4, 0, .2, 1),
+    gap .35s cubic-bezier(.4, 0, .2, 1),
+    justify-content .35s cubic-bezier(.4, 0, .2, 1),
+    background .18s ease,
+    color .18s ease,
+    border-color .18s ease,
+    box-shadow .18s ease;
+}
+.workspace-sidebar nav button i, .workspace-sidebar .back-home i {
+  transition: font-size .35s cubic-bezier(.4, 0, .2, 1);
+}
+.workspace-sidebar.collapsed nav button,
+.workspace-sidebar.collapsed .back-home {
+  justify-content: center;
+  padding: 0;
+  gap: 0;
+}
+.workspace-sidebar.collapsed nav button i,
+.workspace-sidebar.collapsed .back-home i {
+  font-size: 20px;
+}
+.workspace-sidebar nav button span,
+.workspace-sidebar .back-home span {
+  white-space: nowrap;
+  overflow: hidden;
+  max-width: 180px;
+  opacity: 1;
+  transition:
+    max-width .35s cubic-bezier(.4, 0, .2, 1),
+    opacity .14s ease .05s;
+}
+.workspace-sidebar.collapsed nav button span,
+.workspace-sidebar.collapsed .back-home span {
+  max-width: 0;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    max-width .35s cubic-bezier(.4, 0, .2, 1),
+    opacity .12s ease 0s;
+}
+.workspace-shell > main {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+.workspace-header {
+  position: relative;
+  z-index: 45;  /* backdrop-filter 会创建独立层叠上下文；不提升层级时，
+                  会被窄屏 fixed 的页面浮层（如业务知识页业务域面板 z40）盖住，
+                  导致右上角账户菜单被遮挡。45 > 40 保证 header 子树始终在上。 */
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  min-height: 64px;
+  padding: 10px 28px;
+  border-bottom: 1px solid #e5e6eb;
+  background: rgba(255, 255, 255, .9);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+.hd-title {
+  flex: none;
+  min-width: 0;
+}
+.workspace-header small {
+  display: block;
+  color: #a9aeb8;
+  font: 600 9px Rajdhani, monospace;
+  letter-spacing: .15em;
+}
+.workspace-header h1 {
+  margin: 2px 0 0;
+  color: #1d2129;
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.workspace-tools {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: #4e5969;
+  font-size: 11px;
+}
+.workspace-tools button {
+  min-height: 36px;
+  padding: 0 15px;
+  border: 1px solid #c9cdd4;
+  border-radius: 8px;
+  color: #1d2129;
+  background: #ffffff;
+  transition: background .18s ease, border-color .18s ease, color .18s ease, transform .18s ease, box-shadow .18s ease;
+}
+.workspace-tools button:hover {
+  border-color: #1677ff;
+  color: #1677ff;
+  background: #e8f3ff;
+  transform: translateY(-1px);
+  box-shadow: 0 8px 20px rgba(77, 158, 255, .12);
+}
+.workspace-tools .ask-entry {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.workspace-tools .ask-entry i {
+  font-style: normal;
+  font-size: 15px;
+  line-height: 1;
+}
+.hd-clock,
+.hd-weather {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 8px;
+  color: #4e5969;
+  font-size: 12px;
+  background: transparent;
+  white-space: nowrap;
+}
+.hd-clock-time {
+  font-family: Rajdhani, ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: .02em;
+  color: #1d2129;
+}
+.hd-clock-date {
+  color: #a9aeb8;
+  font-size: 11px;
+}
+.hd-weather-temp {
+  font-family: Rajdhani, sans-serif;
+  font-size: 14px;
+  font-weight: 600;
+  color: #1d2129;
+  font-variant-numeric: tabular-nums;
+}
+.hd-weather-city {
+  color: #86909c;
+  font-size: 11px;
+}
+.hd-weather {
+  cursor: default;
+}
+/* 数据库在线徽标（保留当前语义，改企业蓝配色） */
+.hd-online {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid #e5e6eb;
+  border-radius: 14px;
+  color: #86909c;
+  font-size: 11px;
+  background: #ffffff;
+  white-space: nowrap;
+}
+.hd-online i {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+  background: #4D9EFF;
+  box-shadow: 0 0 0 3px rgba(77, 158, 255, .18);
+}
+.workspace-tools .ops-user-button {
+  position: relative;
+  display: grid;
+  width: 36px;
+  height: 36px;
+  min-height: 36px;
+  padding: 0;
+  overflow: hidden;
+  place-items: center;
+  border: 1px solid #4D9EFF;
+  border-radius: 50%;
+  color: #fff;
+  background: #4D9EFF;
+}
+.workspace-tools .ops-user-button:hover, .workspace-tools .ops-user-button.active {
+  border-color: #2E7CF0;
+  box-shadow: 0 0 0 4px rgba(77, 158, 255, .18);
+  background: #2E7CF0;
+}
+.ops-user-button img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.ops-user-button b {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  place-items: center;
+  border-radius: 0;
+  background: transparent;
+  font-size: 12px;
+  color: #fff;
+}
+.workspace-tools .ops-user-button:hover b, .workspace-tools .ops-user-button.active b {
+  color: #fff;
+}
+.workspace-content {
+  padding: 16px 20px 22px;
+  flex: 1;
+  /* 内容面板：浅灰蓝底铺满整列，顶部淡蓝光影 */
+  background:
+    radial-gradient(1100px 480px at 100% -80px, rgba(77, 158, 255, .10), transparent 62%),
+    linear-gradient(180deg, #f7f8fa 0%, #f2f3f5 100%);
+}
+
+/* ============================================================
+   页面统一主题（企业蓝白）：
+   不修改任何页面业务代码，仅用 !important 把 Tailwind 默认
+   多色统一映射到品牌蓝白色系，使壳层与页面内部视觉一致。
+   —— 语义保留：amber/orange(警告)、red/rose(危险/警示) 不压制；
+   —— 层次保留：浅底 chip 不再统一成死灰，蓝系浅底映射为品牌淡蓝，
+      强调文字映射为品牌深蓝，视觉更有层级（2026-09-09 精修）。
+   ============================================================ */
+
+/* 1. 多色渐变卡片 → 统一米白卡片（token 阴影，比原灰影更通透）。
+      排除 bg-clip-text 的渐变【文字】（如 OverviewPage「Vequo」品牌字），
+      避免把文字渐变误压成白底透明字（2026-09-09 修复）。 */
+.workspace-content [class*="bg-gradient-to-br"]:not([class*="bg-clip-text"]),
+.workspace-content [class*="bg-gradient-to-r"]:not([class*="bg-clip-text"]),
+.workspace-content [class*="bg-gradient-to-l"]:not([class*="bg-clip-text"]),
+.workspace-content [class*="bg-gradient-to-t"]:not([class*="bg-clip-text"]) {
+  border-color: #e5e6eb !important;
+  background: #ffffff !important;
+  background-image: none !important;
+  box-shadow: var(--shadow-card) !important;
+}
+/* 渐变文字保留原语义（品牌字效果），同时显式禁止其背景透明化 */
+.workspace-content [class*="bg-clip-text"] {
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent !important;
+}
+
+/* 2. 蓝系浅底徽章/标签 → 品牌淡蓝底（不再压成死灰），紫/靛/青同族并入品牌蓝；
+      非蓝系杂色浅底（orange/rose/pink）继续压灰保持收敛；
+      amber/red/green 语义浅底保留不压制（与历史行为一致）。 */
+/* 修复（P0）：原用 [class*="bg-blue-50"] 子串匹配，而 CSS 属性选择器 *= 是子串匹配 ——
+   "bg-blue-500" 里包含 "bg-blue-50"，导致实底按钮/状态圆点/进度条被强制改成浅底深字
+   （实测 9 处命中：AskPage 状态圆点与进度条、DataPage ER 图例、KnowledgePage 选中态）。
+   改为 ~= 精确整词匹配，并单独匹配 bg-*-50/xx 透明度变体（带斜杠，绝不会命中 -500）。 */
+.workspace-content [class~="bg-blue-50"], .workspace-content [class*="bg-blue-50/"],
+.workspace-content [class~="bg-indigo-50"], .workspace-content [class*="bg-indigo-50/"],
+.workspace-content [class~="bg-purple-50"], .workspace-content [class*="bg-purple-50/"],
+.workspace-content [class~="bg-cyan-50"], .workspace-content [class*="bg-cyan-50/"],
+.workspace-content [class~="bg-sky-50"], .workspace-content [class*="bg-sky-50/"] {
+  background: var(--brand-050) !important;
+  color: var(--brand-700) !important;
+}
+.workspace-content [class~="bg-orange-50"], .workspace-content [class*="bg-orange-50/"],
+.workspace-content [class~="bg-rose-50"], .workspace-content [class*="bg-rose-50/"],
+.workspace-content [class~="bg-pink-50"], .workspace-content [class*="bg-pink-50/"] {
+  background: #f2f3f5 !important;
+}
+
+/* 3. 强调文字（600/700）→ 品牌深蓝；次要（500）→ 品牌中蓝（保留层次）；
+      non-blue 杂色文字保持原有收敛（不恢复多彩） */
+.workspace-content [class*="text-blue-600"],
+.workspace-content [class*="text-indigo-600"],
+.workspace-content [class*="text-purple-600"],
+.workspace-content [class*="text-cyan-600"] {
+  color: var(--brand-600) !important;
+}
+.workspace-content [class*="text-blue-700"],
+.workspace-content [class*="text-indigo-700"],
+.workspace-content [class*="text-purple-700"] {
+  color: var(--brand-700) !important;
+}
+.workspace-content [class*="text-blue-500"],
+.workspace-content [class*="text-indigo-500"],
+.workspace-content [class*="text-purple-500"],
+.workspace-content [class*="text-cyan-500"] {
+  color: var(--brand-500) !important;
+}
+.workspace-content [class*="text-orange-600"],
+.workspace-content [class*="text-orange-500"] {
+  color: #4e5969 !important;
+}
+
+/* 4. 彩色实底按钮/强调块 → 柔和浅蓝（保留 red/rose 危险、amber/orange 警告语义） */
+.workspace-content [class*="bg-indigo-600"],
+.workspace-content [class*="bg-blue-600"],
+.workspace-content [class*="bg-purple-600"],
+.workspace-content [class*="bg-indigo-500"],
+.workspace-content [class*="bg-blue-600"],
+.workspace-content [class*="bg-cyan-600"] {
+  background: #4D9EFF !important;
+  color: #ffffff !important;
+  transition: background .18s ease, box-shadow .18s ease, transform .12s ease !important;
+}
+.workspace-content [class*="bg-indigo-600"]:hover,
+.workspace-content [class*="bg-blue-600"]:hover,
+.workspace-content [class*="bg-purple-600"]:hover,
+.workspace-content [class*="bg-blue-600"]:hover,
+.workspace-content [class*="bg-cyan-600"]:hover {
+  background: #2E7CF0 !important;
+  box-shadow: 0 6px 16px -4px rgba(46, 124, 240, .5) !important;
+}
+.workspace-content [class*="bg-indigo-600"]:active,
+.workspace-content [class*="bg-blue-600"]:active,
+.workspace-content [class*="bg-purple-600"]:active,
+.workspace-content [class*="bg-blue-600"]:active,
+.workspace-content [class*="bg-cyan-600"]:active {
+  transform: scale(.98);
+}
+
+/* 5. 彩色边框 → 统一浅灰描边（保留 green/emerald、amber、red 语义边框） */
+.workspace-content [class*="border-blue-"],
+.workspace-content [class*="border-purple-"],
+.workspace-content [class*="border-indigo-"],
+.workspace-content [class*="border-orange-"],
+.workspace-content [class*="border-teal-"],
+.workspace-content [class*="border-cyan-"],
+.workspace-content [class*="border-sky-"] {
+  border-color: #e5e6eb !important;
+}
+
+/* 6. 通用卡片 / 输入 / 主色反色（保留原项目规则，阴影 token 化） */
+.workspace-content .stat-card, .workspace-content .signal-card, .workspace-content .quick-card, .workspace-content .command-card, .workspace-content .vector-space-shell {
+  border-color: #e5e6eb !important;
+  border-radius: var(--radius-lg) !important;
+  background: #ffffff !important;
+  box-shadow: var(--shadow-card) !important;
+}
+.workspace-content [class*=bg-white], .workspace-content [class*=bg-gray-50] {
+  color: #1d2129;
+  background: #ffffff !important;
+}
+.workspace-content [class*=text-gray-] {
+  color: #4e5969;
+}
+/* 白卡片内默认正文用深蓝灰而非墨绿 */
+.workspace-content [class*=bg-white] .text-gray-800,
+.workspace-content [class*=bg-white] .text-gray-700,
+.workspace-content [class*=bg-white] .text-gray-900 {
+  color: #1d2129;
+}
+.workspace-content input, .workspace-content textarea, .workspace-content select {
+  border-color: #c9cdd4 !important;
+  color: #1d2129 !important;
+  background: #fff !important;
+  transition: border-color .18s ease, box-shadow .18s ease !important;
+}
+.workspace-content input:focus, .workspace-content textarea:focus, .workspace-content select:focus {
+  border-color: #4D9EFF !important;
+  box-shadow: 0 0 0 3px rgba(77, 158, 255, .18) !important;
+}
+.workspace-content .bg-primary {
+  color: #ffffff !important;
+  background: #4D9EFF !important;
+}
+.workspace-content .bg-primary:hover {
+  background: #2E7CF0 !important;
+}
+
+@keyframes workspace-appear {
+  from { opacity: .35; transform: translateY(-7px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* ====== 全局微动效（保留原项目） ====== */
+.card-hover {
+  transition: transform 0.25s ease, box-shadow 0.25s ease;
+}
+.card-hover:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 25px -8px rgba(0, 0, 0, 0.1);
+}
+.btn-ripple {
+  position: relative;
+  overflow: hidden;
+}
+.btn-ripple::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle at var(--x, 50%) var(--y, 50%), rgba(255, 255, 255, 0.3) 0%, transparent 60%);
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+.btn-ripple:active::after {
+  opacity: 1;
+}
+.number-glow {
+  background: linear-gradient(135deg, #2563eb, #7c3aed);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ================================================================
+   UI 精修 · 增强区（2026-09-09）
+   对既有组件语义类的纯视觉增强：不新增 DOM、不依赖模板类名，
+   全部以「层叠补充」方式叠加在组件既有样式之上。
+   ================================================================ */
+
+/* —— 1. 全局细滚动条（内容区 + 代码块 + 图表卡内滚动）—— */
+.workspace-content ::-webkit-scrollbar,
+.workspace-content::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.workspace-content ::-webkit-scrollbar-track,
+.workspace-content::-webkit-scrollbar-track {
+  background: transparent;
+}
+.workspace-content ::-webkit-scrollbar-thumb,
+.workspace-content::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: rgba(77, 158, 255, .35);
+  background-clip: content-box;
+}
+.workspace-content ::-webkit-scrollbar-thumb:hover,
+.workspace-content::-webkit-scrollbar-thumb:hover {
+  background: rgba(46, 124, 240, .55);
+  background-clip: content-box;
+}
+
+/* —— 2. 卡片 hover 浮起（复用既有 .card-hover 钩子，增强视觉层级）—— */
+.card-hover {
+  box-shadow: var(--shadow-card);
+  border-color: var(--line-200);
+}
+.card-hover:hover {
+  transform: translateY(-2px);
+  border-color: var(--brand-200) !important;
+  box-shadow: var(--shadow-float) !important;
+}
+
+/* —— 3. 白底卡片统一细腻描边 + 柔和投影（供 Tailwind 卡片类增强）—— */
+.workspace-content [class*="rounded-xl"][class*="border"]:not([class*="!"]),
+.workspace-content [class*="rounded-2xl"][class*="border"] {
+  transition: box-shadow .25s ease, border-color .25s ease, transform .25s ease;
+}
+
+/* —— 4. 深色代码块柔和圆角（问析 SQL 卡）—— */
+.tk-sql, .sql-code {
+  border: 1px solid rgba(148, 163, 184, .18);
+  border-radius: 10px;
+}
+
+/* —— 5. 链接 hover 下划线动效（内容区文字链接）—— */
+.workspace-content a:not([class*="btn"]):not([class*="button"]):hover {
+  text-decoration-color: rgba(46, 124, 240, .5);
+}
+
+/* —— 6. 骨架屏 shimmer（覆盖 tailwind animate-pulse，更精致）—— */
+.workspace-content .animate-pulse {
+  position: relative;
+  overflow: hidden;
+  background: linear-gradient(90deg, #eef1f5 25%, #e4e9ef 50%, #eef1f5 75%) !important;
+  background-size: 200% 100% !important;
+  animation: ui-shimmer 1.5s infinite !important;
+}
+@keyframes ui-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* —— 7.（页面 .ov-rise 由各自 scoped 定义，此处不再全局注入，避免同名覆盖）—— */
+
+/* —— 8. 侧栏品牌 logo 微光 —— */
+.workspace-brand b {
+  box-shadow: 0 2px 8px rgba(29, 33, 41, .18);
+}
+
+/* —— 9. 表格表头行 hover 语义（若页面用原生 table）—— */
+.workspace-content table thead th {
+  background: #f7f9fc !important;
+  font-weight: 600;
+  letter-spacing: .02em;
+}
+.workspace-content table tbody tr:hover {
+  background: var(--brand-050) !important;
+}
+
+/* —— 10. 数字强调（大数字区域可用）—— */
+.stat-value, .big-number {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -.01em;
+}
+
+@media (max-width: 700px) {
+  .workspace-sidebar { width: 70px; padding: 18px 9px; }
+  .workspace-sidebar span, .workspace-sidebar .back-home { font-size: 0; }
+  .workspace-brand { justify-content: center; padding: 0; }
+  .workspace-sidebar nav button { justify-content: center; padding: 0; }
+  .workspace-header { padding: 19px 16px; }
+  .workspace-tools span, .workspace-tools button { display: none; }
+  .workspace-content { padding: 20px 14px 40px; }
+  /* 管理员分组标签：窄屏只留盾牌图标（顶栏标题区的「管理员」徽标仍可见，身份不丢失） */
+  .admin-menu-divider { justify-content: center; padding: 0; margin: 10px 0 2px; }
+  .admin-menu-divider::after, .admin-menu-divider .divider-label { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  .workspace-shell { animation-duration: .01ms; }
+}
+
+/* ============================================================
+   11. 管理员主题（.workspace-shell.admin-theme）
+   设计目标：与普通员工「浅蓝白」界面形成一眼可辨的对比 ——
+   深靛蓝侧栏 + 琥珀金强调色（金 = 权限/管理语义），
+   顶栏「管理员」盾牌徽标 + 头像金环 + 管理专区独立分组。
+   纯视觉层：仅颜色/间距/徽标，不改任何交互与功能逻辑。
+   ============================================================ */
+/* —— 11.1 深色侧栏 —— */
+.workspace-shell.admin-theme .workspace-sidebar {
+  border-right-color: rgba(255, 255, 255, .07);
+  color: #aeb6dd;
+  background: linear-gradient(180deg, #151b32 0%, #1f2748 100%);
+}
+.workspace-shell.admin-theme .workspace-brand {
+  color: #f2f4ff;
+}
+.workspace-shell.admin-theme .workspace-brand b {
+  background: url('/brand/vequo-app-icon-inverse.svg') center/contain no-repeat;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, .4);
+}
+.workspace-shell.admin-theme .sidebar-toggle {
+  border-color: rgba(255, 255, 255, .18);
+  color: #c9d0ee;
+  background: rgba(255, 255, 255, .06);
+}
+.workspace-shell.admin-theme .sidebar-toggle:hover {
+  border-color: #f5b84c;
+  color: #ffd98a;
+  background: rgba(245, 184, 76, .12);
+  box-shadow: 0 4px 12px rgba(245, 166, 35, .18);
+}
+.workspace-shell.admin-theme .workspace-sidebar nav button,
+.workspace-shell.admin-theme .back-home {
+  color: #aeb6dd;
+}
+.workspace-shell.admin-theme .workspace-sidebar nav button:hover,
+.workspace-shell.admin-theme .back-home:hover {
+  border-color: transparent;
+  color: #ffffff;
+  background: rgba(255, 255, 255, .07);
+}
+.workspace-shell.admin-theme .workspace-sidebar nav button.active {
+  border-color: transparent;
+  color: #ffd98a;
+  background: rgba(245, 184, 76, .16);
+  font-weight: 600;
+}
+.workspace-shell.admin-theme .workspace-sidebar nav button.active::before {
+  background: #f5b84c;
+  box-shadow: 0 0 8px rgba(245, 184, 76, .55);
+}
+.workspace-shell.admin-theme .workspace-sidebar nav button.active i {
+  color: #ffd98a;
+}
+.workspace-shell.admin-theme .back-home {
+  color: #7c86b5;
+}
+/* 深色侧栏上未读角标的白色描边改为侧栏底色，避免突兀白圈 */
+.workspace-shell.admin-theme .menu-unread {
+  box-shadow: 0 0 0 2px #1f2748;
+}
+
+/* —— 11.2 管理专区分组标签 + 管理员专属菜单项 —— */
+.admin-menu-divider {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 16px 4px 3px;
+  padding: 0 9px;
+  color: #f5b84c;
+  font: 600 9px Rajdhani, sans-serif;
+  letter-spacing: .22em;
+  white-space: nowrap;
+  user-select: none;
+}
+.admin-menu-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, rgba(245, 184, 76, .5), transparent);
+}
+.admin-menu-divider .app-icon {
+  color: #f5b84c;
+}
+/* 管理员专属入口：图标统一琥珀金，提升辨识度 */
+.workspace-shell.admin-theme .workspace-sidebar nav button.admin-item i {
+  color: #f5b84c;
+}
+/* 折叠态：分组标签只留盾牌图标居中 */
+.workspace-sidebar.collapsed .admin-menu-divider {
+  justify-content: center;
+  margin: 12px 0 3px;
+  padding: 0;
+}
+.workspace-sidebar.collapsed .admin-menu-divider::after,
+.workspace-sidebar.collapsed .admin-menu-divider .divider-label {
+  display: none;
+}
+
+/* —— 11.3 顶栏：管理员身份徽标 + 标题行布局 —— */
+.hd-title-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.hd-title-main h1 {
+  min-width: 0; /* 允许在 flex 中收缩并触发省略号，给徽标让位 */
+}
+.hd-admin-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  flex: none;
+  padding: 0 10px;
+  border-radius: 999px;
+  color: #3d2c04;
+  background: linear-gradient(135deg, #f7b733, #f0932b);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  box-shadow: 0 2px 8px rgba(245, 166, 35, .35);
+  white-space: nowrap;
+}
+.hd-admin-badge .app-icon {
+  color: #3d2c04;
+}
+/* 管理员主题下顶栏底边带一丝金色分界（克制，不抢内容） */
+.workspace-shell.admin-theme .workspace-header {
+  border-bottom-color: rgba(245, 166, 35, .35);
+}
+
+/* —— 11.4 头像：管理员金环 + 用户菜单头金色侧标 —— */
+.workspace-tools .ops-user-button.admin-avatar {
+  border-color: #f5b84c;
+  background: linear-gradient(135deg, #f7b733, #f0932b);
+  box-shadow: 0 0 0 3px rgba(245, 184, 76, .22);
+}
+.workspace-tools .ops-user-button.admin-avatar b,
+.workspace-tools .ops-user-button.admin-avatar:hover b,
+.workspace-tools .ops-user-button.admin-avatar.active b {
+  color: #3d2c04;
+}
+.workspace-tools .ops-user-button.admin-avatar:hover,
+.workspace-tools .ops-user-button.admin-avatar.active {
+  border-color: #f0932b;
+  background: #f0932b;
+  box-shadow: 0 0 0 4px rgba(245, 184, 76, .3);
+}
+.ops-user-menu-head.admin-head {
+  border-left: 3px solid #f5b84c;
+  color: #1d2129;
+  font-weight: 600;
+}
+
+/* —— 11.5 内容区：暖色微光（与员工版的蓝色微光区分） —— */
+.workspace-shell.admin-theme .workspace-content {
+  background:
+    radial-gradient(1100px 480px at 100% -80px, rgba(245, 166, 35, .10), transparent 62%),
+    linear-gradient(180deg, #faf8f3 0%, #f3f1ec 100%);
+}
+
+/* ================================================================
+   12. UI 精修 v2（2026-09-14）· 蓝白体系质感深化
+   仅视觉层：卡片层级 / 主按钮渐变 / 表头 / 输入 hover / chip 交互。
+   选择器沿用 09-09 的「整词匹配」原则（class~=），避免误伤语义色变体；
+   全部作用于 .workspace-content 内部，不影响壳层与管理员深色主题。
+   ================================================================ */
+:root {
+  --brand-grad: linear-gradient(135deg, #5FAEFF 0%, #2E7CF0 100%);
+  --brand-grad-hover: linear-gradient(135deg, #4D9EFF 0%, #1F66D6 100%);
+}
+
+/* —— 12.1 白色业务卡：统一柔和投影 + 过渡（rounded-xl/2xl + 描边卡片）—— */
+.workspace-content [class~="bg-white"][class*="rounded-xl"][class*="border"],
+.workspace-content [class~="bg-white"][class*="rounded-2xl"][class*="border"] {
+  box-shadow: var(--shadow-card);
+  transition: box-shadow .25s ease, border-color .25s ease, transform .25s ease;
+}
+
+/* —— 12.2 主按钮：纯色 → 品牌渐变 + 悬浮浮起（沿用 09-09 的映射选择器）—— */
+.workspace-content [class*="bg-indigo-600"],
+.workspace-content [class*="bg-blue-600"],
+.workspace-content [class*="bg-purple-600"],
+.workspace-content [class*="bg-indigo-500"],
+.workspace-content [class*="bg-cyan-600"],
+.workspace-content .bg-primary {
+  background: var(--brand-grad) !important;
+  box-shadow: 0 2px 8px rgba(46, 124, 240, .22);
+}
+.workspace-content [class*="bg-indigo-600"]:hover,
+.workspace-content [class*="bg-blue-600"]:hover,
+.workspace-content [class*="bg-purple-600"]:hover,
+.workspace-content [class*="bg-indigo-500"]:hover,
+.workspace-content [class*="bg-cyan-600"]:hover,
+.workspace-content .bg-primary:hover {
+  background: var(--brand-grad-hover) !important;
+  box-shadow: 0 8px 20px -4px rgba(46, 124, 240, .45) !important;
+  transform: translateY(-1px);
+}
+.workspace-content [class*="bg-indigo-600"]:active,
+.workspace-content [class*="bg-blue-600"]:active,
+.workspace-content .bg-primary:active {
+  transform: translateY(0) scale(.98);
+}
+
+/* —— 12.3 表格表头：字重字距 + 底部分隔线（bg 与行 hover 沿用 09-09 规则）—— */
+.workspace-content table thead th {
+  color: #86909c !important;
+  font-size: 11px;
+  letter-spacing: .05em;
+  border-bottom: 1px solid #e5e6eb;
+}
+
+/* —— 12.4 输入控件：hover 描边加深（focus 态沿用既有品牌光环）—— */
+.workspace-content input:hover:not(:focus):not(:disabled),
+.workspace-content textarea:hover:not(:focus):not(:disabled),
+.workspace-content select:hover:not(:focus):not(:disabled) {
+  border-color: #a9aeb8 !important;
+}
+
+/* —— 12.5 灰色胶囊 chip（快捷提问等）：hover 转品牌淡蓝，可点感更强 —— */
+.workspace-content [class~="bg-gray-100"][class*="rounded-full"] {
+  transition: background .18s ease, color .18s ease, transform .18s ease;
+}
+.workspace-content button[class~="bg-gray-100"][class*="rounded-full"]:hover {
+  color: var(--brand-700) !important;
+  background: var(--brand-050) !important;
+  transform: translateY(-1px);
+}
+
+/* —— 12.6 灰底区块头（卡片标题横条）：微渐变替代平灰，层次更细腻 —— */
+.workspace-content [class~="bg-gray-50"][class*="border-b"] {
+  background: linear-gradient(180deg, #fbfcfe 0%, #f4f6f9 100%) !important;
+}
+
+/* —— 12.7 行级 hover：列表/候选行划过反馈（divide-y 分隔列表通用）—— */
+.workspace-content [class*="divide-y"] > div {
+  transition: background .15s ease;
+}
+.workspace-content [class*="divide-y"] > div:hover {
+  background: rgba(77, 158, 255, .035);
+}
+
+/* ================================================================
+   13. UI 精修 v3（2026-09-14）· 高级感可见升级
+   氛围 mesh 背景 / 页面 Hero 横幅 / 卡片层级加深 / 壳层细节。
+   仍仅视觉层；管理员深色主题（11）选择器优先级更高，不受本节影响。
+   ================================================================ */
+
+/* —— 13.1 内容区氛围背景：多层品牌蓝 mesh 光晕（一眼可辨的空间感）—— */
+.workspace-content {
+  background:
+    radial-gradient(1000px 520px at 108% -10%, rgba(77, 158, 255, .17), transparent 60%),
+    radial-gradient(760px 560px at -12% 112%, rgba(96, 165, 250, .10), transparent 62%),
+    radial-gradient(600px 400px at 50% -24%, rgba(77, 158, 255, .06), transparent 60%),
+    linear-gradient(180deg, #f9fbfe 0%, #eef2f7 100%);
+}
+
+/* —— 13.2 页面 Hero 横幅（.page-hero）：给各页头部一个统一的高级开场 —— */
+.page-hero {
+  position: relative;
+  overflow: hidden;
+  padding: 22px 26px;
+  border: 1px solid #e5e6eb;
+  border-radius: 18px;
+  background:
+    radial-gradient(520px 220px at 100% -70%, rgba(77, 158, 255, .18), transparent 65%),
+    linear-gradient(135deg, #ffffff 0%, #f7faff 100%);
+  box-shadow: 0 1px 2px rgba(16, 24, 40, .04), 0 12px 32px -12px rgba(46, 124, 240, .14);
+}
+.page-hero::after {
+  content: '';
+  position: absolute;
+  right: -70px;
+  top: -70px;
+  width: 200px;
+  height: 200px;
+  border-radius: 50%;
+  border: 30px solid rgba(77, 158, 255, .07);
+  pointer-events: none;
+}
+.page-hero h2 {
+  font-size: 20px;
+  letter-spacing: -.01em;
+}
+
+/* —— 13.3 卡片层级加深（覆盖 12.1 的投影，浮岛感更强）—— */
+.workspace-content [class~="bg-white"][class*="rounded-xl"][class*="border"],
+.workspace-content [class~="bg-white"][class*="rounded-2xl"][class*="border"] {
+  box-shadow: 0 1px 2px rgba(16, 24, 40, .05), 0 12px 32px -12px rgba(16, 24, 40, .10);
+}
+/* 设置页式「p-4 + 描边」裸分区 → 白卡（原直接躺在背景上，无容器感） */
+.workspace-content [class~="p-4"][class*="border-gray-200"][class*="rounded-lg"] {
+  border-color: #e5e6eb;
+  border-radius: 16px;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, .04), 0 10px 28px -12px rgba(16, 24, 40, .08);
+}
+/* 卡内灰底小面板（运行观测统计格等）：恢复淡蓝灰容器感（09-09 规则曾压成纯白） */
+.workspace-content [class~="bg-gray-50"][class*="rounded-lg"] {
+  border: 1px solid #edf0f4;
+  background: #f7f9fc !important;
+}
+
+/* —— 13.4 员工浅色侧栏：active 菜单改渐变胶囊 + 微光，壳层更精致 —— */
+.workspace-shell:not(.admin-theme) .workspace-sidebar {
+  background: linear-gradient(180deg, #ffffff 0%, #fbfcfe 100%);
+}
+.workspace-shell:not(.admin-theme) .workspace-sidebar nav button.active {
+  color: #1F66D6;
+  background: linear-gradient(135deg, #EAF3FF 0%, #DBEBFF 100%);
+  box-shadow: 0 4px 14px -4px rgba(46, 124, 240, .28);
+}
+
+/* —— 13.5 顶栏底部品牌渐变发丝线（克制的点缀）—— */
+.workspace-header::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  bottom: -1px;
+  left: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent 0%, rgba(77, 158, 255, .35) 50%, transparent 100%);
+  pointer-events: none;
+}
+
+/* —— 13.6 Hero 标题装饰：渐变竖条 + 图标化开场 —— */
+.page-hero h2 {
+  position: relative;
+  padding-left: 14px;
+}
+.page-hero h2::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 5px;
+  height: 20px;
+  border-radius: 3px;
+  background: var(--brand-grad);
+  box-shadow: 0 2px 6px rgba(46, 124, 240, .35);
+  transform: translateY(-50%);
+}
+
+/* —— 15. 键盘焦点环（2026-09-27）：全站此前零自定义焦点样式，只有浏览器默认框 —— */
+/* 鼠标点击不显示（:focus-visible 只在键盘 Tab 时出现），与品牌色同族 */
+:focus-visible {
+  outline: 2px solid #2E7CF0;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* —— 16. 行内图标 .eico（2026-09-27）：emoji 图标的替代形态 —— */
+/* Lucide SVG 内联进模板与 v-html 富文本，1em 跟随字号、currentColor 跟随文字色 */
+.eico {
+  display: inline-block;
+  width: 1em;
+  height: 1em;
+  line-height: 0;
+  vertical-align: -0.135em;
+}
+.eico svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}

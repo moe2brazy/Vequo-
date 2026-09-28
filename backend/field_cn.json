@@ -1,0 +1,118 @@
+{
+  "_comment": "字段名 → 短中文业务名。用于结果表头 / 字段展示的翻译（如 rework_qty → 返工数量）。来源：DataPage.vue 的 DOC_FIELD_CN（《数据介绍.md》语义字典）+ 人工校订。只放「短名」，不要把长句解释放进来；长解释请写 field_semantics.json。",
+
+  "dim_product": {
+    "product_id": "产品ID",
+    "product_code": "产品编码",
+    "product_name": "产品名称",
+    "product_model": "产品型号",
+    "product_category": "产品类别",
+    "unit": "单位",
+    "is_active": "是否启用"
+  },
+
+  "dim_process": {
+    "process_id": "工序ID",
+    "process_code": "工序编码",
+    "process_name": "工序名称",
+    "process_seq": "工序顺序",
+    "standard_yield_rate": "标准良率",
+    "is_key_process": "是否关键工序"
+  },
+
+  "dim_production_line": {
+    "line_id": "产线ID",
+    "line_code": "产线编码",
+    "line_name": "产线名称",
+    "workshop_name": "车间名称",
+    "line_manager": "产线负责人",
+    "line_status": "产线状态"
+  },
+
+  "dim_equipment": {
+    "equipment_id": "设备ID",
+    "equipment_code": "设备编码",
+    "equipment_name": "设备名称",
+    "equipment_type": "设备类型",
+    "line_id": "所属产线ID",
+    "install_date": "安装日期",
+    "equipment_status": "设备状态"
+  },
+
+  "mes_work_order": {
+    "work_order_id": "工单ID",
+    "work_order_no": "工单编号",
+    "product_id": "产品ID",
+    "line_id": "产线ID",
+    "plan_qty": "计划数量",
+    "actual_qty": "实际数量",
+    "start_date": "计划开始日期",
+    "end_date": "计划结束日期",
+    "order_status": "工单状态",
+    "status": "工单状态"
+  },
+
+  "mes_process_output": {
+    "output_id": "产量记录ID",
+    "work_order_id": "工单ID",
+    "product_id": "产品ID",
+    "process_id": "工序ID",
+    "line_id": "产线ID",
+    "stat_date": "统计日期",
+    "input_qty": "投入数量",
+    "good_qty": "合格数量",
+    "defect_qty": "不良数量",
+    "rework_qty": "返工数量",
+    "shift_code": "班次"
+  },
+
+  "qms_inspection": {
+    "inspection_id": "检验记录ID",
+    "inspection_no": "检验单号",
+    "work_order_id": "工单ID",
+    "product_id": "产品ID",
+    "process_id": "工序ID",
+    "inspection_date": "检验日期",
+    "sample_qty": "抽检数量",
+    "defect_qty": "不良数量",
+    "inspection_result": "检验结果",
+    "result": "检验结果"
+  },
+
+  "qms_defect_detail": {
+    "defect_id": "不良明细ID",
+    "inspection_id": "检验记录ID",
+    "defect_type": "不良类型",
+    "defect_code": "不良代码",
+    "defect_qty": "不良数量",
+    "severity_level": "严重等级",
+    "responsible_process_id": "责任工序ID"
+  },
+
+  "eqp_downtime_record": {
+    "downtime_id": "停机记录ID",
+    "equipment_id": "设备ID",
+    "line_id": "产线ID",
+    "start_time": "停机开始时间",
+    "end_time": "停机结束时间",
+    "downtime_minutes": "停机分钟",
+    "downtime_reason": "停机原因",
+    "is_planned": "是否计划停机"
+  },
+
+  "inv_inventory_snapshot": {
+    "snapshot_id": "库存快照ID",
+    "snapshot_date": "快照日期",
+    "product_id": "产品ID",
+    "warehouse_code": "仓库编码",
+    "available_qty": "可用库存",
+    "frozen_qty": "冻结库存",
+    "safety_stock_qty": "安全库存"
+  },
+
+  "mes_equipment": {
+    "equipment_id": "设备ID",
+    "equipment_name": "设备名称",
+    "line_id": "所属产线ID"
+  }
+}

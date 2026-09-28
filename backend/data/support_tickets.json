@@ -1,0 +1,63 @@
+[
+ {
+  "id": "sup-273818bf2c43",
+  "user_key": "viewer",
+  "user_name": "viewer",
+  "status": "open",
+  "created_at": 1789047203226.1152,
+  "updated_at": 1789359801805.1882,
+  "user_read_ts": 1789359802302.7927,
+  "admin_read_ts": 1789360162985.1204,
+  "messages": [
+   {
+    "id": "1bad471435f8",
+    "sender": "user",
+    "sender_name": "viewer",
+    "text": "111",
+    "ts": 1789047203230.1785,
+    "kind": "feedback",
+    "meta": {
+     "item_key": "topic:检验批次统计",
+     "item_kind": "分析主题",
+     "item_title": "检验批次统计",
+     "item_scene": "质量分析",
+     "item_table": "",
+     "item_desc": "检验批次、不合格批次与复检情况",
+     "note": "111",
+     "status": "rejected",
+     "admin_note": "",
+     "handled_at": 1789047277476.0303,
+     "handled_by": "管理员"
+    }
+   },
+   {
+    "id": "d71b7d02b4bd",
+    "sender": "user",
+    "sender_name": "viewer",
+    "text": "111",
+    "ts": 1789047210071.3926
+   },
+   {
+    "id": "3ff743140ec4",
+    "sender": "agent",
+    "sender_name": "管理员",
+    "text": "经核实，该知识条目内容无误，你的反馈我们已记录，感谢反馈。",
+    "ts": 1789047277476.0303
+   },
+   {
+    "id": "e8ada7c2c569",
+    "sender": "user",
+    "sender_name": "viewer",
+    "text": "耍起",
+    "ts": 1789047303707.9421
+   },
+   {
+    "id": "d66d26eb3221",
+    "sender": "user",
+    "sender_name": "viewer",
+    "text": "11",
+    "ts": 1789359801805.1882
+   }
+  ]
+ }
+]

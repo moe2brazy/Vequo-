@@ -1,0 +1,325 @@
+{
+ "attendance": {
+  "cols": [
+   "id:bigint",
+   "employee_id:bigint",
+   "work_date:date",
+   "shift:character varying",
+   "check_in:time without time zone",
+   "check_out:time without time zone",
+   "status:character varying",
+   "created_at:timestamp without time zone"
+  ],
+  "rows": 12000
+ },
+ "customer": {
+  "cols": [
+   "id:bigint",
+   "code:character varying",
+   "name:character varying",
+   "contact:character varying",
+   "phone:character varying",
+   "province:character varying",
+   "city:character varying",
+   "industry:character varying",
+   "credit_level:character varying",
+   "status:character varying",
+   "created_at:timestamp without time zone"
+  ],
+  "rows": 360
+ },
+ "department": {
+  "cols": [
+   "id:bigint",
+   "factory_id:bigint",
+   "parent_id:bigint",
+   "code:character varying",
+   "name:character varying",
+   "manager:character varying",
+   "cost_center:character varying",
+   "created_at:timestamp without time zone"
+  ],
+  "rows": 24
+ },
+ "employee": {
+  "cols": [
+   "id:bigint",
+   "code:character varying",
+   "name:character varying",
+   "gender:character varying",
+   "birthday:date",
+   "id_card:character varying",
+   "hire_date:date",
+   "department_id:bigint",
+   "workshop_id:bigint",
+   "position:character varying",
+   "education:character varying",
+   "salary:numeric",
+   "phone:character varying",
+   "status:character varying",
+   "created_at:timestamp without time zone"
+  ],
+  "rows": 2000
+ },
+ "equipment": {
+  "cols": [
+   "id:bigint",
+   "line_id:bigint",
+   "workshop_id:bigint",
+   "code:character varying",
+   "name:character varying",
+   "category:character varying",
+   "model:character varying",
+   "manufacturer:character varying",
+   "purchase_date:date",
+   "status:character varying",
+   "last_maintenance_date:date",
+   "created_at:timestamp without time zone"
+  ],
+  "rows": 720
+ },
+ "equipment_maintenance": {
+  "cols": [
+   "id:bigint",
+   "equipment_id:bigint",
+   "type:character varying",
+   "mdate:date",
+   "technician:character varying",
+   "cost:numeric",
+   "downtime_hours:numeric",
+   "description:character varying",
+   "created_at:timestamp without time zone"
+  ],
+  "rows": 900
+ },
+ "factory": {
+  "cols": [
+   "id:bigint",
+   "code:character varying",
+   "name:character varying",
+   "province:character varying",
+   "city:character varying",
+   "address:character varying",
+   "manager:character varying",
+   "phone:character varying",
+   "established_date:date",
+   "status:character varying",
+   "created_at:timestamp without time zone"
+  ],
+  "rows": 8
+ },
+ "inventory": {
+  "cols": [
+   "id:bigint",
+   "warehouse:character varying",
+   "item_type:character varying",
+   "item_id:bigint",
+   "quantity:numeric",
+   "unit:character varying",
+   "safe_stock:numeric",
+   "last_update:timestamp without time zone"
+  ],
+  "rows": 620
+ },
+ "material": {
+  "cols": [
+   "id:bigint",
+   "code:character varying",
+   "name:character varying",
+   "category:character varying",
+   "spec:character varying",
+   "unit:character varying",
+   "safety_stock:numeric",
+   "unit_price:numeric",
+   "supplier_id:bigint",
+   "created_at:timestamp without time zone"
+  ],
+  "rows": 320
+ },
+ "product": {
+  "cols": [
+   "id:bigint",
+   "code:character varying",
+   "name:character varying",
+   "category:character varying",
+   "spec:character varying",
+   "unit:character varying",
+   "standard_price:numeric",
+   "lead_time_days:smallint",
+   "created_at:timestamp without time zone"
+  ],
+  "rows": 300
+ },
+ "production_line": {
+  "cols": [
+   "id:bigint",
+   "workshop_id:bigint",
+   "code:character varying",
+   "name:character varying",
+   "capacity_per_hr:numeric",
+   "status:character varying",
+   "created_at:timestamp without time zone"
+  ],
+  "rows": 96
+ },
+ "production_record": {
+  "cols": [
+   "id:bigint",
+   "wo_id:bigint",
+   "line_id:bigint",
+   "employee_id:bigint",
+   "work_date:date",
+   "shift:character varying",
+   "qty_produced:numeric",
+   "qty_defect:numeric",
+   "work_hours:numeric",
+   "created_at:timestamp without time zone"
+  ],
+  "rows": 9000
+ },
+ "purchase_order": {
+  "cols": [
+   "id:bigint",
+   "po_no:character varying",
+   "supplier_id:bigint",
+   "order_date:date",
+   "expected_date:date",
+   "status:character varying",
+   "total_amount:numeric",
+   "buyer:character varying",
+   "created_at:timestamp without time zone"
+  ],
+  "rows": 1500
+ },
+ "purchase_order_item": {
+  "cols": [
+   "id:bigint",
+   "po_id:bigint",
+   "material_id:bigint",
+   "qty:numeric",
+   "unit_price:numeric",
+   "amount:numeric",
+   "received_qty:numeric",
+   "created_at:timestamp without time zone"
+  ],
+  "rows": 4500
+ },
+ "quality_inspection": {
+  "cols": [
+   "id:bigint",
+   "wo_id:bigint",
+   "product_id:bigint",
+   "inspect_date:date",
+   "inspector:character varying",
+   "sample_qty:numeric",
+   "pass_qty:numeric",
+   "fail_qty:numeric",
+   "result:character varying",
+   "defect_type:character varying",
+   "created_at:timestamp without time zone"
+  ],
+  "rows": 4000
+ },
+ "sales_order": {
+  "cols": [
+   "id:bigint",
+   "so_no:character varying",
+   "customer_id:bigint",
+   "order_date:date",
+   "due_date:date",
+   "status:character varying",
+   "total_amount:numeric",
+   "salesman:character varying",
+   "created_at:timestamp without time zone"
+  ],
+  "rows": 2000
+ },
+ "sales_order_item": {
+  "cols": [
+   "id:bigint",
+   "so_id:bigint",
+   "product_id:bigint",
+   "qty:numeric",
+   "unit_price:numeric",
+   "amount:numeric",
+   "shipped_qty:numeric",
+   "created_at:timestamp without time zone"
+  ],
+  "rows": 6000
+ },
+ "supplier": {
+  "cols": [
+   "id:bigint",
+   "code:character varying",
+   "name:character varying",
+   "short_name:character varying",
+   "contact:character varying",
+   "phone:character varying",
+   "province:character varying",
+   "city:character varying",
+   "category:character varying",
+   "bank:character varying",
+   "account:character varying",
+   "rating:smallint",
+   "status:character varying",
+   "created_at:timestamp without time zone"
+  ],
+  "rows": 260
+ },
+ "v_supplier_purchase": {
+  "cols": [
+   "id:bigint",
+   "name:character varying",
+   "category:character varying",
+   "po_count:bigint",
+   "total_amount:numeric"
+  ],
+  "rows": 260
+ },
+ "v_work_order_summary": {
+  "cols": [
+   "id:bigint",
+   "wo_no:character varying",
+   "product:character varying",
+   "line:character varying",
+   "plan_qty:numeric",
+   "produced_qty:numeric",
+   "completion_rate:numeric",
+   "status:character varying"
+  ],
+  "rows": 3000
+ },
+ "work_order": {
+  "cols": [
+   "id:bigint",
+   "wo_no:character varying",
+   "product_id:bigint",
+   "line_id:bigint",
+   "plan_qty:numeric",
+   "produced_qty:numeric",
+   "scrap_qty:numeric",
+   "status:character varying",
+   "plan_start:date",
+   "plan_end:date",
+   "actual_start:date",
+   "actual_end:date",
+   "created_at:timestamp without time zone"
+  ],
+  "rows": 3000
+ },
+ "workshop": {
+  "cols": [
+   "id:bigint",
+   "factory_id:bigint",
+   "department_id:bigint",
+   "code:character varying",
+   "name:character varying",
+   "manager:character varying",
+   "area_sqm:numeric",
+   "shift_count:smallint",
+   "status:character varying",
+   "created_at:timestamp without time zone"
+  ],
+  "rows": 48
+ }
+}

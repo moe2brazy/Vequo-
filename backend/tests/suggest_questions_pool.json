@@ -1,0 +1,82 @@
+[
+ {
+  "question": "不良明细表的不良类型排行 TOP10",
+  "src": "quality"
+ },
+ {
+  "question": "物料采购可用库存排行",
+  "src": "purchase"
+ },
+ {
+  "question": "库存快照表低于安全库存的产品预警",
+  "src": "inventory"
+ },
+ {
+  "question": "各检验结果的数量",
+  "src": "memory"
+ },
+ {
+  "question": "工序产量表各工序的良率分析",
+  "src": "quality"
+ },
+ {
+  "question": "工序产量表的不良类型排行 TOP10",
+  "src": "quality"
+ },
+ {
+  "question": "设备主数据表停机原因分析",
+  "src": "equipment"
+ },
+ {
+  "question": "统计各产线最近7天的在产工单数趋势",
+  "src": "production"
+ },
+ {
+  "question": "工序产量表的工单完成情况统计",
+  "src": "work_order"
+ },
+ {
+  "question": "训练模型预测投入数量",
+  "src": "ml"
+ },
+ {
+  "question": "分析各产线最近7天的产量趋势",
+  "src": "explore"
+ },
+ {
+  "question": "各关键工序的数量",
+  "src": "memory"
+ },
+ {
+  "question": "统计各工序最近7天的投入数量趋势",
+  "src": "production"
+ },
+ {
+  "question": "销售计划产量排行",
+  "src": "sales"
+ },
+ {
+  "question": "设备停机记录表停机原因分析",
+  "src": "equipment"
+ },
+ {
+  "question": "不良类型排行 TOP10",
+  "src": "explore"
+ },
+ {
+  "question": "设备停机记录表的工单完成情况统计",
+  "src": "work_order"
+ },
+ {
+  "question": "生产工单表的工单完成情况统计",
+  "src": "work_order"
+ },
+ {
+  "question": "各工单状态的数量",
+  "src": "memory"
+ },
+ {
+  "question": "查看当前数据库有哪些表",
+  "src": "explore"
+ }
+]

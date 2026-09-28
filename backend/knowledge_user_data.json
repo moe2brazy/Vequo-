@@ -1,0 +1,44 @@
+{
+  "guest": {
+    "favorites": [],
+    "feedback": {},
+    "overrides": {},
+    "custom_terms": [],
+    "template_use_count": {
+      "tpl_002": 1,
+      "tpl_003": 2
+    }
+  },
+  "admin": {
+    "favorites": [],
+    "feedback": {},
+    "overrides": {},
+    "custom_terms": [],
+    "template_use_count": {
+      "tpl_002": 3,
+      "tpl_001": 3,
+      "tpl_006": 1,
+      "tpl_005": 1
+    }
+  },
+  "viewer": {
+    "favorites": [],
+    "feedback": {
+      "topic:检验批次统计": {
+        "vote": "down",
+        "reason": "",
+        "ts": "2026-09-10T13:33:23.251529+00:00"
+      },
+      "met:缺陷数": {
+        "vote": "up",
+        "reason": "",
+        "ts": "2026-09-21T05:59:30.984797+00:00"
+      }
+    },
+    "overrides": {},
+    "custom_terms": [],
+    "template_use_count": {
+      "tpl_002": 1
+    }
+  }
+}

@@ -1,0 +1,9 @@
+﻿process_id,process_code,process_name,process_seq,standard_yield_rate,is_key_process
+PR01,PR01,SMT贴片,1,0.9850,True
+PR02,PR02,回流焊,2,0.9820,False
+PR03,PR03,AOI检测,3,0.9900,False
+PR04,PR04,插件装配,4,0.9750,False
+PR05,PR05,波峰焊,5,0.9700,False
+PR06,PR06,功能测试,6,0.9650,True
+PR07,PR07,老化测试,7,0.9680,True
+PR08,PR08,包装入库,8,0.9920,False

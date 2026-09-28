@@ -1,0 +1,234 @@
+"""时间表达式解析器 — 把中文时间表达翻译成确定性的 SQL 日期区间
+
+支持：最近N天/周/月/年、本周、本月、本季度、今年、昨天/今日/昨天、上周/上月/上季度/去年、
+近几日等口语表达。解析结果按当前数据库方言（PG/MySQL）输出对应日期表达式。
+
+用法：
+    from agent.time_expr import parse_time_expr
+    hint = parse_time_expr("统计最近7天的产量")   # 返回 dict 或 None
+    # hint = {"raw": "最近7天", "gte": "CURRENT_DATE - INTERVAL '7 days'", "label": "最近7天(含今天)"}
+"""
+
+import re
+
+# ── 中文数字 → int ──
+_CN_NUM = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+           "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+_CN_TEN = {"十": 10, "廿": 20, "卅": 30}
+
+
+def _cn_to_int(s: str) -> int | None:
+    """中文数字转 int（支持 一~九十九，含"两"），失败返回 None"""
+    if s.isdigit():
+        return int(s)
+    total = 0
+    num = 0
+    for ch in s:
+        if ch in _CN_TEN:
+            if num == 0:
+                num = 1
+            total += num * _CN_TEN[ch]
+            num = 0
+        elif ch in _CN_NUM:
+            num = _CN_NUM[ch]
+        else:
+            return None
+    return total + num
+
+
+# ── 日期区间构造 ──
+def _interval(amount: int, unit_sql: str, unit_label: str, interval_amount: int | None = None) -> dict:
+    # interval_amount 单独指定 SQL 里的区间数值（amount 保留展示用），
+    # 用于「最近N天(含今天)」这类需减 1 的场景。
+    if interval_amount is None:
+        interval_amount = amount
+    return {
+        "raw": f"最近{amount}{unit_label}",
+        "gte": f"CURRENT_DATE - INTERVAL '{interval_amount} {unit_sql}'",
+        "label": f"最近{amount}{unit_label}(含今天)",
+        "unit": unit_sql,
+        "amount": amount,
+    }
+
+
+def _handle_abs_year(m) -> dict | None:
+    """绝对年份：2023年 / 2024 年 → 该年 1/1 ~ 次年 1/1（左闭右开）。"""
+    try:
+        y = int(m.group("year"))
+    except Exception:
+        return None
+    if not (1900 <= y <= 2199):
+        return None
+    return {
+        "raw": f"{y}年",
+        "gte": f"DATE '{y:04d}-01-01'",
+        "lt": f"DATE '{y + 1:04d}-01-01'",
+        "label": f"{y}年(整年)",
+        "unit": "year",
+        "amount": None,
+    }
+
+
+def _handle_abs_month(m) -> dict | None:
+    """绝对月份：3月 / 12月 → 当年该月 1 日 ~ 次月 1 日。
+
+    用 date_trunc('year', CURRENT_DATE) 偏移，避免把当前年份写死进 SQL。
+    """
+    try:
+        mm = int(m.group("month"))
+    except Exception:
+        return None
+    if not (1 <= mm <= 12):
+        return None
+    return {
+        "raw": f"{mm}月",
+        "gte": f"date_trunc('year', CURRENT_DATE) + INTERVAL '{mm - 1} months'",
+        "lt": f"date_trunc('year', CURRENT_DATE) + INTERVAL '{mm} months'",
+        "label": f"{mm}月(整月)",
+        "unit": "month",
+        "amount": None,
+    }
+
+
+# 正则规则表：(pattern, handler)  按顺序匹配，第一个命中生效
+_RULES = [
+    # 绝对年份（2023年 / 2024 年）—— 必须放在"最近N年"之前。
+    # 数据正确性修复（P0）：规则 1 的 (?:最近|近|过去)? 前缀是【可选】的，
+    # 实测 `统计2023年产量` 被解析成 gte = CURRENT_DATE - INTERVAL '2023 years'，
+    # 绝对年份查询被静默改写成无意义的相对窗口，且前端 label 还显示"最近2023年"，用户无法察觉。
+    (re.compile(r"(?P<year>(?:19|20)\d{2})\s*年", re.IGNORECASE),
+     lambda m: _handle_abs_year(m)),
+    # 绝对月份（3月 / 12月的销量）—— 同理必须先于"最近N个月"。
+    # 负向断言 (?!份) 避免误吞"月份"；数字前不允许紧跟数字，避免匹配"2023年12月"中的 12 时与年份规则冲突。
+    (re.compile(r"(?<!\d)(?P<month>1[0-2]|[1-9])\s*月(?!份)", re.IGNORECASE),
+     lambda m: _handle_abs_month(m)),
+    # 最近N天/周/月/年（支持中文数字与阿拉伯数字，"最近7天" "近一个月" "近3周"）
+    (re.compile(r"(?:最近|近|过去)?\s*(?P<num>[\d一二两三四五六七八九十]+)\s*(?P<unit>天|日|周|星期|个月|月|年)\s*(?:内|以来)?", re.IGNORECASE),
+     lambda m: _handle_n(m)),
+    # 本周 / 这周 / 本星期
+    (re.compile(r"(?:本|这|当)\s*(?:周|星期)", re.IGNORECASE),
+     lambda m: {"raw": "本周", "gte": "date_trunc('week', CURRENT_DATE)", "label": "本周(周一起)", "unit": "week", "amount": None}),
+    # 本月 / 这个月 / 当月
+    (re.compile(r"(?:本|这|当)\s*(?:个月|月)", re.IGNORECASE),
+     lambda m: {"raw": "本月", "gte": "date_trunc('month', CURRENT_DATE)", "label": "本月(1号起)", "unit": "month", "amount": None}),
+    # 本季度 / 本季
+    (re.compile(r"(?:本|这)\s*季度", re.IGNORECASE),
+     lambda m: {"raw": "本季度", "gte": "date_trunc('quarter', CURRENT_DATE)", "label": "本季度(季初起)", "unit": "quarter", "amount": None}),
+    # 今年 / 本年 / 今年一年
+    (re.compile(r"(?:今|本)\s*年", re.IGNORECASE),
+     lambda m: {"raw": "今年", "gte": "date_trunc('year', CURRENT_DATE)", "label": "今年(1月1日起)", "unit": "year", "amount": None}),
+    # 昨天 / 昨日 / 今天 / 今日 / 前天
+    (re.compile(r"昨天|昨日", re.IGNORECASE),
+     lambda m: {"raw": "昨天", "gte": "CURRENT_DATE - INTERVAL '1 day'", "lt": "CURRENT_DATE", "label": "昨天", "unit": "day", "amount": 1}),
+    (re.compile(r"今天|今日", re.IGNORECASE),
+     lambda m: {"raw": "今天", "gte": "CURRENT_DATE", "label": "今天(0点起)", "unit": "day", "amount": 0}),
+    (re.compile(r"前天", re.IGNORECASE),
+     lambda m: {"raw": "前天", "gte": "CURRENT_DATE - INTERVAL '2 days'", "lt": "CURRENT_DATE - INTERVAL '1 day'", "label": "前天", "unit": "day", "amount": 2}),
+    # 上周 / 上月 / 上季度 / 去年
+    (re.compile(r"上\s*周|上周", re.IGNORECASE),
+     lambda m: {"raw": "上周", "gte": "date_trunc('week', CURRENT_DATE) - INTERVAL '7 days'", "lt": "date_trunc('week', CURRENT_DATE)", "label": "上周(上周一至上周日)", "unit": "week", "amount": 1}),
+    (re.compile(r"上\s*(?:个月|月)", re.IGNORECASE),
+     lambda m: {"raw": "上月", "gte": "date_trunc('month', CURRENT_DATE) - INTERVAL '1 month'", "lt": "date_trunc('month', CURRENT_DATE)", "label": "上月(整月)", "unit": "month", "amount": 1}),
+    (re.compile(r"上\s*季度", re.IGNORECASE),
+     lambda m: {"raw": "上季度", "gte": "date_trunc('quarter', CURRENT_DATE) - INTERVAL '3 months'", "lt": "date_trunc('quarter', CURRENT_DATE)", "label": "上季度", "unit": "quarter", "amount": 1}),
+    (re.compile(r"去\s*年|去年", re.IGNORECASE),
+     lambda m: {"raw": "去年", "gte": "date_trunc('year', CURRENT_DATE) - INTERVAL '1 year'", "lt": "date_trunc('year', CURRENT_DATE)", "label": "去年(整年)", "unit": "year", "amount": 1}),
+]
+
+
+def _handle_n(m) -> dict | None:
+    """处理「最近N天/周/月/年」"""
+    num_s = m.group("num")
+    unit = m.group("unit")
+    n = _cn_to_int(num_s)
+    if n is None or n <= 0:
+        return None
+    # 纵深防御：即便上游规则被绕过，也绝不能把 2023 这样的绝对年份当成"最近 2023 年"
+    if unit == "年" and 1900 <= n <= 2199:
+        return None
+    if n > 3650:  # 上限 10 年，防止无意义的大区间
+        n = 3650
+    unit_map = {"天": ("days", "天"), "日": ("days", "天"), "周": ("weeks", "周"),
+                "星期": ("weeks", "周"), "个月": ("months", "个月"), "月": ("months", "个月"),
+                "年": ("years", "年")}
+    sql_unit, label = unit_map.get(unit, ("days", "天"))
+    # 「最近N天(含今天)」= 今天 + 过去 N-1 天，共 N 个日历日；
+    # 直接用 INTERVAL 'N days' 会含 N+1 天（off-by-one）。周/月/年按整周期语义不变。
+    interval_amount = n - 1 if sql_unit == "days" else n
+    return _interval(n, sql_unit, label, interval_amount)
+
+
+def parse_time_expr(query: str) -> dict | None:
+    """从自然语言问题中提取时间表达式，返回 {raw, gte, lt?, label, unit, amount} 或 None。
+
+    只识别第一个命中（时间范围类表达），避免多个时间词互相冲突。
+    """
+    if not query:
+        return None
+    for pat, handler in _RULES:
+        m = pat.search(query)
+        if m:
+            try:
+                r = handler(m)
+                if r:
+                    return r
+            except Exception:
+                continue
+    return None
+
+
+# PG → MySQL 日期表达式转换（PG 专用语法映射为 MySQL 等价写法）
+_MYSQL_UNIT = {"day": "DAY", "days": "DAY", "week": "WEEK", "weeks": "WEEK",
+               "month": "MONTH", "months": "MONTH", "year": "YEAR", "years": "YEAR"}
+
+
+def _mysql_expr(expr: str) -> str:
+    """把 PG 方言日期表达式转换为 MySQL 等价表达式（只覆盖本模块生成的形式）"""
+    e = expr
+    e = re.sub(r"date_trunc\('week',\s*CURRENT_DATE\)",
+               "DATE_SUB(CURDATE(), INTERVAL WEEKDAY(CURDATE()) DAY)", e, flags=re.I)
+    e = re.sub(r"date_trunc\('month',\s*CURRENT_DATE\)",
+               "DATE_FORMAT(CURDATE(), '%Y-%m-01')", e, flags=re.I)
+    e = re.sub(r"date_trunc\('quarter',\s*CURRENT_DATE\)",
+               "DATE_SUB(DATE_FORMAT(CURDATE(), '%Y-%m-01'), "
+               "INTERVAL ((MONTH(CURDATE())-1) MOD 3) MONTH)", e, flags=re.I)
+    e = re.sub(r"date_trunc\('year',\s*CURRENT_DATE\)",
+               "DATE_FORMAT(CURDATE(), '%Y-01-01')", e, flags=re.I)
+    # INTERVAL 'N unit' → INTERVAL N UNIT（MySQL 单位必须为单数大写）
+    e = re.sub(r"INTERVAL\s*'(\d+)\s*(\w+)'",
+               lambda m: f"INTERVAL {m.group(1)} {_MYSQL_UNIT.get(m.group(2).lower(), m.group(2).upper())}",
+               e, flags=re.I)
+    e = re.sub(r"\bCURRENT_DATE\b", "CURDATE()", e, flags=re.I)
+    return e
+
+
+def build_time_hint(query: str) -> str:
+    """生成可注入 SQL 生成 Prompt 的时间约束提示（按当前数据库方言输出，无命中返回空串）"""
+    t = parse_time_expr(query)
+    if not t:
+        return ""
+    try:
+        from database import get_db_type
+        is_mysql = get_db_type() == "mysql"
+    except Exception:
+        is_mysql = False
+    if is_mysql:
+        gte = _mysql_expr(t["gte"])
+        lt = _mysql_expr(t["lt"]) if t.get("lt") else ""
+    else:
+        gte, lt = t["gte"], t.get("lt", "")
+    if lt:
+        return (f"时间范围：\"{t['raw']}\" 对应日期区间为 "
+                f"[{gte}, {lt})（{t['label']}）。"
+                f"请在 WHERE 中把表的日期字段与该区间比较，例如 "
+                f"date_field >= {gte} AND date_field < {lt}。")
+    return (f"时间范围：\"{t['raw']}\" 对应日期下限为 {gte}（{t['label']}）。"
+            f"请在 WHERE 中把表的日期字段与该下限比较，例如 "
+            f"date_field >= {gte}。")
+
+
+if __name__ == "__main__":
+    for q in ["统计最近7天的产量", "最近三个月的不良率", "本周产量", "上个月销量",
+              "本季度各产线产量", "去年订单总额", "昨天停机次数", "近两周的良率",
+              "三天前的数据", "今年每个月的产量"]:
+        print(f"{q!r:20} -> {parse_time_expr(q)}")

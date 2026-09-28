@@ -1,0 +1,75 @@
+{
+  "_comment": "示例问法库 · 从已注册口径反向生成。数据源：演示库 yans（10 张制造表）。所有 expected 为 2026-09-24 实测值。",
+  "_generated_from": "metric_registry.BUILTIN_METRICS(64) + metrics_registry.json(29)",
+  "_verified_on": "yans@localhost:5432",
+  "version": 1,
+  "groups": [
+    {
+      "group": "良率质量",
+      "items": [
+        {"q": "全厂良率是多少", "metric": "良率", "tables": ["mes_process_output"], "expected": "97.56%"},
+        {"q": "各产线良率排名", "metric": "良率", "tables": ["mes_process_output", "dim_production_line"], "expected": "一车间-1号线 97.95 / 二车间-5号线 97.79 / 二车间-2号线 97.65 / 三车间-3号线 97.39 / 一车间-4号线 97.05"},
+        {"q": "哪条产线良率最低", "metric": "良率", "tables": ["mes_process_output", "dim_production_line"], "expected": "一车间-4号线 97.05%"},
+        {"q": "各工序良率从低到高", "metric": "良率", "tables": ["mes_process_output", "dim_process"], "expected": "功能测试 95.80 / 老化测试 96.20 / 波峰焊 96.57 / 插件装配 97.11 / 回流焊 97.94 / SMT贴片 98.28 / AOI检测 99.19 / 包装入库 99.21"},
+        {"q": "关键工序的良率怎么样", "metric": "良率", "tables": ["mes_process_output", "dim_process"], "expected": "功能测试 95.80 / 老化测试 96.20 / SMT贴片 98.28"},
+        {"q": "返工率是多少", "metric": "返工率", "tables": ["mes_process_output"], "expected": "0.86%（返工 27555 件）"},
+        {"q": "白班和夜班良率有差别吗", "metric": "良率", "tables": ["mes_process_output"], "expected": "白班 97.55% / 夜班 97.56%"}
+      ]
+    },
+    {
+      "group": "产量",
+      "items": [
+        {"q": "全厂总投入量和合格量", "metric": "投入量+合格数量", "tables": ["mes_process_output"], "expected": "投入 3187009 件 / 合格 3109120 件"},
+        {"q": "各产线投入产出对比", "metric": "投入量+合格数量", "tables": ["mes_process_output", "dim_production_line"], "expected": "三车间-3号线 687215/669275；一车间-1号线 660908/647353；二车间-2号线 651322/635991；一车间-4号线 648853/629690；二车间-5号线 538711/526811"},
+        {"q": "产量最高的十个产品", "metric": "合格数量", "tables": ["mes_process_output", "dim_product"], "expected": "传感器14 183230 / 控制器13 172296 / 通信模块12 161312 / 控制器05 160549 / 通信模块24 140367"},
+        {"q": "各工序的投入量分布", "metric": "投入量", "tables": ["mes_process_output", "dim_process"], "expected": "按工序分组求和 input_qty"}
+      ]
+    },
+    {
+      "group": "工单",
+      "items": [
+        {"q": "各状态的工单各有多少", "metric": "工单数", "tables": ["mes_work_order"], "expected": "已完成 207 / 已关闭 72 / 进行中 33 / 待生产 32"},
+        {"q": "在建工单有多少", "metric": "在产工单数", "tables": ["mes_work_order"], "expected": "33 单"},
+        {"q": "还没开工的工单", "metric": "待生产工单数", "tables": ["mes_work_order"], "expected": "32 单"},
+        {"q": "各产线的工单数", "metric": "工单数", "tables": ["mes_work_order", "dim_production_line"], "expected": "按产线分组计数"}
+      ]
+    },
+    {
+      "group": "质检与缺陷",
+      "items": [
+        {"q": "质检合格率是多少", "metric": "质检合格率", "tables": ["qms_inspection"], "expected": "97.04%（抽检 178200 件，不良 5273 件）"},
+        {"q": "累计抽检了多少件", "metric": "抽检数", "tables": ["qms_inspection"], "expected": "178200 件，共 1376 次抽检"},
+        {"q": "缺陷件数按类型排序", "metric": "缺陷件数", "tables": ["qms_defect_detail"], "expected": "老化异常 719 / 焊点虚焊 695 / 少件 688 / 标签错误 681 / 偏位 672 / 包装破损 640 / 外观划伤 596 / 功能失效 582"},
+        {"q": "严重缺陷有多少", "metric": "严重缺陷数", "tables": ["qms_defect_detail"], "expected": "少件 688 件、功能失效 582 件"},
+        {"q": "各工序的质检合格率", "metric": "质检合格率", "tables": ["qms_inspection", "dim_process"], "expected": "功能测试 94.78 / 老化测试 95.29 / AOI检测 99.02 / 包装入库 99.08"}
+      ]
+    },
+    {
+      "group": "设备与停机",
+      "items": [
+        {"q": "设备总数和状态分布", "metric": "设备数+运行设备数", "tables": ["dim_equipment"], "expected": "共 48 台：运行 36 / 空闲 8 / 维护 4"},
+        {"q": "各类型设备有多少台", "metric": "设备数", "tables": ["dim_equipment"], "expected": "8 类各 6 台：测试治具 / 贴片机 / 包装机 / AOI设备 / 回流炉 / 插件线 / 波峰焊机 / 老化柜"},
+        {"q": "停机总时长是多少", "metric": "停机时长+停机次数", "tables": ["eqp_downtime_record"], "expected": "15600 分钟，276 次"},
+        {"q": "停机时长最长的是什么原因", "metric": "停机时长", "tables": ["eqp_downtime_record"], "expected": "换线调机 3000 分钟（59 次）"},
+        {"q": "各产线停机时长对比", "metric": "停机时长", "tables": ["eqp_downtime_record", "dim_production_line"], "expected": "三车间-3号线 3460 / 一车间-4号线 3450 / 二车间-2号线 3110 / 一车间-1号线 2845 / 二车间-5号线 2735"},
+        {"q": "计划停机和故障停机各占多少", "metric": "计划内停机时长+非计划停机时长", "tables": ["eqp_downtime_record"], "expected": "非计划 184 次 8225 分钟 / 计划 152 次 7375 分钟"}
+      ]
+    },
+    {
+      "group": "库存",
+      "items": [
+        {"q": "当前总库存多少", "metric": "库存量+冻结库存", "tables": ["inv_inventory_snapshot"], "expected": "可用 3366671 / 冻结 40180"},
+        {"q": "各仓库库存分布", "metric": "库存量", "tables": ["inv_inventory_snapshot"], "expected": "WH-A 1191314 / WH-B 1093291 / WH-QA 1082066"},
+        {"q": "有多少产品的库存低于安全线", "metric": "库存预警数", "tables": ["inv_inventory_snapshot"], "expected": "0 个（演示数据安全线偏低，见 note）", "note": "最低可用库存 1731 高于最高安全线 1200，需调高 safety_stock_qty 才能触发"}
+      ]
+    },
+    {
+      "group": "跨表综合",
+      "items": [
+        {"q": "良率最低的产线，停机时间是不是也最长", "tables": ["mes_process_output", "dim_production_line", "eqp_downtime_record"], "expected": "良率最低是一车间-4号线（97.05%），停机 3450 分钟排第 2；停机最长的三车间-3号线良率 97.39% 排第 3"},
+        {"q": "哪个车间的综合表现最好", "tables": ["mes_process_output", "dim_production_line", "eqp_downtime_record"], "expected": "二车间良率 97.71% 最高；一车间 97.50%；三车间 97.39%"},
+        {"q": "出过不良的工单，都是什么状态的", "tables": ["qms_defect_detail", "qms_inspection", "mes_work_order"], "expected": "已完成 207 单 / 已关闭 72 单 / 进行中 33 单 / 待生产 32 单"}
+      ]
+    }
+  ]
+}

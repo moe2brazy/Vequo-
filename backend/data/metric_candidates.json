@@ -1,0 +1,3025 @@
+{
+ "candidates": {
+  "fe44f246c336": {
+   "id": "fe44f246c336",
+   "expr": "COUNT(em.id)",
+   "tables": [
+    "factory.equipment_maintenance"
+   ],
+   "dims": [
+    "name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各工厂的设备故障维修次数是多少",
+   "name": "maintenance_count",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789365506
+  },
+  "d3f26a50cf18": {
+   "id": "d3f26a50cf18",
+   "expr": "SUM(qi.fail_qty) WHERE inspect_date>=cast('2026-01-01'asdate)andinspect_date<cast('2027-01-01'asdate)",
+   "tables": [
+    "factory.quality_inspection"
+   ],
+   "dims": [
+    "CAST(qi.inspect_date AS TEXT)"
+   ],
+   "hit_count": 1,
+   "sample_question": "2026年每个月的质量检验不合格率是多少",
+   "name": "不合格率",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789365562
+  },
+  "1a7815e9889c": {
+   "id": "1a7815e9889c",
+   "expr": "COUNT(so.id) WHERE due_date<current_dateandnotstatusin('completed','shipped')",
+   "tables": [
+    "factory.sales_order"
+   ],
+   "dims": [
+    "name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各工厂的逾期销售订单数是多少",
+   "name": "逾期销售订单数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789365751
+  },
+  "2019ccd5305d": {
+   "id": "2019ccd5305d",
+   "expr": "AVG(poi.amount)",
+   "tables": [
+    "factory.purchase_order_item"
+   ],
+   "dims": [
+    "rating"
+   ],
+   "hit_count": 1,
+   "sample_question": "各供应商评级的平均采购金额是多少",
+   "name": "平均采购金额",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789365768
+  },
+  "a2b57bef5aef": {
+   "id": "a2b57bef5aef",
+   "expr": "SUM(poi.amount)",
+   "tables": [
+    "factory.purchase_order_item"
+   ],
+   "dims": [
+    "name"
+   ],
+   "hit_count": 1,
+   "sample_question": "采购金额最高的前5家供应商是哪些",
+   "name": "采购金额",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789365786
+  },
+  "fa1f81222d68": {
+   "id": "fa1f81222d68",
+   "expr": "AVG(s.rating)",
+   "tables": [
+    "factory.supplier"
+   ],
+   "dims": [
+    "status"
+   ],
+   "hit_count": 1,
+   "sample_question": "各供应商状态的平均到货率是多少",
+   "name": "平均到货率",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789365802
+  },
+  "6588a08061d0": {
+   "id": "6588a08061d0",
+   "expr": "AVG(so.total_amount)",
+   "tables": [
+    "factory.sales_order"
+   ],
+   "dims": [
+    "industry"
+   ],
+   "hit_count": 1,
+   "sample_question": "各客户行业的平均订单金额是多少",
+   "name": "平均订单金额",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789365815
+  },
+  "5d0f9f5217c5": {
+   "id": "5d0f9f5217c5",
+   "expr": "COUNT(*) WHERE quantity<safe_stock",
+   "tables": [
+    "factory.inventory"
+   ],
+   "dims": [
+    "warehouse"
+   ],
+   "hit_count": 1,
+   "sample_question": "各仓库低于安全库存的品种数是多少",
+   "name": "低于安全库存的品种数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789365833
+  },
+  "dce1163b4a52": {
+   "id": "dce1163b4a52",
+   "expr": "SUM(m.safety_stock - COALESCE(inv.quantity, 0))",
+   "tables": [
+    "factory.inventory",
+    "factory.material"
+   ],
+   "dims": [
+    "category"
+   ],
+   "hit_count": 1,
+   "sample_question": "各物料类别的安全库存缺口总量是多少",
+   "name": "安全库存缺口总量",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789365851
+  },
+  "d96c296c4470": {
+   "id": "d96c296c4470",
+   "expr": "COUNT(qi.id) WHERE result='不合格'",
+   "tables": [
+    "factory.quality_inspection"
+   ],
+   "dims": [
+    "category"
+   ],
+   "hit_count": 1,
+   "sample_question": "各产品类别的不合格检验批次数是多少",
+   "name": "不合格检验批次数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789365910
+  },
+  "8757cae3ce30": {
+   "id": "8757cae3ce30",
+   "expr": "COUNT(DISTINCT wo.id)",
+   "tables": [
+    "factory.work_order"
+   ],
+   "dims": [
+    "name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各工厂有质检记录的工单占比是多少",
+   "name": "工单总数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366019
+  },
+  "ba72a74609e9": {
+   "id": "ba72a74609e9",
+   "expr": "COUNT(DISTINCT qi.wo_id)",
+   "tables": [
+    "factory.quality_inspection"
+   ],
+   "dims": [
+    "name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各工厂有质检记录的工单占比是多少",
+   "name": "有质检记录工单数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366019
+  },
+  "bb4d936c0fa2": {
+   "id": "bb4d936c0fa2",
+   "expr": "COUNT(*) WHERE produced_qty>=plan_qty*1.1",
+   "tables": [
+    "factory.work_order"
+   ],
+   "dims": [],
+   "hit_count": 1,
+   "sample_question": "实际产量超过计划产量10%以上的工单有多少个",
+   "name": "工单数量",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366061
+  },
+  "eb00e3716104": {
+   "id": "eb00e3716104",
+   "expr": "SUM(COUNT(*))",
+   "tables": [
+    "factory.employee"
+   ],
+   "dims": [
+    "education"
+   ],
+   "hit_count": 1,
+   "sample_question": "各学历的员工人数占比是多少",
+   "name": "总人数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366108
+  },
+  "6a47e71260a8": {
+   "id": "6a47e71260a8",
+   "expr": "SUM(CASE WHEN e.gender = '男' THEN 1 ELSE 0 END) WHERE statusnotilike'%离职%'andstatusnotilike'%resign%'",
+   "tables": [
+    "factory.employee"
+   ],
+   "dims": [
+    "name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各工厂的男女员工比例是多少",
+   "name": "男性员工数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366130
+  },
+  "a993f299a309": {
+   "id": "a993f299a309",
+   "expr": "SUM(CASE WHEN e.gender = '女' THEN 1 ELSE 0 END) WHERE statusnotilike'%离职%'andstatusnotilike'%resign%'",
+   "tables": [
+    "factory.employee"
+   ],
+   "dims": [
+    "name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各工厂的男女员工比例是多少",
+   "name": "女性员工数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366130
+  },
+  "d8916ef69b2d": {
+   "id": "d8916ef69b2d",
+   "expr": "SUM(CASE WHEN e.gender IN ('男', '女') THEN 1 ELSE 0 END) WHERE statusnotilike'%离职%'andstatusnotilike'%resign%'",
+   "tables": [
+    "factory.employee"
+   ],
+   "dims": [
+    "name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各工厂的男女员工比例是多少",
+   "name": "男女比例",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366130
+  },
+  "8687df444ca8": {
+   "id": "8687df444ca8",
+   "expr": "AVG(e.salary)",
+   "tables": [
+    "factory.employee"
+   ],
+   "dims": [
+    "name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各工厂的平均薪资是多少",
+   "name": "平均薪资",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366136
+  },
+  "87b083941119": {
+   "id": "87b083941119",
+   "expr": "SUM(CASE WHEN pr.work_date >= CAST('2026-01-01' AS DATE) AND pr.work_date < CAST('2027-01-01' AS DATE) THEN pr.qty_produced ELSE 0 END) WHERE work_date>=cast('2025-01-01'asdate)andwork_date<cast('2027-01-01'asdate)",
+   "tables": [
+    "factory.production_record"
+   ],
+   "dims": [
+    "name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各工厂2025年与2026年的产量对比是多少",
+   "name": "2026年产量",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366267
+  },
+  "eafea84764d0": {
+   "id": "eafea84764d0",
+   "expr": "SUM(CASE WHEN e.gender ILIKE '%男%' OR e.gender = 'M' THEN 1 ELSE 0 END)",
+   "tables": [
+    "factory.employee"
+   ],
+   "dims": [
+    "name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各工厂的男女员工人数分别是多少",
+   "name": "男员工人数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366274
+  },
+  "7fceb574457e": {
+   "id": "7fceb574457e",
+   "expr": "SUM(CASE WHEN e.gender ILIKE '%女%' OR e.gender = 'F' THEN 1 ELSE 0 END)",
+   "tables": [
+    "factory.employee"
+   ],
+   "dims": [
+    "name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各工厂的男女员工人数分别是多少",
+   "name": "女员工人数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366274
+  },
+  "77b3293ae281": {
+   "id": "77b3293ae281",
+   "expr": "SUM(quantity)",
+   "tables": [
+    "factory.inventory"
+   ],
+   "dims": [
+    "warehouse"
+   ],
+   "hit_count": 1,
+   "sample_question": "各仓库的库存量与安全库存对比是多少",
+   "name": "库存量",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366281
+  },
+  "e1bb2a1fbb5c": {
+   "id": "e1bb2a1fbb5c",
+   "expr": "SUM(safe_stock)",
+   "tables": [
+    "factory.inventory"
+   ],
+   "dims": [
+    "warehouse"
+   ],
+   "hit_count": 1,
+   "sample_question": "各仓库的库存量与安全库存对比是多少",
+   "name": "安全库存",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366281
+  },
+  "ed67f7c85ed5": {
+   "id": "ed67f7c85ed5",
+   "expr": "COUNT(po.id)",
+   "tables": [
+    "factory.purchase_order"
+   ],
+   "dims": [
+    "credit_level"
+   ],
+   "hit_count": 1,
+   "sample_question": "各供应商评级的供应商数量与平均采购金额是多少",
+   "name": "供应商数量",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366294
+  },
+  "10e08b65c050": {
+   "id": "10e08b65c050",
+   "expr": "AVG(po.total_amount)",
+   "tables": [
+    "factory.purchase_order"
+   ],
+   "dims": [
+    "credit_level"
+   ],
+   "hit_count": 1,
+   "sample_question": "各供应商评级的供应商数量与平均采购金额是多少",
+   "name": "平均采购金额",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366294
+  },
+  "19db89b01810": {
+   "id": "19db89b01810",
+   "expr": "AVG(wo.plan_qty)",
+   "tables": [
+    "factory.work_order"
+   ],
+   "dims": [
+    "name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各工厂的工单平均计划量与平均实际量是多少",
+   "name": "平均计划量",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366325
+  },
+  "6b8cf974e1e7": {
+   "id": "6b8cf974e1e7",
+   "expr": "AVG(wo.produced_qty)",
+   "tables": [
+    "factory.work_order"
+   ],
+   "dims": [
+    "name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各工厂的工单平均计划量与平均实际量是多少",
+   "name": "平均实际量",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366325
+  },
+  "086830926cb7": {
+   "id": "086830926cb7",
+   "expr": "COUNT(DISTINCT e.id)",
+   "tables": [
+    "factory.equipment"
+   ],
+   "dims": [
+    "name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各工厂的设备数量与维修次数对比是多少",
+   "name": "equipment_count",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366333
+  },
+  "b949a869d7a6": {
+   "id": "b949a869d7a6",
+   "expr": "AVG(e.salary) WHERE avg(salary)>(selectavg(salary)fromfactory.employee)",
+   "tables": [
+    "factory.employee"
+   ],
+   "dims": [
+    "name"
+   ],
+   "hit_count": 1,
+   "sample_question": "平均薪资高于全厂平均水平的部门有哪些",
+   "name": "平均薪资",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366348
+  },
+  "d1a5d5ea7111": {
+   "id": "d1a5d5ea7111",
+   "expr": "COUNT(wo.id) WHERE notexists(select1fromfactory.quality_inspectionasqiwherewo_id=id)",
+   "tables": [
+    "factory.work_order"
+   ],
+   "dims": [],
+   "hit_count": 1,
+   "sample_question": "没有任何质检记录的工单有多少个",
+   "name": "无质检工单数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366364
+  },
+  "9e2a0ccd8153": {
+   "id": "9e2a0ccd8153",
+   "expr": "COUNT(m.id) WHERE notexists(select1fromfactory.purchase_order_itemaspoiwherematerial_id=id)",
+   "tables": [
+    "factory.material"
+   ],
+   "dims": [],
+   "hit_count": 1,
+   "sample_question": "从未被采购过的物料有多少个",
+   "name": "未被采购过的物料数量",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366376
+  },
+  "b54027806c77": {
+   "id": "b54027806c77",
+   "expr": "COUNT(*) WHERE qty_produced>(selectavg(qty_produced)fromfactory.production_record)",
+   "tables": [
+    "factory.production_record"
+   ],
+   "dims": [],
+   "hit_count": 1,
+   "sample_question": "产量超过全厂工单平均产量的工单有多少个",
+   "name": "工单数量",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366385
+  },
+  "09cb3c09d463": {
+   "id": "09cb3c09d463",
+   "expr": "SUM(oi.amount) WHERE item_type='material'",
+   "tables": [
+    "factory.purchase_order_item"
+   ],
+   "dims": [
+    "item_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "库存金额最高的前5个物料是哪些",
+   "name": "库存金额",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366404
+  },
+  "35017a06582f": {
+   "id": "35017a06582f",
+   "expr": "SUM(CASE WHEN e.education IN ('本科', '硕士', '博士') THEN 1 ELSE 0 END)",
+   "tables": [
+    "factory.employee"
+   ],
+   "dims": [
+    "name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各工厂高学历（本科及以上）的员工占比是多少",
+   "name": "高学历人数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366440
+  },
+  "b53d9b9b1bc6": {
+   "id": "b53d9b9b1bc6",
+   "expr": "SUM(CASE WHEN e.education IN ('本科', '硕士', '博士') THEN 1.0 ELSE 0.0 END)",
+   "tables": [
+    "factory.employee"
+   ],
+   "dims": [
+    "name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各工厂高学历（本科及以上）的员工占比是多少",
+   "name": "高学历占比",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366440
+  },
+  "cb85c7b51af1": {
+   "id": "cb85c7b51af1",
+   "expr": "SUM(soi.amount) WHERE order_date>=cast('2026-01-01'asdate)andorder_date<cast('2026-07-01'asdate)",
+   "tables": [
+    "factory.sales_order_item"
+   ],
+   "dims": [
+    "CAST(so.order_date AS TEXT)"
+   ],
+   "hit_count": 1,
+   "sample_question": "2026年上半年各月的销售金额是多少",
+   "name": "销售金额",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366455
+  },
+  "256c5b4f624b": {
+   "id": "256c5b4f624b",
+   "expr": "SUM(so.total_amount) WHERE status='发货中'",
+   "tables": [
+    "factory.sales_order"
+   ],
+   "dims": [
+    "industry"
+   ],
+   "hit_count": 1,
+   "sample_question": "各行业客户发货中状态的订单总金额是多少",
+   "name": "订单总金额",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789366491
+  },
+  "6ea6e9eb75b0": {
+   "id": "6ea6e9eb75b0",
+   "expr": "AVG(mes_work_order.plan_qty)",
+   "tables": [
+    "mes_work_order"
+   ],
+   "dims": [
+    "line_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各产线的平均单工单计划量是多少",
+   "name": "平均单工单计划量",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789368281
+  },
+  "eb8899116168": {
+   "id": "eb8899116168",
+   "expr": "COUNT(qms_inspection.inspection_id) WHERE inspection_result='fail'",
+   "tables": [
+    "qms_inspection"
+   ],
+   "dims": [
+    "product_category"
+   ],
+   "hit_count": 1,
+   "sample_question": "各产品类别的不合格检验批次数是多少",
+   "name": "不合格检验批次数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789368286
+  },
+  "72ba59ecb13b": {
+   "id": "72ba59ecb13b",
+   "expr": "COUNT(inv.snapshot_date)",
+   "tables": [
+    "inv_inventory_snapshot"
+   ],
+   "dims": [
+    "product_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各产品的库存快照天数是多少",
+   "name": "库存快照天数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789368305
+  },
+  "3235db53ddd0": {
+   "id": "3235db53ddd0",
+   "expr": "COUNT(*) WHERE notequipment_idin(selectdistinctequipment_idfromeqp_downtime_record)",
+   "tables": [
+    "dim_equipment",
+    "eqp_downtime_record"
+   ],
+   "dims": [],
+   "hit_count": 1,
+   "sample_question": "没有停机记录的设备有多少台",
+   "name": "没有停机记录的设备台数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789368320
+  },
+  "9136ea47864c": {
+   "id": "9136ea47864c",
+   "expr": "SUM(CASE WHEN \"severity_level\" = 'critical' THEN 1 ELSE 0 END)",
+   "tables": [
+    "qms_defect_detail"
+   ],
+   "dims": [
+    "defect_type"
+   ],
+   "hit_count": 1,
+   "sample_question": "各缺陷类型中严重与非严重的数量分别是多少",
+   "name": "严重缺陷数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789368397
+  },
+  "e8ea58367c1e": {
+   "id": "e8ea58367c1e",
+   "expr": "SUM(CASE WHEN \"severity_level\" <> 'critical' THEN 1 ELSE 0 END)",
+   "tables": [
+    "qms_defect_detail"
+   ],
+   "dims": [
+    "defect_type"
+   ],
+   "hit_count": 1,
+   "sample_question": "各缺陷类型中严重与非严重的数量分别是多少",
+   "name": "非严重缺陷数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789368397
+  },
+  "c351207b3568": {
+   "id": "c351207b3568",
+   "expr": "COUNT(eqp_downtime_record.downtime_id)",
+   "tables": [
+    "eqp_downtime_record"
+   ],
+   "dims": [
+    "downtime_reason"
+   ],
+   "hit_count": 1,
+   "sample_question": "各设备的停机原因分布是怎样的",
+   "name": "停机次数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789368407
+  },
+  "f1578839f720": {
+   "id": "f1578839f720",
+   "expr": "MAX(CAST(dr.start_time AS DATE))",
+   "tables": [
+    "eqp_downtime_record"
+   ],
+   "dims": [
+    "equipment_name",
+    "equipment_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "各设备最近一次停机距今天数",
+   "name": "距今天数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789368438
+  },
+  "e815178ecc2d": {
+   "id": "e815178ecc2d",
+   "expr": "MAX(q.inspection_date)",
+   "tables": [
+    "qms_inspection"
+   ],
+   "dims": [
+    "product_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各产品最后一次检验距今多少天",
+   "name": "最后一次检验距今天数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789368447
+  },
+  "baeac3a8642b": {
+   "id": "baeac3a8642b",
+   "expr": "AVG(CURRENT_DATE - e.install_date)",
+   "tables": [
+    "dim_equipment"
+   ],
+   "dims": [
+    "workshop_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各车间的设备平均服役天数",
+   "name": "平均服役天数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789368465
+  },
+  "79b4fc7bd322": {
+   "id": "79b4fc7bd322",
+   "expr": "MIN(po.stat_date)",
+   "tables": [
+    "mes_process_output"
+   ],
+   "dims": [
+    "line_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各产线首次产出与末次产出相隔多少天",
+   "name": "first_output_date",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789368487
+  },
+  "b1bdecbba096": {
+   "id": "b1bdecbba096",
+   "expr": "MAX(po.stat_date)",
+   "tables": [
+    "mes_process_output"
+   ],
+   "dims": [
+    "line_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各产线首次产出与末次产出相隔多少天",
+   "name": "last_output_date",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789368487
+  },
+  "21dadb73729d": {
+   "id": "21dadb73729d",
+   "expr": "COUNT(DISTINCT dp.product_id)",
+   "tables": [
+    "dim_product"
+   ],
+   "dims": [
+    "line_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "各车间的产品覆盖数是多少",
+   "name": "产品覆盖数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789370765
+  },
+  "f377b45112d4": {
+   "id": "f377b45112d4",
+   "expr": "COUNT(DISTINCT s.snapshot_date)",
+   "tables": [
+    "inv_inventory_snapshot"
+   ],
+   "dims": [
+    "product_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各产品的库存快照天数是多少",
+   "name": "库存快照天数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789370780
+  },
+  "b0a5c1b075d5": {
+   "id": "b0a5c1b075d5",
+   "expr": "MAX(r.end_time)",
+   "tables": [
+    "eqp_downtime_record"
+   ],
+   "dims": [
+    "equipment_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各设备最近一次停机距今天数",
+   "name": "最近停机时间",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789370972
+  },
+  "5920d4e69ba8": {
+   "id": "5920d4e69ba8",
+   "expr": "COUNT(DISTINCT po.\"process_id\")",
+   "tables": [
+    "mes_process_output"
+   ],
+   "dims": [
+    "work_order_id",
+    "work_order_no"
+   ],
+   "hit_count": 1,
+   "sample_question": "各工单是否走完全部工序",
+   "name": "实际完成工序数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789371062
+  },
+  "4eb1b7cc7aea": {
+   "id": "4eb1b7cc7aea",
+   "expr": "SUM(COALESCE(mpo.input_qty, 0))",
+   "tables": [
+    "mes_process_output"
+   ],
+   "dims": [
+    "line_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各产线的非合格产出合计是多少",
+   "name": "非合格产出合计",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789371082
+  },
+  "945980dea40d": {
+   "id": "945980dea40d",
+   "expr": "SUM(SUM(COALESCE(o.defect_qty, 0)))",
+   "tables": [
+    "mes_process_output"
+   ],
+   "dims": [
+    "process_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各工序不良占全厂不良的比例是多少",
+   "name": "全厂不良总数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789372251
+  },
+  "65f1ed6008bb": {
+   "id": "65f1ed6008bb",
+   "expr": "COUNT(mes_process_output.product_id)",
+   "tables": [
+    "mes_process_output"
+   ],
+   "dims": [
+    "line_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "每个产线生产了多少种不同的产品",
+   "name": "不同产品种类数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789486132
+  },
+  "985ff0aa7f0e": {
+   "id": "985ff0aa7f0e",
+   "expr": "COUNT(DISTINCT po.product_id)",
+   "tables": [
+    "mes_process_output"
+   ],
+   "dims": [
+    "line_id",
+    "line_code",
+    "line_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "每个产线生产了多少种不同的产品",
+   "name": "product_count",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789486277
+  },
+  "c599b5862c9e": {
+   "id": "c599b5862c9e",
+   "expr": "COUNT(CASE WHEN e.is_planned THEN 1 END)",
+   "tables": [
+    "eqp_downtime_record"
+   ],
+   "dims": [
+    "workshop_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各车间计划停机和非计划停机的次数分别是多少",
+   "name": "planned_downtime_count",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789486320
+  },
+  "302a39d23e3b": {
+   "id": "302a39d23e3b",
+   "expr": "COUNT(CASE WHEN NOT e.is_planned THEN 1 END)",
+   "tables": [
+    "eqp_downtime_record"
+   ],
+   "dims": [
+    "workshop_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各车间计划停机和非计划停机的次数分别是多少",
+   "name": "unplanned_downtime_count",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789486320
+  },
+  "9f38ffd9a755": {
+   "id": "9f38ffd9a755",
+   "expr": "COUNT(*) WHERE count(*)>5",
+   "tables": [
+    "dim_equipment",
+    "eqp_downtime_record"
+   ],
+   "dims": [
+    "equipment_id",
+    "equipment_code",
+    "equipment_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "停机次数超过5次的设备中，累计停机时长最长的前5台是哪些",
+   "name": "downtime_count",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789486374
+  },
+  "f4f10182bbee": {
+   "id": "f4f10182bbee",
+   "expr": "SUM(d.downtime_minutes) WHERE count(*)>5",
+   "tables": [
+    "eqp_downtime_record"
+   ],
+   "dims": [
+    "equipment_id",
+    "equipment_code",
+    "equipment_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "停机次数超过5次的设备中，累计停机时长最长的前5台是哪些",
+   "name": "total_downtime_minutes",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789486374
+  },
+  "43574c4ce1db": {
+   "id": "43574c4ce1db",
+   "expr": "SUM(\"input_qty\")",
+   "tables": [
+    "mes_process_output"
+   ],
+   "dims": [
+    "output_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "每个产线生产了多少种不同的产品",
+   "name": "汇总",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789487073
+  },
+  "68affd37ee2d": {
+   "id": "68affd37ee2d",
+   "expr": "SUM(CASE WHEN e.is_planned IS FALSE THEN 1 ELSE 0 END)",
+   "tables": [
+    "eqp_downtime_record"
+   ],
+   "dims": [
+    "workshop_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各车间计划停机和非计划停机的次数分别是多少",
+   "name": "unplanned_downtime_count",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789487126
+  },
+  "11ba08c063f6": {
+   "id": "11ba08c063f6",
+   "expr": "LAG(daily_qty)",
+   "tables": [
+    "dim_production_line",
+    "mes_process_output"
+   ],
+   "dims": [],
+   "hit_count": 1,
+   "sample_question": "一车间-1号线6月1日至6月7日每天的产量相比前一天变化了多少",
+   "name": "较前一日变化量",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789487403
+  },
+  "93aa22a5e23b": {
+   "id": "93aa22a5e23b",
+   "expr": "SUM(mes_process_output.good_qty + mes_process_output.defect_qty) WHERE line_name='一车间-1号线'andstat_date>=date_trunc('year',current_date)+interval'5'monthsandstat_date<date_trunc('year',current_date)+interval'5'months+interval'7'days",
+   "tables": [
+    "mes_process_output"
+   ],
+   "dims": [
+    "stat_date"
+   ],
+   "hit_count": 1,
+   "sample_question": "一车间-1号线6月1日至6月7日每天的产量相比前一天变化了多少",
+   "name": "daily_output",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789487885
+  },
+  "cce82c20662c": {
+   "id": "cce82c20662c",
+   "expr": "LAG(SUM(mes_process_output.good_qty + mes_process_output.defect_qty)) WHERE line_name='一车间-1号线'andstat_date>=date_trunc('year',current_date)+interval'5'monthsandstat_date<date_trunc('year',current_date)+interval'5'months+interval'7'days",
+   "tables": [
+    "mes_process_output"
+   ],
+   "dims": [
+    "stat_date"
+   ],
+   "hit_count": 1,
+   "sample_question": "一车间-1号线6月1日至6月7日每天的产量相比前一天变化了多少",
+   "name": "prev_output",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789487885
+  },
+  "ee475f7f8abc": {
+   "id": "ee475f7f8abc",
+   "expr": "COUNT(CASE WHEN ed.is_planned = TRUE THEN 1 END)",
+   "tables": [
+    "eqp_downtime_record"
+   ],
+   "dims": [
+    "workshop_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各车间计划停机和非计划停机的次数分别是多少",
+   "name": "planned_count",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789488160
+  },
+  "c9d0e3c0c13c": {
+   "id": "c9d0e3c0c13c",
+   "expr": "COUNT(CASE WHEN ed.is_planned = FALSE THEN 1 END)",
+   "tables": [
+    "eqp_downtime_record"
+   ],
+   "dims": [
+    "workshop_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各车间计划停机和非计划停机的次数分别是多少",
+   "name": "non_planned_count",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789488160
+  },
+  "d6fde07e635b": {
+   "id": "d6fde07e635b",
+   "expr": "SUM(o.input_qty) WHERE process_name=(selectprocess_namefromlowest_process)",
+   "tables": [
+    "mes_process_output"
+   ],
+   "dims": [
+    "process_name",
+    "line_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "良率最低的工序在哪些产线上执行",
+   "name": "投入量",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789488419
+  },
+  "6be53410f2ae": {
+   "id": "6be53410f2ae",
+   "expr": "SUM(o.good_qty) WHERE process_name=(selectprocess_namefromlowest_process)",
+   "tables": [
+    "mes_process_output"
+   ],
+   "dims": [
+    "process_name",
+    "line_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "良率最低的工序在哪些产线上执行",
+   "name": "合格量",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789488419
+  },
+  "da6f68050e9c": {
+   "id": "da6f68050e9c",
+   "expr": "LAG(total_output)",
+   "tables": [
+    "dim_production_line",
+    "mes_process_output"
+   ],
+   "dims": [],
+   "hit_count": 1,
+   "sample_question": "一车间-1号线6月1日至6月7日每天的产量相比前一天变化了多少",
+   "name": "diff_from_prev_day",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789489004
+  },
+  "c181178e9c75": {
+   "id": "c181178e9c75",
+   "expr": "COUNT(DISTINCT e.equipment_id) WHERE notline_idisnull",
+   "tables": [
+    "dim_equipment"
+   ],
+   "dims": [
+    "line_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "每个产线生产了多少种不同的产品",
+   "name": "设备数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789489217
+  },
+  "39da641dd27a": {
+   "id": "39da641dd27a",
+   "expr": "COUNT(r.downtime_id) WHERE count(downtime_id)>5",
+   "tables": [
+    "eqp_downtime_record"
+   ],
+   "dims": [
+    "equipment_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "停机次数超过5次的设备中，累计停机时长最长的前5台是哪些",
+   "name": "停机次数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789489327
+  },
+  "fe3e0c660c9a": {
+   "id": "fe3e0c660c9a",
+   "expr": "SUM(r.downtime_minutes) WHERE count(downtime_id)>5",
+   "tables": [
+    "eqp_downtime_record"
+   ],
+   "dims": [
+    "equipment_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "停机次数超过5次的设备中，累计停机时长最长的前5台是哪些",
+   "name": "累计停机时长",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789489327
+  },
+  "3ab1bb04eadc": {
+   "id": "3ab1bb04eadc",
+   "expr": "SUM(\"plan_qty\")",
+   "tables": [
+    "mes_work_order"
+   ],
+   "dims": [
+    "work_order_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "各车间的工单完成率是多少",
+   "name": "汇总",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789490797
+  },
+  "0f56064c0015": {
+   "id": "0f56064c0015",
+   "expr": "SUM(\"downtime_id\")",
+   "tables": [
+    "eqp_downtime_record"
+   ],
+   "dims": [
+    "equipment_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "各设备类型(equipment_type)分别有多少台设备",
+   "name": "汇总",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789491049
+  },
+  "05a255d44894": {
+   "id": "05a255d44894",
+   "expr": "COUNT(dim_equipment.equipment_id) WHERE purchase_date>='2024-01-01'andpurchase_date<='2024-12-31'",
+   "tables": [
+    "dim_equipment"
+   ],
+   "dims": [],
+   "hit_count": 1,
+   "sample_question": "2024年采购的设备有多少台",
+   "name": "2024年采购设备数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789491097
+  },
+  "0113858f7506": {
+   "id": "0113858f7506",
+   "expr": "COUNT(mes_process_output.process_id)",
+   "tables": [
+    "mes_process_output"
+   ],
+   "dims": [
+    "department"
+   ],
+   "hit_count": 1,
+   "sample_question": "各部门(department)分别有多少道工序",
+   "name": "工序数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789491148
+  },
+  "c59e0c585515": {
+   "id": "c59e0c585515",
+   "expr": "SUM(\"active_orders\")",
+   "tables": [
+    "dim_production_line"
+   ],
+   "dims": [
+    "line_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "各车间(workshop)分别有多少条产线",
+   "name": "汇总",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789491235
+  },
+  "9815227e8334": {
+   "id": "9815227e8334",
+   "expr": "COUNT(*) WHERE is_active=true",
+   "tables": [
+    "dim_product"
+   ],
+   "dims": [
+    "category"
+   ],
+   "hit_count": 1,
+   "sample_question": "各产品类别(category)的在产产品数量",
+   "name": "在产产品数量",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789491253
+  },
+  "4c0e9286d0c0": {
+   "id": "4c0e9286d0c0",
+   "expr": "COUNT(*) WHERE status='运行中'",
+   "tables": [
+    "dim_production_line"
+   ],
+   "dims": [],
+   "hit_count": 1,
+   "sample_question": "处于运行中状态的产线有多少条",
+   "name": "运行中产线数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789491268
+  },
+  "8fe5dae1c589": {
+   "id": "8fe5dae1c589",
+   "expr": "COUNT(w.work_order_id) WHERE notstatusin('已完成','已取消')",
+   "tables": [
+    "mes_work_order"
+   ],
+   "dims": [
+    "workshop"
+   ],
+   "hit_count": 1,
+   "sample_question": "各车间(workshop)的在制订单总数",
+   "name": "在制订单总数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789491274
+  },
+  "3eb16b71d0e7": {
+   "id": "3eb16b71d0e7",
+   "expr": "SUM(active_orders)",
+   "tables": [
+    "dim_production_line"
+   ],
+   "dims": [
+    "line_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "在制订单数最多的产线是哪条",
+   "name": "在制订单数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789491290
+  },
+  "15ea8470280b": {
+   "id": "15ea8470280b",
+   "expr": "SUM(\"defect_id\")",
+   "tables": [
+    "qms_defect_detail"
+   ],
+   "dims": [
+    "work_order_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "各处置方式(disposal)的缺陷数量是多少",
+   "name": "汇总",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789491336
+  },
+  "55e18fd5a55d": {
+   "id": "55e18fd5a55d",
+   "expr": "SUM(\"inspection_id\")",
+   "tables": [
+    "qms_inspection"
+   ],
+   "dims": [
+    "work_order_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "各检验结果(result)的检验记录数",
+   "name": "汇总",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789491351
+  },
+  "53f4967da358": {
+   "id": "53f4967da358",
+   "expr": "COUNT(*) WHERE result='不合格'",
+   "tables": [
+    "qms_inspection"
+   ],
+   "dims": [],
+   "hit_count": 1,
+   "sample_question": "检验结论(result)为不合格的记录有几条",
+   "name": "*",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789491386
+  },
+  "20e0ca32f6c6": {
+   "id": "20e0ca32f6c6",
+   "expr": "SUM(\"material_id\")",
+   "tables": [
+    "test_materials"
+   ],
+   "dims": [
+    "material_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各供应商(supplier)分别供应多少种物料",
+   "name": "汇总",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789491510
+  },
+  "0793b753a7c6": {
+   "id": "0793b753a7c6",
+   "expr": "SUM(\"factory_id\")",
+   "tables": [
+    "test_factories"
+   ],
+   "dims": [
+    "factory_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各工厂(factory_name)的产能(capacity)是多少",
+   "name": "汇总",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789491513
+  },
+  "ff5ff579d02f": {
+   "id": "ff5ff579d02f",
+   "expr": "SUM(\"order_id\")",
+   "tables": [
+    "test_orders"
+   ],
+   "dims": [
+    "customer_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各订单状态(status)分别有多少订单",
+   "name": "汇总",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789491537
+  },
+  "384f8e85ff0d": {
+   "id": "384f8e85ff0d",
+   "expr": "MAX(unit_cost)",
+   "tables": [
+    "test_materials"
+   ],
+   "dims": [
+    "material_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "单位成本(unit_cost)最高的物料是什么",
+   "name": "单位成本",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789491542
+  },
+  "77619fbf5d8f": {
+   "id": "77619fbf5d8f",
+   "expr": "MAX(unit_price)",
+   "tables": [
+    "test_orders"
+   ],
+   "dims": [
+    "order_id",
+    "customer_name",
+    "product_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "订单单价(unit_price)最高的订单是哪个",
+   "name": "订单单价",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789491572
+  },
+  "aa976c4abda4": {
+   "id": "aa976c4abda4",
+   "expr": "SUM(\"snapshot_id\")",
+   "tables": [
+    "inv_inventory_snapshot"
+   ],
+   "dims": [
+    "product_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "各物料单位(unit)的物料种类数是多少",
+   "name": "汇总",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789491573
+  },
+  "2c52913d9505": {
+   "id": "2c52913d9505",
+   "expr": "SUM(COALESCE(good_qty, 0) + COALESCE(defect_qty, 0)) WHERE sum(coalesce(good_qty,0)+coalesce(defect_qty,0))>(selectavg(coalesce(good_qty,0)+coalesce(defect_qty,0))frommes_process_output)",
+   "tables": [
+    "mes_process_output"
+   ],
+   "dims": [
+    "line_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "产量高于平均产量的产线有哪些",
+   "name": "总产量",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789491581
+  },
+  "513c6db957e7": {
+   "id": "513c6db957e7",
+   "expr": "SUM(\"process_seq\")",
+   "tables": [
+    "dim_process"
+   ],
+   "dims": [
+    "process_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "哪个工序的标准良率最低",
+   "name": "汇总",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789491634
+  },
+  "6c83d2d29763": {
+   "id": "6c83d2d29763",
+   "expr": "SUM(available_qty)",
+   "tables": [
+    "inv_inventory_snapshot",
+    "t"
+   ],
+   "dims": [
+    "1"
+   ],
+   "hit_count": 1,
+   "sample_question": "各库存产品按可用库存的充足程度分类",
+   "name": "可用库存合计",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789491766
+  },
+  "8ed56305911e": {
+   "id": "8ed56305911e",
+   "expr": "SUM(\"output_id\")",
+   "tables": [
+    "mes_process_output"
+   ],
+   "dims": [
+    "work_order_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "按工序顺序累计投入数量",
+   "name": "汇总",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789491794
+  },
+  "05c56d1346a7": {
+   "id": "05c56d1346a7",
+   "expr": "SUM(s.available_qty) WHERE sum(available_qty)>(selectavg(available_qty)frominv_inventory_snapshot)",
+   "tables": [
+    "inv_inventory_snapshot"
+   ],
+   "dims": [
+    "product_code",
+    "product_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "可用库存高于平均可用库存的产品有哪些",
+   "name": "可用库存合计",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789491889
+  },
+  "6e075cce57ff": {
+   "id": "6e075cce57ff",
+   "expr": "SUM(defect_qty)",
+   "tables": [
+    "qms_inspection"
+   ],
+   "dims": [],
+   "hit_count": 1,
+   "sample_question": "检验缺陷总数(defect_qty)是多少",
+   "name": "检验缺陷总数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789491943
+  },
+  "61d4ded34a7f": {
+   "id": "61d4ded34a7f",
+   "expr": "COUNT(*) WHERE defect_qty>0",
+   "tables": [
+    "dim_product",
+    "qms_inspection"
+   ],
+   "dims": [
+    "category"
+   ],
+   "hit_count": 1,
+   "sample_question": "各产品类别(category)的不合格检验记录数",
+   "name": "不合格检验记录数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789491996
+  },
+  "8d718b79ccc3": {
+   "id": "8d718b79ccc3",
+   "expr": "SUM(stock_qty) WHERE notsupplierisnull",
+   "tables": [
+    "test_materials"
+   ],
+   "dims": [
+    "supplier"
+   ],
+   "hit_count": 1,
+   "sample_question": "各供应商(supplier)的物料总库存是多少",
+   "name": "stock_qty",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789492070
+  },
+  "249f08623372": {
+   "id": "249f08623372",
+   "expr": "SUM(\"id\")",
+   "tables": [
+    "factory.department"
+   ],
+   "dims": [
+    "code"
+   ],
+   "hit_count": 1,
+   "sample_question": "统计每个部门的员工人数",
+   "name": "汇总",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789492187
+  },
+  "28ce317a387d": {
+   "id": "28ce317a387d",
+   "expr": "SUM(\"id\")",
+   "tables": [
+    "factory.employee"
+   ],
+   "dims": [
+    "code"
+   ],
+   "hit_count": 1,
+   "sample_question": "各学历(education)的员工人数是多少",
+   "name": "汇总",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789492188
+  },
+  "0887d97fa125": {
+   "id": "0887d97fa125",
+   "expr": "SUM(\"id\")",
+   "tables": [
+    "factory.workshop"
+   ],
+   "dims": [
+    "code"
+   ],
+   "hit_count": 1,
+   "sample_question": "各工厂的员工人数是多少",
+   "name": "汇总",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789492235
+  },
+  "d1016c9bf931": {
+   "id": "d1016c9bf931",
+   "expr": "COUNT(id) WHERE hire_date>=cast('2025-01-01'asdate)andhire_date<cast('2026-01-01'asdate)",
+   "tables": [
+    "factory.employee"
+   ],
+   "dims": [],
+   "hit_count": 1,
+   "sample_question": "2025年入职的员工有多少人",
+   "name": "2025年入职员工人数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789492267
+  },
+  "9922b6687197": {
+   "id": "9922b6687197",
+   "expr": "COUNT(attendance.id)",
+   "tables": [
+    "attendance"
+   ],
+   "dims": [
+    "status"
+   ],
+   "hit_count": 1,
+   "sample_question": "各考勤状态(status)的记录数是多少",
+   "name": "考勤状态记录数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789492418
+  },
+  "e1ebf78a6551": {
+   "id": "e1ebf78a6551",
+   "expr": "SUM(\"id\")",
+   "tables": [
+    "factory.attendance"
+   ],
+   "dims": [
+    "work_date"
+   ],
+   "hit_count": 1,
+   "sample_question": "各班次(shift)的考勤记录数是多少",
+   "name": "汇总",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789492421
+  },
+  "9c69d23a9c25": {
+   "id": "9c69d23a9c25",
+   "expr": "COUNT(attendance.id) WHERE status='迟到'",
+   "tables": [
+    "attendance"
+   ],
+   "dims": [],
+   "hit_count": 1,
+   "sample_question": "迟到(status)的记录有多少条",
+   "name": "迟到记录数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789492431
+  },
+  "9c278e57954b": {
+   "id": "9c278e57954b",
+   "expr": "COUNT(attendance.id) WHERE status='缺勤'",
+   "tables": [
+    "attendance"
+   ],
+   "dims": [],
+   "hit_count": 1,
+   "sample_question": "缺勤(status)的记录有多少条",
+   "name": "缺勤记录数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789492432
+  },
+  "372b82081d0b": {
+   "id": "372b82081d0b",
+   "expr": "COUNT(*) WHERE status='请假'",
+   "tables": [
+    "factory.attendance"
+   ],
+   "dims": [],
+   "hit_count": 1,
+   "sample_question": "请假的记录有多少条",
+   "name": "请假记录数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789492437
+  },
+  "da33cdaff4cd": {
+   "id": "da33cdaff4cd",
+   "expr": "SUM(\"id\")",
+   "tables": [
+    "factory.product"
+   ],
+   "dims": [
+    "code"
+   ],
+   "hit_count": 1,
+   "sample_question": "各设备类别(category)的设备数量是多少",
+   "name": "汇总",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789492474
+  },
+  "f311ef65a2ba": {
+   "id": "f311ef65a2ba",
+   "expr": "SUM(\"id\")",
+   "tables": [
+    "factory.equipment"
+   ],
+   "dims": [
+    "code"
+   ],
+   "hit_count": 1,
+   "sample_question": "各设备状态(status)的设备数量是多少",
+   "name": "汇总",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789492486
+  },
+  "77a0e7e28e6a": {
+   "id": "77a0e7e28e6a",
+   "expr": "COUNT(equipment.id) WHERE status='正常'",
+   "tables": [
+    "equipment"
+   ],
+   "dims": [],
+   "hit_count": 1,
+   "sample_question": "处于正常状态的设备有多少台",
+   "name": "正常状态设备数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789492488
+  },
+  "79ca519afda2": {
+   "id": "79ca519afda2",
+   "expr": "SUM(\"id\")",
+   "tables": [
+    "factory.equipment_maintenance"
+   ],
+   "dims": [
+    "type"
+   ],
+   "hit_count": 1,
+   "sample_question": "各维护类型(type)的记录数是多少",
+   "name": "汇总",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789492502
+  },
+  "961d952553b7": {
+   "id": "961d952553b7",
+   "expr": "SUM(\"id\")",
+   "tables": [
+    "factory.factory"
+   ],
+   "dims": [
+    "code"
+   ],
+   "hit_count": 1,
+   "sample_question": "各工厂的设备数量是多少",
+   "name": "汇总",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789492525
+  },
+  "d3864d09861d": {
+   "id": "d3864d09861d",
+   "expr": "AVG(cost)",
+   "tables": [
+    "factory.equipment_maintenance"
+   ],
+   "dims": [
+    "type"
+   ],
+   "hit_count": 1,
+   "sample_question": "平均每次维护费用是多少",
+   "name": "avg_maintenance_cost",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789492544
+  },
+  "6cce9d00f27c": {
+   "id": "6cce9d00f27c",
+   "expr": "AVG(equipment_maintenance.downtime_hours)",
+   "tables": [
+    "equipment_maintenance"
+   ],
+   "dims": [
+    "type"
+   ],
+   "hit_count": 1,
+   "sample_question": "各维护类型(type)的平均停机时长是多少",
+   "name": "平均停机时长",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789492561
+  },
+  "3ce0d5aa5341": {
+   "id": "3ce0d5aa5341",
+   "expr": "COUNT(production_record.id) WHERE qty_defect>'0'",
+   "tables": [
+    "production_record"
+   ],
+   "dims": [],
+   "hit_count": 1,
+   "sample_question": "不良数量(qty_defect)大于0的生产记录条数",
+   "name": "不良数量大于0的生产记录条数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789492642
+  },
+  "6eb79d372286": {
+   "id": "6eb79d372286",
+   "expr": "COUNT(pr.id)",
+   "tables": [
+    "factory.production_record"
+   ],
+   "dims": [
+    "id",
+    "code",
+    "name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各产线的生产记录条数",
+   "name": "",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789492645
+  },
+  "6803dd710a98": {
+   "id": "6803dd710a98",
+   "expr": "SUM(\"id\")",
+   "tables": [
+    "factory.work_order"
+   ],
+   "dims": [
+    "wo_no"
+   ],
+   "hit_count": 1,
+   "sample_question": "各工单状态(status)的工单数量是多少",
+   "name": "汇总",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789492656
+  },
+  "a57824106d48": {
+   "id": "a57824106d48",
+   "expr": "SUM(CASE WHEN qi.inspection_result = 'fail' THEN 1 ELSE 0 END)",
+   "tables": [
+    "qms_inspection"
+   ],
+   "dims": [
+    "work_order_no",
+    "work_order_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "工单批不合格率",
+   "name": "batch_fail_rate",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789831831
+  },
+  "c9b8fd4c5b8a": {
+   "id": "c9b8fd4c5b8a",
+   "expr": "COUNT(*) WHERE inspection_resultin('pass','fail')",
+   "tables": [
+    "mes_work_order",
+    "qms_inspection"
+   ],
+   "dims": [
+    "work_order_no",
+    "work_order_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "工单批不合格率",
+   "name": "batch_cnt",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789832061
+  },
+  "7244d769058a": {
+   "id": "7244d769058a",
+   "expr": "SUM(CASE WHEN i.inspection_result = 'fail' THEN 1 ELSE 0 END) WHERE inspection_resultin('pass','fail')",
+   "tables": [
+    "qms_inspection"
+   ],
+   "dims": [
+    "work_order_no",
+    "work_order_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "工单批不合格率",
+   "name": "fail_batch_cnt",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789832061
+  },
+  "d96a7b400066": {
+   "id": "d96a7b400066",
+   "expr": "SUM(CASE WHEN d.severity_level IN ('重大', '特大') THEN d.defect_qty ELSE 0 END)",
+   "tables": [
+    "qms_defect_detail"
+   ],
+   "dims": [
+    "line_name",
+    "process_name",
+    "process_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "各产线各责任工序中，重大及以上等级缺陷占全部缺陷的比重，降序排列",
+   "name": "major_defect_qty",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789833030
+  },
+  "dc907537131e": {
+   "id": "dc907537131e",
+   "expr": "SUM(d.defect_qty)",
+   "tables": [
+    "qms_defect_detail"
+   ],
+   "dims": [
+    "line_name",
+    "process_name",
+    "process_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "各产线各责任工序中，重大及以上等级缺陷占全部缺陷的比重，降序排列",
+   "name": "total_defect_qty",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789833030
+  },
+  "09ea7e2ee680": {
+   "id": "09ea7e2ee680",
+   "expr": "SUM(COALESCE(d.downtime_minutes, 0))",
+   "tables": [
+    "dim_production_line",
+    "eqp_downtime_record",
+    "mes_process_output"
+   ],
+   "dims": [
+    "line_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各产线的每千件产出折算停机分钟数（衡量设备损失对产出的影响），降序排列",
+   "name": "downtime_minutes_per_1000_output",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789833335
+  },
+  "ab47cc6363b2": {
+   "id": "ab47cc6363b2",
+   "expr": "COUNT(DISTINCT qd.defect_id)",
+   "tables": [
+    "qms_defect_detail"
+   ],
+   "dims": [
+    "process_name",
+    "severity_level",
+    "product_category",
+    "process_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "各责任工序在各严重度下、针对各产品类别的缺陷记录数和涉及产品数，降序排列",
+   "name": "defect_record_count",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789833916
+  },
+  "5642717a5996": {
+   "id": "5642717a5996",
+   "expr": "SUM(\"defect_qty\")",
+   "tables": [
+    "qms_defect_detail"
+   ],
+   "dims": [
+    "defect_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "各产线的缺陷明细合计件数，以及占全部缺陷总量的比重（百分数，保留两位小数），降序排列",
+   "name": "汇总",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789834215
+  },
+  "a60c0ad0ce58": {
+   "id": "a60c0ad0ce58",
+   "expr": "COUNT(i.inspection_id)",
+   "tables": [
+    "qms_inspection"
+   ],
+   "dims": [
+    "product_category"
+   ],
+   "hit_count": 1,
+   "sample_question": "各产品类别的抽检批次数、不合格批次数，以及不合格批次数占抽检批次数的比重（百分数，保留两位小数），降序排列",
+   "name": "抽检批次数",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789834270
+  },
+  "23bdfe84de7a": {
+   "id": "23bdfe84de7a",
+   "expr": "SUM(mpo.good_qty + mpo.defect_qty)",
+   "tables": [
+    "mes_process_output"
+   ],
+   "dims": [
+    "workshop_name",
+    "line_name",
+    "product_category",
+    "line_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "各车间各产线各产品类别的产量、合格数量和不良数",
+   "name": "total_output_qty",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789882230
+  },
+  "203a2e40bf43": {
+   "id": "203a2e40bf43",
+   "expr": "SUM(row_count)",
+   "tables": [
+    "dim_equipment",
+    "dim_process",
+    "dim_product",
+    "dim_production_line",
+    "eqp_downtime_record",
+    "qms_defect_detail"
+   ],
+   "dims": [
+    "table_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各张表大概有多少行数据",
+   "name": "row_count",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789964660
+  },
+  "ec043b84bda6": {
+   "id": "ec043b84bda6",
+   "expr": "SUM(CASE WHEN mo.order_status = '非计划' THEN EXTRACT(EPOCH FROM (CAST(mo.end_date AS TIMESTAMP) - CAST(mo.start_date AS TIMESTAMP))) / 60 ELSE 0 END)",
+   "tables": [
+    "mes_work_order"
+   ],
+   "dims": [
+    "line_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "各产线的不可用分钟中，非计划部分的占比（百分数，保留两位小数），降序排列",
+   "name": "非计划占比",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789966664
+  },
+  "772f595d326b": {
+   "id": "772f595d326b",
+   "expr": "SUM(CASE WHEN NOT e.is_planned THEN e.downtime_minutes ELSE 0 END)",
+   "tables": [
+    "eqp_downtime_record"
+   ],
+   "dims": [
+    "line_name",
+    "line_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "各产线的不可用分钟中，非计划部分的占比（百分数，保留两位小数），降序排列",
+   "name": "non_planned_percent",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1789968551
+  },
+  "d6f946533789": {
+   "expr": "SUM(standard_yield_rate)",
+   "field": "standard_yield_rate",
+   "field_type": "numeric",
+   "sample": "",
+   "table": "dim_process",
+   "tables": [
+    "dim_process"
+   ],
+   "time_col": "",
+   "name": "合计(standard_yield_rate)",
+   "aliases": [],
+   "unit": "",
+   "description": "来自表 dim_process 的 standard_yield_rate 字段（自动扫描候选）",
+   "source": "schema_scan",
+   "id": "d6f946533789",
+   "hit_count": 1,
+   "status": "pending",
+   "mined_at": 1789986337
+  },
+  "e59b97116f26": {
+   "expr": "AVG(available_qty)",
+   "field": "available_qty",
+   "field_type": "integer",
+   "sample": "",
+   "table": "inv_inventory_snapshot",
+   "tables": [
+    "inv_inventory_snapshot"
+   ],
+   "time_col": "snapshot_date",
+   "name": "平均(available_qty)",
+   "aliases": [],
+   "unit": "",
+   "description": "来自表 inv_inventory_snapshot 的 available_qty 字段（自动扫描候选）",
+   "source": "schema_scan",
+   "id": "e59b97116f26",
+   "hit_count": 1,
+   "status": "pending",
+   "mined_at": 1789986337
+  },
+  "0bdf7dc28e4b": {
+   "expr": "AVG(frozen_qty)",
+   "field": "frozen_qty",
+   "field_type": "integer",
+   "sample": "",
+   "table": "inv_inventory_snapshot",
+   "tables": [
+    "inv_inventory_snapshot"
+   ],
+   "time_col": "snapshot_date",
+   "name": "平均(frozen_qty)",
+   "aliases": [],
+   "unit": "",
+   "description": "来自表 inv_inventory_snapshot 的 frozen_qty 字段（自动扫描候选）",
+   "source": "schema_scan",
+   "id": "0bdf7dc28e4b",
+   "hit_count": 1,
+   "status": "pending",
+   "mined_at": 1789986337
+  },
+  "ba4551d6d905": {
+   "expr": "AVG(safety_stock_qty)",
+   "field": "safety_stock_qty",
+   "field_type": "integer",
+   "sample": "",
+   "table": "inv_inventory_snapshot",
+   "tables": [
+    "inv_inventory_snapshot"
+   ],
+   "time_col": "snapshot_date",
+   "name": "平均(safety_stock_qty)",
+   "aliases": [],
+   "unit": "",
+   "description": "来自表 inv_inventory_snapshot 的 safety_stock_qty 字段（自动扫描候选）",
+   "source": "schema_scan",
+   "id": "ba4551d6d905",
+   "hit_count": 1,
+   "status": "pending",
+   "mined_at": 1789986337
+  },
+  "b4c863c9080c": {
+   "expr": "AVG(good_qty)",
+   "field": "good_qty",
+   "field_type": "integer",
+   "sample": "",
+   "table": "mes_process_output",
+   "tables": [
+    "mes_process_output"
+   ],
+   "time_col": "stat_date",
+   "name": "平均(good_qty)",
+   "aliases": [],
+   "unit": "",
+   "description": "来自表 mes_process_output 的 good_qty 字段（自动扫描候选）",
+   "source": "schema_scan",
+   "id": "b4c863c9080c",
+   "hit_count": 1,
+   "status": "pending",
+   "mined_at": 1789986337
+  },
+  "86f1d0b9db57": {
+   "expr": "AVG(defect_qty)",
+   "field": "defect_qty",
+   "field_type": "integer",
+   "sample": "",
+   "table": "mes_process_output",
+   "tables": [
+    "mes_process_output"
+   ],
+   "time_col": "stat_date",
+   "name": "平均(defect_qty)",
+   "aliases": [],
+   "unit": "",
+   "description": "来自表 mes_process_output 的 defect_qty 字段（自动扫描候选）",
+   "source": "schema_scan",
+   "id": "86f1d0b9db57",
+   "hit_count": 1,
+   "status": "pending",
+   "mined_at": 1789986337
+  },
+  "02965452e25d": {
+   "expr": "SUM(rework_qty)",
+   "field": "rework_qty",
+   "field_type": "integer",
+   "sample": "",
+   "table": "mes_process_output",
+   "tables": [
+    "mes_process_output"
+   ],
+   "time_col": "stat_date",
+   "name": "合计(rework_qty)",
+   "aliases": [],
+   "unit": "",
+   "description": "来自表 mes_process_output 的 rework_qty 字段（自动扫描候选）",
+   "source": "schema_scan",
+   "id": "02965452e25d",
+   "hit_count": 1,
+   "status": "pending",
+   "mined_at": 1789986337
+  },
+  "e6da8975dd70": {
+   "expr": "AVG(rework_qty)",
+   "field": "rework_qty",
+   "field_type": "integer",
+   "sample": "",
+   "table": "mes_process_output",
+   "tables": [
+    "mes_process_output"
+   ],
+   "time_col": "stat_date",
+   "name": "平均(rework_qty)",
+   "aliases": [],
+   "unit": "",
+   "description": "来自表 mes_process_output 的 rework_qty 字段（自动扫描候选）",
+   "source": "schema_scan",
+   "id": "e6da8975dd70",
+   "hit_count": 1,
+   "status": "pending",
+   "mined_at": 1789986337
+  },
+  "8d1d6a51718e": {
+   "expr": "AVG(defect_qty)",
+   "field": "defect_qty",
+   "field_type": "integer",
+   "sample": "",
+   "table": "qms_defect_detail",
+   "tables": [
+    "qms_defect_detail"
+   ],
+   "time_col": "",
+   "name": "平均(defect_qty)",
+   "aliases": [],
+   "unit": "",
+   "description": "来自表 qms_defect_detail 的 defect_qty 字段（自动扫描候选）",
+   "source": "schema_scan",
+   "id": "8d1d6a51718e",
+   "hit_count": 1,
+   "status": "pending",
+   "mined_at": 1789986337
+  },
+  "5c6a2a8fc7f1": {
+   "expr": "AVG(sample_qty)",
+   "field": "sample_qty",
+   "field_type": "integer",
+   "sample": "",
+   "table": "qms_inspection",
+   "tables": [
+    "qms_inspection"
+   ],
+   "time_col": "inspection_date",
+   "name": "平均(sample_qty)",
+   "aliases": [],
+   "unit": "",
+   "description": "来自表 qms_inspection 的 sample_qty 字段（自动扫描候选）",
+   "source": "schema_scan",
+   "id": "5c6a2a8fc7f1",
+   "hit_count": 1,
+   "status": "pending",
+   "mined_at": 1789986337
+  },
+  "943f233fed01": {
+   "expr": "AVG(defect_qty)",
+   "field": "defect_qty",
+   "field_type": "integer",
+   "sample": "",
+   "table": "qms_inspection",
+   "tables": [
+    "qms_inspection"
+   ],
+   "time_col": "inspection_date",
+   "name": "平均(defect_qty)",
+   "aliases": [],
+   "unit": "",
+   "description": "来自表 qms_inspection 的 defect_qty 字段（自动扫描候选）",
+   "source": "schema_scan",
+   "id": "943f233fed01",
+   "hit_count": 1,
+   "status": "pending",
+   "mined_at": 1789986337
+  },
+  "00ab277809a1": {
+   "id": "00ab277809a1",
+   "expr": "COUNT(DISTINCT CASE WHEN p.is_active THEN p.product_id END)",
+   "tables": [
+    "dim_product"
+   ],
+   "dims": [
+    "product_category"
+   ],
+   "hit_count": 1,
+   "sample_question": "给我生成销售报告",
+   "name": "active_product_count",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1790238947
+  },
+  "fde8baed5313": {
+   "id": "fde8baed5313",
+   "expr": "COUNT(i.product_id)",
+   "tables": [
+    "inv_inventory_snapshot"
+   ],
+   "dims": [
+    "product_category"
+   ],
+   "hit_count": 1,
+   "sample_question": "给我生成销售报告",
+   "name": "inventory_snapshot_count",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1790238947
+  }
+ },
+ "ignored": [
+  "005d25569cc1",
+  "046c7c5f5791",
+  "0d04a00644b1",
+  "114160f47ce7",
+  "1e5ac71e1e5e",
+  "231aaa441240",
+  "303ed42957e8",
+  "4bbe3c1ce999",
+  "56be24acdbc9",
+  "86eb54bbd401",
+  "87ed7fcbc594",
+  "9ccabb260d2c",
+  "b05724636ee2",
+  "c5616b80dd5e",
+  "ed94758b7a81",
+  "f4d7a39b98e1"
+ ],
+ "adopted": [
+  {
+   "id": "cdecc1a9beb6",
+   "expr": "AVG(w.end_date - w.start_date) WHERE notstart_dateisnullandnotend_dateisnull",
+   "name": "挖掘测试指标",
+   "aliases": [],
+   "unit": "箱",
+   "source": "runtime",
+   "adopted_at": 1789140205
+  },
+  {
+   "id": "8d015da7f74a",
+   "expr": "SUM(available_qty + frozen_qty)",
+   "name": "挖掘测试指标",
+   "aliases": [],
+   "unit": "箱",
+   "source": "runtime",
+   "adopted_at": 1789275781
+  },
+  {
+   "id": "8d015da7f74a",
+   "expr": "SUM(available_qty + frozen_qty)",
+   "name": "挖掘测试指标",
+   "aliases": [],
+   "unit": "箱",
+   "source": "runtime",
+   "adopted_at": 1789276051
+  },
+  {
+   "id": "8d015da7f74a",
+   "expr": "SUM(available_qty + frozen_qty)",
+   "name": "挖掘测试指标",
+   "aliases": [],
+   "unit": "箱",
+   "source": "runtime",
+   "adopted_at": 1789276070
+  },
+  {
+   "id": "ef91e7987b41",
+   "expr": "SUM(CASE WHEN status = 'abnormal' THEN 1 ELSE 0 END) WHERE equipment_typeilike'%temperature%'orequipment_nameilike'%温度%'",
+   "name": "车间温度异常率",
+   "aliases": [],
+   "unit": "",
+   "source": "runtime",
+   "adopted_at": 1789970636
+  },
+  {
+   "id": "f3fd7844a974",
+   "expr": "SUM(CASE WHEN i.result = 'pass' THEN 1 ELSE 0 END)",
+   "name": "合格率",
+   "aliases": [],
+   "unit": "",
+   "source": "runtime",
+   "adopted_at": 1789970640
+  },
+  {
+   "id": "ba0d60c3c8d1",
+   "expr": "COUNT(*) WHERE equipment_idisnull",
+   "name": "设备数量",
+   "aliases": [],
+   "unit": "",
+   "source": "runtime",
+   "adopted_at": 1789972018
+  },
+  {
+   "id": "b61632a45382",
+   "expr": "SUM(CASE WHEN e.status ILIKE '%离职%' OR e.status ILIKE '%resign%' OR e.status ILIKE '%terminate%' THEN 1 ELSE 0 END)",
+   "name": "离职人数",
+   "aliases": [],
+   "unit": "",
+   "source": "runtime",
+   "adopted_at": 1789972022
+  },
+  {
+   "id": "333c9c476466",
+   "expr": "SUM(pr.qty_produced) WHERE work_date>=cast('2026-01-01'asdate)andwork_date<cast('2027-01-01'asdate)",
+   "name": "月产量",
+   "aliases": [],
+   "unit": "",
+   "source": "runtime",
+   "adopted_at": 1789972025
+  },
+  {
+   "id": "d51c5b4cfc63",
+   "expr": "COUNT(DISTINCT po.process_id)",
+   "name": "已完成工序数",
+   "aliases": [],
+   "unit": "",
+   "source": "runtime",
+   "adopted_at": 1789972035
+  },
+  {
+   "id": "6a53eceed0c0",
+   "expr": "AVG(COALESCE(available_qty, 0) + COALESCE(frozen_qty, 0))",
+   "name": "avg_inventory_qty",
+   "aliases": [],
+   "unit": "",
+   "source": "runtime",
+   "adopted_at": 1789972130
+  },
+  {
+   "id": "0ea3ff91181f",
+   "expr": "SUM(o.good_qty) WHERE is_key_process=true",
+   "name": "合格量",
+   "aliases": [],
+   "unit": "",
+   "source": "runtime",
+   "adopted_at": 1789972169
+  },
+  {
+   "id": "027f24b13afc",
+   "expr": "AVG(mwo.plan_qty - mwo.actual_qty)",
+   "name": "平均产出缺口",
+   "aliases": [],
+   "unit": "",
+   "source": "runtime",
+   "adopted_at": 1789972174
+  },
+  {
+   "id": "d38f2f4355b9",
+   "expr": "AVG(mes_work_order.actual_qty)",
+   "name": "平均单工单产出",
+   "aliases": [],
+   "unit": "",
+   "source": "runtime",
+   "adopted_at": 1789972175
+  },
+  {
+   "id": "7527ce106e89",
+   "expr": "SUM(o.defect_qty) WHERE is_key_process=true",
+   "name": "不良量",
+   "aliases": [],
+   "unit": "",
+   "source": "runtime",
+   "adopted_at": 1789972245
+  },
+  {
+   "id": "b88042e66f59",
+   "expr": "COUNT(qdd.defect_id)",
+   "name": "缺陷工单数",
+   "aliases": [],
+   "unit": "",
+   "source": "runtime",
+   "adopted_at": 1789972248
+  },
+  {
+   "id": "9d912594eaf0",
+   "expr": "SUM(CASE WHEN s.available_qty >= s.safety_stock_qty THEN 1 ELSE 0 END)",
+   "name": "满足安全库存品种数",
+   "aliases": [],
+   "unit": "",
+   "source": "runtime",
+   "adopted_at": 1789986336
+  },
+  {
+   "id": "ce81851e8f9d",
+   "expr": "COUNT(DISTINCT wo.\"work_order_id\") WHERE \"disposal\"='返工'",
+   "name": "返工涉及的工单数",
+   "aliases": [],
+   "unit": "",
+   "source": "runtime",
+   "adopted_at": 1789986337
+  },
+  {
+   "id": "5a0c7ccf5a0d",
+   "expr": "AVG(standard_yield_rate)",
+   "name": "平均(standard_yield_rate)",
+   "aliases": [],
+   "unit": "",
+   "source": "schema_scan",
+   "adopted_at": 1789986340
+  },
+  {
+   "id": "9c6af35cf714",
+   "expr": "SUM(frozen_qty)",
+   "name": "合计(frozen_qty)",
+   "aliases": [],
+   "unit": "",
+   "source": "schema_scan",
+   "adopted_at": 1789986342
+  },
+  {
+   "id": "4222db6e29d0",
+   "expr": "SUM(poi.received_qty)",
+   "name": "采购到货率",
+   "aliases": [],
+   "unit": "",
+   "source": "runtime",
+   "adopted_at": 1789986457
+  },
+  {
+   "id": "39edd8c32146",
+   "expr": "COUNT(a.id)",
+   "name": "员工出勤率",
+   "aliases": [],
+   "unit": "",
+   "source": "runtime",
+   "adopted_at": 1789986662
+  },
+  {
+   "id": "ab39a37d5207",
+   "expr": "AVG(em.downtime_hours)",
+   "name": "平均单次维修时长",
+   "aliases": [],
+   "unit": "",
+   "source": "runtime",
+   "adopted_at": 1789986665
+  },
+  {
+   "id": "7f450fa0aa01",
+   "expr": "COUNT(*) WHERE created_at>=cast('2026-01-01'asdate)andcreated_at<cast('2027-01-01'asdate)",
+   "name": "工单量",
+   "aliases": [],
+   "unit": "",
+   "source": "runtime",
+   "adopted_at": 1789986669
+  },
+  {
+   "id": "f441985c4e77",
+   "expr": "AVG(CAST((wo.actual_end - wo.plan_start) AS DECIMAL)) WHERE notactual_endisnullandnotplan_startisnull",
+   "name": "平均生产周期(天)",
+   "aliases": [],
+   "unit": "",
+   "source": "runtime",
+   "adopted_at": 1789986671
+  }
+ ]
+}

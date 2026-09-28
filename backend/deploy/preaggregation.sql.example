@@ -1,0 +1,81 @@
+-- ============================================================
+-- 预聚合 / 物化视图模板（对齐竞品"物化视图 + 预计算"实践）
+--
+-- 适用场景：跨表 JOIN 的慢查询（日志中 25~65s 的 OEE 类），
+-- 把高频口径预计算成物化视图，查询命中时走"编译直通 → 物化视图"毫秒级返回。
+--
+-- 用法：
+--   1. 在真实业务库（如 factory 123 库）按实际表结构替换表名/列名后执行；
+--   2. 注册指标口径时把 sql_expression 指向物化视图（单表即可编译直通）；
+--   3. 物化视图随数据刷新：REFRESH MATERIALIZED VIEW CONCURRENTLY（需唯一索引）
+--      或配合 pg_cron 每日/每小时定时刷新。
+-- ============================================================
+
+-- ── 示例 1：设备综合效率 OEE（按日预聚合）────────────────────
+-- 完整 OEE = 可用率 × 性能率 × 良率；字段按真实排产/节拍数据调整。
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_oee_daily AS
+SELECT
+    f.stat_date,
+    f.line_id,
+    d.line_name,
+    SUM(f.good_qty)                                   AS good_qty,
+    SUM(f.input_qty)                                  AS input_qty,
+    SUM(f.good_qty) * 100.0 / NULLIF(SUM(f.input_qty), 0) AS yield_rate,  -- 良率（质量口径）
+    COALESCE(dt.total_downtime_min, 0)                AS downtime_min,
+    COALESCE(dt.downtime_cnt, 0)                      AS downtime_cnt
+FROM mes_process_output f
+LEFT JOIN dim_production_line d ON f.line_id = d.line_id
+LEFT JOIN (
+    SELECT DATE(start_time) AS d, equipment_id,
+           SUM(downtime_minutes) AS total_downtime_min,
+           COUNT(*) AS downtime_cnt
+    FROM eqp_downtime_record
+    GROUP BY DATE(start_time), equipment_id
+) dt ON dt.d = f.stat_date AND dt.equipment_id = f.line_id   -- 按真实关联键调整
+GROUP BY f.stat_date, f.line_id, d.line_name, dt.total_downtime_min, dt.downtime_cnt;
+
+-- 物化视图唯一索引（REFRESH CONCURRENTLY 必需）
+CREATE UNIQUE INDEX IF NOT EXISTS uq_mv_oee_daily ON mv_oee_daily (stat_date, line_id);
+
+-- 注册指标口径（metric_registry 中，单表 → 编译直通零 LLM）：
+--   name: 设备综合效率OEE(预聚合)
+--   sql_expression: SUM(yield_rate) / COUNT(*)   -- 或按实际口径：可用率×性能率×良率
+--   tables: [mv_oee_daily]
+
+-- ── 示例 2：库存周转天数（按产品预聚合）────────────────────
+-- 演示库销售/库存无共享产品键，真实库若 product_id 一致可启用：
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_inventory_turnover AS
+SELECT
+    p.product_code,
+    p.product_name,
+    AVG(inv.available_qty + COALESCE(inv.frozen_qty, 0)) AS avg_inventory_qty,
+    COUNT(DISTINCT inv.snapshot_date)                    AS period_days,
+    COALESCE(sales.total_sales_qty, 0)                   AS total_sales_qty,
+    ROUND(
+        AVG(inv.available_qty + COALESCE(inv.frozen_qty, 0))
+        * COUNT(DISTINCT inv.snapshot_date)
+        / NULLIF(COALESCE(sales.total_sales_qty, 0), 0), 2
+    ) AS inventory_turnover_days
+FROM inv_inventory_snapshot inv
+JOIN dim_product p ON inv.product_id = p.product_id
+LEFT JOIN (
+    SELECT product_id, SUM(quantity) AS total_sales_qty
+    FROM test_orders
+    WHERE status = 'completed'
+    GROUP BY product_id
+) sales ON sales.product_id = p.product_id
+GROUP BY p.product_code, p.product_name, sales.total_sales_qty;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_mv_inv_turnover ON mv_inventory_turnover (product_code);
+
+-- ── 刷新策略（pg_cron 示例，真实库按数据频率调整）──────────
+-- CREATE EXTENSION IF NOT EXISTS pg_cron;
+-- SELECT cron.schedule('refresh-oee-daily',  '30 0 * * *',
+--        $$REFRESH MATERIALIZED VIEW CONCURRENTLY mv_oee_daily$$);
+-- SELECT cron.schedule('refresh-inv-hourly', '15 * * * *',
+--        $$REFRESH MATERIALIZED VIEW CONCURRENTLY mv_inventory_turnover$$);
+
+-- ⚠️ 注意：
+--  1. 物化视图 = 口径固化，与 metric_registry 的公式必须一致（单一事实来源）；
+--  2. 数据时效性：按业务容忍度选刷新频率（小时/日），结果缓存 TTL 分级会自动配合；
+--  3. 先 EXPLAIN 验证预聚合后的查询计划（应走物化视图全扫描即可，不再多表 JOIN）。

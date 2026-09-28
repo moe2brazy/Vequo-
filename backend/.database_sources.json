@@ -1,0 +1,14 @@
+[
+  {
+    "id": "default",
+    "name": "默认数据源",
+    "db_type": "postgresql",
+    "host": "localhost",
+    "port": 5432,
+    "database": "a07_manufacturing",
+    "user": "postgres",
+    "password": "root",
+    "is_active": true,
+    "created_at": 0
+  }
+]

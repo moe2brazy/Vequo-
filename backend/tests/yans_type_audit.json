@@ -1,0 +1,698 @@
+{
+ "dim_equipment": [
+  {
+   "col": "equipment_id",
+   "type": "TEXT",
+   "sample": [
+    "E0001",
+    "E0002",
+    "E0003"
+   ]
+  },
+  {
+   "col": "equipment_code",
+   "type": "TEXT",
+   "sample": [
+    "EQ-06-PR02",
+    "EQ-05-PR01",
+    "EQ-01-PR08"
+   ]
+  },
+  {
+   "col": "equipment_name",
+   "type": "TEXT",
+   "sample": [
+    "三车间-6号线-SMT贴片",
+    "一车间-1号线-功能测试",
+    "一车间-1号线-回流焊"
+   ]
+  },
+  {
+   "col": "equipment_type",
+   "type": "TEXT",
+   "sample": [
+    "包装机",
+    "AOI设备",
+    "插件线"
+   ]
+  },
+  {
+   "col": "line_id",
+   "type": "TEXT",
+   "sample": [
+    "L04",
+    "L03",
+    "L06"
+   ]
+  },
+  {
+   "col": "install_date",
+   "type": "DATE",
+   "sample": [
+    "2022-09-21",
+    "2024-11-11",
+    "2024-07-19"
+   ]
+  },
+  {
+   "col": "equipment_status",
+   "type": "TEXT",
+   "sample": [
+    "running",
+    "idle",
+    "maintenance"
+   ]
+  }
+ ],
+ "dim_process": [
+  {
+   "col": "process_id",
+   "type": "TEXT",
+   "sample": [
+    "PR01",
+    "PR02",
+    "PR03"
+   ]
+  },
+  {
+   "col": "process_code",
+   "type": "TEXT",
+   "sample": [
+    "PR08",
+    "PR07",
+    "PR01"
+   ]
+  },
+  {
+   "col": "process_name",
+   "type": "TEXT",
+   "sample": [
+    "回流焊",
+    "波峰焊",
+    "SMT贴片"
+   ]
+  },
+  {
+   "col": "process_seq",
+   "type": "INTEGER",
+   "sample": [
+    "3",
+    "5",
+    "4"
+   ]
+  },
+  {
+   "col": "standard_yield_rate",
+   "type": "NUMERIC",
+   "sample": [
+    "0.9850",
+    "0.9820",
+    "0.9650"
+   ]
+  },
+  {
+   "col": "is_key_process",
+   "type": "BOOLEAN",
+   "sample": [
+    "False",
+    "True"
+   ]
+  }
+ ],
+ "dim_product": [
+  {
+   "col": "product_id",
+   "type": "TEXT",
+   "sample": [
+    "P001",
+    "P002",
+    "P003"
+   ]
+  },
+  {
+   "col": "product_code",
+   "type": "TEXT",
+   "sample": [
+    "FG-02-002",
+    "FG-02-014",
+    "FG-01-013"
+   ]
+  },
+  {
+   "col": "product_name",
+   "type": "TEXT",
+   "sample": [
+    "通信模块24",
+    "执行器19",
+    "控制器13"
+   ]
+  },
+  {
+   "col": "product_model",
+   "type": "TEXT",
+   "sample": [
+    "M100-B",
+    "M600-B",
+    "M500-D"
+   ]
+  },
+  {
+   "col": "product_category",
+   "type": "TEXT",
+   "sample": [
+    "通信模块",
+    "执行器",
+    "控制器"
+   ]
+  },
+  {
+   "col": "unit",
+   "type": "TEXT",
+   "sample": [
+    "pcs"
+   ]
+  },
+  {
+   "col": "is_active",
+   "type": "BOOLEAN",
+   "sample": [
+    "False",
+    "True"
+   ]
+  }
+ ],
+ "dim_production_line": [
+  {
+   "col": "line_id",
+   "type": "TEXT",
+   "sample": [
+    "L01",
+    "L02",
+    "L03"
+   ]
+  },
+  {
+   "col": "line_code",
+   "type": "TEXT",
+   "sample": [
+    "LINE-05",
+    "LINE-03",
+    "LINE-04"
+   ]
+  },
+  {
+   "col": "line_name",
+   "type": "TEXT",
+   "sample": [
+    "一车间-1号线",
+    "二车间-2号线",
+    "二车间-5号线"
+   ]
+  },
+  {
+   "col": "workshop_name",
+   "type": "TEXT",
+   "sample": [
+    "一车间",
+    "三车间",
+    "二车间"
+   ]
+  },
+  {
+   "col": "line_manager",
+   "type": "TEXT",
+   "sample": [
+    "主管1",
+    "主管2",
+    "主管4"
+   ]
+  },
+  {
+   "col": "line_status",
+   "type": "TEXT",
+   "sample": [
+    "running",
+    "maintenance"
+   ]
+  }
+ ],
+ "eqp_downtime_record": [
+  {
+   "col": "downtime_id",
+   "type": "TEXT",
+   "sample": [
+    "DT00000001",
+    "DT00000002",
+    "DT00000003"
+   ]
+  },
+  {
+   "col": "equipment_id",
+   "type": "TEXT",
+   "sample": [
+    "E0027",
+    "E0026",
+    "E0030"
+   ]
+  },
+  {
+   "col": "line_id",
+   "type": "TEXT",
+   "sample": [
+    "L05",
+    "L04",
+    "L01"
+   ]
+  },
+  {
+   "col": "start_time",
+   "type": "TIMESTAMP",
+   "sample": [
+    "2026-06-06 18:50:00",
+    "2026-06-20 17:40:00",
+    "2026-06-18 12:00:00"
+   ]
+  },
+  {
+   "col": "end_time",
+   "type": "TIMESTAMP",
+   "sample": [
+    "2026-07-11 19:00:00",
+    "2026-06-04 17:55:00",
+    "2026-06-13 13:00:00"
+   ]
+  },
+  {
+   "col": "downtime_minutes",
+   "type": "INTEGER",
+   "sample": [
+    "10",
+    "90",
+    "45"
+   ]
+  },
+  {
+   "col": "downtime_reason",
+   "type": "TEXT",
+   "sample": [
+    "品质异常停线",
+    "换线调机",
+    "工装更换"
+   ]
+  },
+  {
+   "col": "is_planned",
+   "type": "BOOLEAN",
+   "sample": [
+    "False",
+    "True"
+   ]
+  }
+ ],
+ "inv_inventory_snapshot": [
+  {
+   "col": "snapshot_id",
+   "type": "TEXT",
+   "sample": [
+    "INV00000001",
+    "INV00000002",
+    "INV00000003"
+   ]
+  },
+  {
+   "col": "snapshot_date",
+   "type": "DATE",
+   "sample": [
+    "2026-06-10",
+    "2026-07-11",
+    "2026-06-23"
+   ]
+  },
+  {
+   "col": "product_id",
+   "type": "TEXT",
+   "sample": [
+    "P001",
+    "P015",
+    "P010"
+   ]
+  },
+  {
+   "col": "warehouse_code",
+   "type": "TEXT",
+   "sample": [
+    "WH-QA",
+    "WH-A",
+    "WH-B"
+   ]
+  },
+  {
+   "col": "available_qty",
+   "type": "INTEGER",
+   "sample": [
+    "3309",
+    "3925",
+    "3936"
+   ]
+  },
+  {
+   "col": "frozen_qty",
+   "type": "INTEGER",
+   "sample": [
+    "50",
+    "0",
+    "80"
+   ]
+  },
+  {
+   "col": "safety_stock_qty",
+   "type": "INTEGER",
+   "sample": [
+    "800",
+    "1000",
+    "500"
+   ]
+  }
+ ],
+ "mes_process_output": [
+  {
+   "col": "output_id",
+   "type": "TEXT",
+   "sample": [
+    "OUT00000001",
+    "OUT00000002",
+    "OUT00000003"
+   ]
+  },
+  {
+   "col": "work_order_id",
+   "type": "TEXT",
+   "sample": [
+    "WO000317",
+    "WO000305",
+    "WO000343"
+   ]
+  },
+  {
+   "col": "product_id",
+   "type": "TEXT",
+   "sample": [
+    "P001",
+    "P010",
+    "P015"
+   ]
+  },
+  {
+   "col": "process_id",
+   "type": "TEXT",
+   "sample": [
+    "PR01",
+    "PR04",
+    "PR02"
+   ]
+  },
+  {
+   "col": "line_id",
+   "type": "TEXT",
+   "sample": [
+    "L04",
+    "L01",
+    "L05"
+   ]
+  },
+  {
+   "col": "stat_date",
+   "type": "DATE",
+   "sample": [
+    "2026-06-10",
+    "2026-07-11",
+    "2026-06-23"
+   ]
+  },
+  {
+   "col": "input_qty",
+   "type": "INTEGER",
+   "sample": [
+    "1489",
+    "1269",
+    "652"
+   ]
+  },
+  {
+   "col": "good_qty",
+   "type": "INTEGER",
+   "sample": [
+    "1269",
+    "652",
+    "1560"
+   ]
+  },
+  {
+   "col": "defect_qty",
+   "type": "INTEGER",
+   "sample": [
+    "55",
+    "27",
+    "23"
+   ]
+  },
+  {
+   "col": "rework_qty",
+   "type": "INTEGER",
+   "sample": [
+    "29",
+    "4",
+    "34"
+   ]
+  },
+  {
+   "col": "shift_code",
+   "type": "TEXT",
+   "sample": [
+    "N",
+    "D"
+   ]
+  }
+ ],
+ "mes_work_order": [
+  {
+   "col": "work_order_id",
+   "type": "TEXT",
+   "sample": [
+    "WO000001",
+    "WO000002",
+    "WO000003"
+   ]
+  },
+  {
+   "col": "work_order_no",
+   "type": "TEXT",
+   "sample": [
+    "MO-20260614-0099",
+    "MO-20260611-0076",
+    "MO-20260627-0192"
+   ]
+  },
+  {
+   "col": "product_id",
+   "type": "TEXT",
+   "sample": [
+    "P001",
+    "P010",
+    "P015"
+   ]
+  },
+  {
+   "col": "line_id",
+   "type": "TEXT",
+   "sample": [
+    "L04",
+    "L01",
+    "L05"
+   ]
+  },
+  {
+   "col": "plan_qty",
+   "type": "INTEGER",
+   "sample": [
+    "800",
+    "1000",
+    "1800"
+   ]
+  },
+  {
+   "col": "start_date",
+   "type": "DATE",
+   "sample": [
+    "2026-06-10",
+    "2026-07-11",
+    "2026-06-23"
+   ]
+  },
+  {
+   "col": "end_date",
+   "type": "DATE",
+   "sample": [
+    "2026-06-10",
+    "2026-07-11",
+    "2026-06-23"
+   ]
+  },
+  {
+   "col": "order_status",
+   "type": "TEXT",
+   "sample": [
+    "closed",
+    "completed",
+    "in_progress"
+   ]
+  }
+ ],
+ "qms_defect_detail": [
+  {
+   "col": "defect_id",
+   "type": "TEXT",
+   "sample": [
+    "DEF00000001",
+    "DEF00000002",
+    "DEF00000003"
+   ]
+  },
+  {
+   "col": "inspection_id",
+   "type": "TEXT",
+   "sample": [
+    "INS00000901",
+    "INS00000378",
+    "INS00001019"
+   ]
+  },
+  {
+   "col": "defect_type",
+   "type": "TEXT",
+   "sample": [
+    "包装破损",
+    "标签错误",
+    "偏位"
+   ]
+  },
+  {
+   "col": "defect_code",
+   "type": "TEXT",
+   "sample": [
+    "D06",
+    "D01",
+    "D02"
+   ]
+  },
+  {
+   "col": "defect_qty",
+   "type": "INTEGER",
+   "sample": [
+    "4",
+    "14",
+    "3"
+   ]
+  },
+  {
+   "col": "severity_level",
+   "type": "TEXT",
+   "sample": [
+    "critical",
+    "major",
+    "minor"
+   ]
+  },
+  {
+   "col": "responsible_process_id",
+   "type": "TEXT",
+   "sample": [
+    "PR03",
+    "PR07",
+    "PR06"
+   ]
+  }
+ ],
+ "qms_inspection": [
+  {
+   "col": "inspection_id",
+   "type": "TEXT",
+   "sample": [
+    "INS00000001",
+    "INS00000002",
+    "INS00000003"
+   ]
+  },
+  {
+   "col": "inspection_no",
+   "type": "TEXT",
+   "sample": [
+    "QI-20260703-00957",
+    "QI-20260614-00356",
+    "QI-20260715-01345"
+   ]
+  },
+  {
+   "col": "work_order_id",
+   "type": "TEXT",
+   "sample": [
+    "WO000317",
+    "WO000305",
+    "WO000343"
+   ]
+  },
+  {
+   "col": "product_id",
+   "type": "TEXT",
+   "sample": [
+    "P001",
+    "P010",
+    "P015"
+   ]
+  },
+  {
+   "col": "process_id",
+   "type": "TEXT",
+   "sample": [
+    "PR03",
+    "PR07",
+    "PR06"
+   ]
+  },
+  {
+   "col": "inspection_date",
+   "type": "DATE",
+   "sample": [
+    "2026-06-10",
+    "2026-07-11",
+    "2026-06-23"
+   ]
+  },
+  {
+   "col": "sample_qty",
+   "type": "INTEGER",
+   "sample": [
+    "80",
+    "100",
+    "120"
+   ]
+  },
+  {
+   "col": "defect_qty",
+   "type": "INTEGER",
+   "sample": [
+    "4",
+    "0",
+    "14"
+   ]
+  },
+  {
+   "col": "inspection_result",
+   "type": "TEXT",
+   "sample": [
+    "pass",
+    "fail"
+   ]
+  }
+ ]
+}

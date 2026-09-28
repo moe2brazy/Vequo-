@@ -1,0 +1,69 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist2
+dist-ssr
+# 历史构建产物变体 / 前端备份 / npm 缓存（仅保留最新 dist，其余为磁盘冗余）
+dist_v
+dist[0-9]*
+dist_check
+dist_gz
+dist_new_*
+dist_old_*
+.build_verify
+frontend_backup
+.npm_cache_tmp
+*.local
+
+# ── Python / 虚拟环境 ──
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# ── 运行时数据（禁止提交）──
+backend/.agent_memory/
+backend/.database_profiles.json
+backend/.db_connections.json
+backend/uploads/
+backend/imports/
+# 认证/指标运行时数据（含密码哈希与密钥，禁止提交）
+backend/auth_users.json
+backend/auth_secret.key
+backend/metrics_registry.json
+backend/feedback_queue.jsonl
+backend/logs/
+# 权限策略备份（临时产物，禁止提交）
+backend/auth_permissions.bak*
+backend/auth_permissions.tmp.bak*
+
+# ── 密钥与配置文件（禁止提交，含数据库/LLM API Key）──
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+config/secrets*.json
+*.pem
+*.key
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

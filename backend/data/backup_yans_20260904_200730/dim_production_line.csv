@@ -1,0 +1,7 @@
+﻿line_id,line_code,line_name,workshop_name,line_manager,line_status
+L01,LINE-01,一车间-1号线,一车间,主管1,running
+L02,LINE-02,二车间-2号线,二车间,主管2,running
+L03,LINE-03,三车间-3号线,三车间,主管3,running
+L04,LINE-04,一车间-4号线,一车间,主管4,running
+L05,LINE-05,二车间-5号线,二车间,主管5,running
+L06,LINE-06,三车间-6号线,三车间,主管6,maintenance

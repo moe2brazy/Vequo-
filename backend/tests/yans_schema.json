@@ -1,0 +1,402 @@
+{
+ "dim_equipment": [
+  {
+   "n": "equipment_id",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "equipment_code",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "equipment_name",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "equipment_type",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "line_id",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "install_date",
+   "t": "date",
+   "c": ""
+  },
+  {
+   "n": "equipment_status",
+   "t": "text",
+   "c": ""
+  }
+ ],
+ "dim_process": [
+  {
+   "n": "process_id",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "process_code",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "process_name",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "process_seq",
+   "t": "integer",
+   "c": ""
+  },
+  {
+   "n": "standard_yield_rate",
+   "t": "numeric",
+   "c": ""
+  },
+  {
+   "n": "is_key_process",
+   "t": "boolean",
+   "c": ""
+  }
+ ],
+ "dim_product": [
+  {
+   "n": "product_id",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "product_code",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "product_name",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "product_model",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "product_category",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "unit",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "is_active",
+   "t": "boolean",
+   "c": ""
+  }
+ ],
+ "dim_production_line": [
+  {
+   "n": "line_id",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "line_code",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "line_name",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "workshop_name",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "line_manager",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "line_status",
+   "t": "text",
+   "c": ""
+  }
+ ],
+ "eqp_downtime_record": [
+  {
+   "n": "downtime_id",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "equipment_id",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "line_id",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "start_time",
+   "t": "timestamp without time zone",
+   "c": ""
+  },
+  {
+   "n": "end_time",
+   "t": "timestamp without time zone",
+   "c": ""
+  },
+  {
+   "n": "downtime_minutes",
+   "t": "integer",
+   "c": ""
+  },
+  {
+   "n": "downtime_reason",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "is_planned",
+   "t": "boolean",
+   "c": ""
+  }
+ ],
+ "inv_inventory_snapshot": [
+  {
+   "n": "snapshot_id",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "snapshot_date",
+   "t": "date",
+   "c": ""
+  },
+  {
+   "n": "product_id",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "warehouse_code",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "available_qty",
+   "t": "integer",
+   "c": ""
+  },
+  {
+   "n": "frozen_qty",
+   "t": "integer",
+   "c": ""
+  },
+  {
+   "n": "safety_stock_qty",
+   "t": "integer",
+   "c": ""
+  }
+ ],
+ "mes_process_output": [
+  {
+   "n": "output_id",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "work_order_id",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "product_id",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "process_id",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "line_id",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "stat_date",
+   "t": "date",
+   "c": ""
+  },
+  {
+   "n": "input_qty",
+   "t": "integer",
+   "c": ""
+  },
+  {
+   "n": "good_qty",
+   "t": "integer",
+   "c": ""
+  },
+  {
+   "n": "defect_qty",
+   "t": "integer",
+   "c": ""
+  },
+  {
+   "n": "rework_qty",
+   "t": "integer",
+   "c": ""
+  },
+  {
+   "n": "shift_code",
+   "t": "text",
+   "c": ""
+  }
+ ],
+ "mes_work_order": [
+  {
+   "n": "work_order_id",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "work_order_no",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "product_id",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "line_id",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "plan_qty",
+   "t": "integer",
+   "c": ""
+  },
+  {
+   "n": "start_date",
+   "t": "date",
+   "c": ""
+  },
+  {
+   "n": "end_date",
+   "t": "date",
+   "c": ""
+  },
+  {
+   "n": "order_status",
+   "t": "text",
+   "c": ""
+  }
+ ],
+ "qms_defect_detail": [
+  {
+   "n": "defect_id",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "inspection_id",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "defect_type",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "defect_code",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "defect_qty",
+   "t": "integer",
+   "c": ""
+  },
+  {
+   "n": "severity_level",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "responsible_process_id",
+   "t": "text",
+   "c": ""
+  }
+ ],
+ "qms_inspection": [
+  {
+   "n": "inspection_id",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "inspection_no",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "work_order_id",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "product_id",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "process_id",
+   "t": "text",
+   "c": ""
+  },
+  {
+   "n": "inspection_date",
+   "t": "date",
+   "c": ""
+  },
+  {
+   "n": "sample_qty",
+   "t": "integer",
+   "c": ""
+  },
+  {
+   "n": "defect_qty",
+   "t": "integer",
+   "c": ""
+  },
+  {
+   "n": "inspection_result",
+   "t": "text",
+   "c": ""
+  }
+ ]
+}

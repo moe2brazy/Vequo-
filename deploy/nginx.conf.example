@@ -1,0 +1,58 @@
+# ============================================================
+# 智能问析 Nginx 部署配置示例
+# 覆盖：Gzip 预压缩伺服 / 静态资源强缓存 / API 反代 / SSE 流式
+# 使用：将 server 块并入你的 nginx.conf，按实际路径/端口修改后
+#       `nginx -t` 校验，`nginx -s reload` 生效
+# ============================================================
+
+server {
+    listen 80;
+    server_name your-domain.com;   # 改为你的域名或 IP
+
+    # ── 前端静态资源（Vite 构建产物，构建时已生成 .gz 预压缩）──
+    root /path/to/vue_first/dist;  # 改为实际 dist 目录
+    index index.html;
+
+    # Gzip 预压缩伺服：浏览器声明支持 gzip 时，Nginx 直接返回构建时生成的
+    # .gz 文件（gzip_static），不重复压缩（省 CPU）；无预压缩文件时走下方动态压缩兜底
+    gzip_static on;
+    gzip_vary on;
+    gzip_types text/plain text/css application/javascript application/json image/svg+xml;
+
+    # 动态压缩兜底（仅对未预压缩的响应生效）
+    gzip on;
+    gzip_min_length 1024;
+    gzip_proxied any;
+    gzip_comp_level 6;
+
+    # ── 带 hash 的静态资源（assets/*.js|css）→ 一年强缓存 + immutable ──
+    # 文件名含内容 hash（如 echarts-BRAMrTJP.js），发版后 URL 自动变化，
+    # 旧缓存自然失效，不存在"改版不生效"问题
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, max-age=31536000, immutable";
+    }
+
+    # 入口 HTML 不缓存：确保每次访问都拿到最新 index.html（引用新 hash 资源）
+    location = /index.html {
+        add_header Cache-Control "no-cache";
+    }
+
+    # ── 后端 API 反代（FastAPI :8010，含 SSE 流式支持）──
+    location /api/ {
+        proxy_pass http://127.0.0.1:8010;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # SSE 关键：禁用缓冲，事件逐条实时到达（否则前端表现为"最后一次性输出"）
+        proxy_buffering off;
+        proxy_cache off;
+
+        # LLM 长查询放宽读超时（单请求含多轮 LLM + 60s 单次超时 + 重试）
+        proxy_read_timeout 300s;
+        proxy_send_timeout 60s;
+    }
+}
