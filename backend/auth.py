@@ -334,21 +334,31 @@ def set_user_roles(username: str, roles: list[str]) -> list[str]:
 
     同时把 role 字段同步为「主角色」：admin 优先，其次列表首个，
     保证既有依赖单 role 的逻辑（前端菜单 / JWT / require_roles）行为一致。
+
+    ⚠️ `pending` 是「待授权」哨兵（自助注册账号的初始 role/roles），**不是**
+    auth_permissions.json 里注册过的角色。权限页保存成员时会把该用户当前 roles
+    原样回传（待授权用户的 payload = ['pending'] + 管理员新勾选的角色），若把哨兵
+    当角色做存在性校验，必然抛「角色不存在：pending」——表现就是「新注册的两个账号
+    一点保存就报错，但本人登录完全正常」（登录不校验角色，只有写角色才校验）。
+    所以这里先剔除哨兵，只对真实角色校验；剔除后为空（只点保存没勾角色 / 取消全部
+    角色）时回落到 ['pending']，即回到「待授权」零数据权限，这也是目前唯一能整体
+    撤销某个账号数据权限的方式。
     """
     clean = [str(r).strip() for r in (roles or []) if str(r).strip()]
-    if not clean:
-        raise ValueError("至少需要保留一个角色")
+    real = [r for r in clean if r != "pending"]   # pending 只是哨兵，不参与校验
     from security.model import get_role
-    unknown = [r for r in clean if not get_role(r)]
+    unknown = [r for r in real if not get_role(r)]
     if unknown:
-        raise ValueError(f"角色不存在：{', '.join(unknown)}")
+        raise ValueError(f"角色不存在：{', '.join(unknown)}（请先在权限管理页新建该角色）")
+    if not real:
+        real = ["pending"]                        # 未分配任何角色 → 回到待授权
     users = load_users()
     for u in users:
         if u["username"] == username:
-            u["roles"] = clean
-            u["role"] = "admin" if "admin" in clean else clean[0]
+            u["roles"] = real
+            u["role"] = "admin" if "admin" in real else real[0]
             save_users(users)
-            return clean
+            return real
     raise ValueError(f"用户「{username}」不存在")
 
 

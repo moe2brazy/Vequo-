@@ -21,12 +21,6 @@
           </div>
         </div>
         <button
-          class="text-[11px] text-blue-600 hover:text-blue-700 font-medium shrink-0"
-          @click="$emit('view-data', tbl.table_name)"
-        >
-          查看数据 →
-        </button>
-        <button
           class="text-[11px] text-gray-500 hover:text-gray-700 font-medium shrink-0 border border-gray-200 rounded px-1.5 py-0.5"
           title="放大查看"
           @click="$emit('enlarge', tbl)"
@@ -63,7 +57,6 @@ defineProps<{
 }>()
 
 defineEmits<{
-  (e: 'view-data', table: string): void
   (e: 'enlarge', table: any): void
 }>()
 </script>

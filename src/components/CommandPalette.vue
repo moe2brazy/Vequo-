@@ -94,8 +94,9 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, nextTick, onMounted } from 'vue'
-import { isAdmin } from '../auth'
+import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
+import { isAdmin, getUser } from '../auth'
+import { ASK_HISTORY_PREFIX } from '../storage'
 
 const props = defineProps<{ visible: boolean }>()
 const emit = defineEmits<{ (e: 'close'): void; (e: 'navigate', page: string): void; (e: 'ask', q: string): void }>()
@@ -138,9 +139,21 @@ const totalLen = computed(() => {
   return 1 + tables.value.length + metrics.value.length
 })
 
+// 与 AskPage 的历史命名空间保持一致。AskPage 写入的是 `ask_chat_history:${uid}`
+// （uid = 登录用户名，未登录为 guest，见 AskPage.vue:2744-2751）。
+// 此处原先读的是不带 uid 的裸键 `ask_chat_history`，全项目没有任何地方写过这个键，
+// 于是「历史问题」区块恒为空、无输入时的历史导航形同虚设。
+const historyKey = () => {
+  try {
+    return `${ASK_HISTORY_PREFIX}${getUser()?.username || 'guest'}`
+  } catch {
+    return `${ASK_HISTORY_PREFIX}guest`
+  }
+}
+
 const loadHistory = () => {
   try {
-    const data = localStorage.getItem('ask_chat_history')
+    const data = localStorage.getItem(historyKey())
     if (!data) { historyQ.value = []; return }
     const chats = JSON.parse(data)
     const qs: string[] = []
@@ -246,5 +259,12 @@ const close = () => emit('close')
 
 onMounted(() => {
   loadHistory()
+})
+
+// 输入防抖定时器在卸载时清掉：否则面板关闭后 180ms 内仍会发起两条搜索请求，
+// 并把结果写进已卸载组件的 ref。
+onUnmounted(() => {
+  if (searchTimer.value) clearTimeout(searchTimer.value)
+  searchTimer.value = null
 })
 </script>

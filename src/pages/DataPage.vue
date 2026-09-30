@@ -1,8 +1,10 @@
 <template>
 
 
-
-  <div class="space-y-3">
+  <!-- 根元素手动接管 attrs：本页顶层还有两个 <Teleport>（弹窗挂 body），组件是多根，
+       Vue 无法自动继承父级传入的 class（如 h-full）→ 页面内容不足一屏时底部会空一截，
+       且每次渲染刷两条 Extraneous non-props attributes 警告。 -->
+  <div class="space-y-3" v-bind="$attrs">
 
 
 
@@ -2839,6 +2841,21 @@
 <script setup lang="ts">
 
 
+
+// 多根组件（顶层另有 Teleport 弹窗）：关闭自动继承，改由模板根元素显式 v-bind="$attrs"
+defineOptions({ inheritAttrs: false })
+
+// 显式声明「接收」的事件。App.vue 对每个页面组件统一广播 navigate / navigate-ask /
+// question-consumed / account-updated / database-switched，本页只做展示、不向外发事件。
+// 不声明它们就会留在 $attrs 里，被模板根元素的 v-bind="$attrs" 当作原生 DOM 事件监听器
+// 挂到 <div> 上——永远不可能触发，只是白白往根节点上挂五个无效监听器，也与其它页面的写法不一致。
+defineEmits<{
+  (e: 'navigate', page: string): void
+  (e: 'navigate-ask', q: string): void
+  (e: 'question-consumed'): void
+  (e: 'account-updated', partial: { display_name?: string; avatar?: string }): void
+  (e: 'database-switched'): void
+}>()
 
 import { ref, computed, onMounted, watch, nextTick, onBeforeUnmount } from 'vue'
 
@@ -6010,8 +6027,23 @@ let _erWheelEl: HTMLElement | null = null
 let _erWheelHandler: ((e: WheelEvent) => void) | null = null
 
 
+// 容器 mouseleave 回调。
+// 此前写成 el.addEventListener('mouseleave', () => ...) —— 匿名函数每次调用都新建一个，
+// 而 renderErFullscreenChart() 会被 scheduleErRender()（缩放 / 拖动 / 数据变更）反复触发，
+// 容器又是同一个 DOM 节点，于是回调越叠越多且永远无法移除（滚轮监听当时已做了具名 + 解绑，
+// 这里漏了）。改为模块级具名回调 + 记录绑定元素，重绑前先解绑。
+let _erMouseLeaveEl: HTMLElement | null = null
+
+let _erMouseLeaveHandler: (() => void) | null = null
+
+
 
 let _erRenderTimer: number | null = null
+
+
+// ER 图载入提示的 12 秒兜底定时器。此前是裸 setTimeout，组件被 KeepAlive 驱逐或切页销毁后
+// 回调仍会执行并写已卸载实例的 ref；同时重复打开会叠加多个定时器。统一登记、重入前先清、卸载时清。
+let _erLoadingFallbackTimer: number | null = null
 
 
 
@@ -6601,7 +6633,17 @@ const renderErFullscreenChart = () => {
 
 
 
-    el.addEventListener('mouseleave', () => erFullChart?.dispatchAction({ type: 'downplay' }))
+    if (_erMouseLeaveHandler && _erMouseLeaveEl && _erMouseLeaveEl !== el) {
+      _erMouseLeaveEl.removeEventListener('mouseleave', _erMouseLeaveHandler)
+      _erMouseLeaveHandler = null
+      _erMouseLeaveEl = null
+    }
+    if (!_erMouseLeaveHandler) {
+      const handler = () => erFullChart?.dispatchAction({ type: 'downplay' })
+      _erMouseLeaveHandler = handler
+      _erMouseLeaveEl = el
+      el.addEventListener('mouseleave', handler)
+    }
 
 
 
@@ -6725,7 +6767,11 @@ const startErRender = () => {
 
 
 
-  setTimeout(() => { erRendering.value = false }, 12000)
+  if (_erLoadingFallbackTimer !== null) clearTimeout(_erLoadingFallbackTimer)
+  _erLoadingFallbackTimer = window.setTimeout(() => {
+    _erLoadingFallbackTimer = null
+    erRendering.value = false
+  }, 12000)
 
 
 
@@ -9423,6 +9469,23 @@ onBeforeUnmount(() => {
 
 
   window.removeEventListener('open-table', handleOpenTable)
+
+
+
+  // 定时器与全屏容器监听一并清理：否则组件销毁后兜底回调仍会写 erRendering，
+  // 容器上的 mouseleave / wheel 也会随元素被销毁而留下悬空引用
+  if (_erRenderTimer !== null) { clearTimeout(_erRenderTimer); _erRenderTimer = null }
+  if (_erLoadingFallbackTimer !== null) { clearTimeout(_erLoadingFallbackTimer); _erLoadingFallbackTimer = null }
+  if (_erMouseLeaveHandler && _erMouseLeaveEl) {
+    _erMouseLeaveEl.removeEventListener('mouseleave', _erMouseLeaveHandler)
+  }
+  if (_erWheelHandler && _erWheelEl) {
+    _erWheelEl.removeEventListener('wheel', _erWheelHandler)
+  }
+  _erMouseLeaveHandler = null
+  _erMouseLeaveEl = null
+  _erWheelHandler = null
+  _erWheelEl = null
 
 
 

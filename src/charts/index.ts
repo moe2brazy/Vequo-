@@ -209,12 +209,19 @@ export function buildEChartOption(type: string, cols: string[], rows: any[], pal
     return base
   })
 
+  // 类目轴：倾斜标签只对「横轴」成立。横向条形图里类目轴是纵轴，再给它加 rotate
+  // 会让每个标签多占近一倍行高，13 个类目在 240px 画布里叠成一团黑（实测 id 类
+  // 标签互相压字、完全读不出）。纵轴不倾斜，交给 ECharts 自己按高度抽稀。
   const catAxis = {
     type: 'category',
     data: cats,
     axisLine: { show: false },
     axisTick: { show: false },
-    axisLabel: { color: AXIS_COLOR, fontSize: 11, rotate: cats.length > 8 ? 30 : 0 },
+    axisLabel: { color: AXIS_COLOR, fontSize: 11 },
+  }
+  const catAxisX = {
+    ...catAxis,
+    axisLabel: { ...catAxis.axisLabel, rotate: cats.length > 8 ? 30 : 0 },
   }
 
   return {
@@ -227,7 +234,7 @@ export function buildEChartOption(type: string, cols: string[], rows: any[], pal
       left: 20, right: 24, top: numCols.length > 1 ? 40 : 28, bottom: 12,
       containLabel: true,
     },
-    xAxis: horizontal ? valueAxis : catAxis,
+    xAxis: horizontal ? valueAxis : catAxisX,
     yAxis: horizontal ? catAxis : valueAxis,
     series,
   }

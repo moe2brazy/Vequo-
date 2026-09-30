@@ -7,9 +7,10 @@
       <pre v-if="detail">{{ detail }}</pre>
       <div class="actions">
         <button type="button" class="primary" @click="reload">重新加载页面</button>
-        <button type="button" class="ghost" @click="retry" v-if="canRetry">仅重试本页</button>
+        <button type="button" class="ghost" @click="retry" v-if="canRetry && !staleChunk">仅重试本页</button>
       </div>
-      <small>如果刷新后仍失败，请把上面这段错误信息发给开发者（同时也打印在浏览器控制台）。</small>
+      <small v-if="staleChunk">这类错误是「开发服务器重新预构建依赖后旧资源地址失效」，本页内重试用的还是同一个失效地址，只有整页刷新才能恢复。</small>
+      <small v-else>如果刷新后仍失败，请把上面这段错误信息发给开发者（同时也打印在浏览器控制台）。</small>
     </div>
   </div>
 </template>
@@ -20,14 +21,30 @@ import { computed, ref } from 'vue'
 const props = defineProps<{ error?: unknown }>()
 const canRetry = ref(true)
 
-const detail = computed(() => {
+const rawMessage = computed(() => {
   const e = props.error as { message?: string } | string | undefined
-  const msg = typeof e === 'string' ? e : (e?.message || '')
-  return String(msg).slice(0, 300)
+  return typeof e === 'string' ? e : (e?.message || '')
 })
 
+const detail = computed(() => String(rawMessage.value).slice(0, 300))
+
+// 依赖重优化 / chunk 失效类错误：Vite 重新预构建依赖（vite config 变更、启动期 optimize）后
+// 旧的 dep 地址全部失效，此时「仅重试本页」重新发起的仍是那个已失效的地址 → 必然再次失败；
+// 只有整页刷新拿到新的模块图才能恢复（生产环境发新版后旧 chunk 被清理也是同一现象）。
+// 实测：dev server 重优化后 DataPage.vue 一直报 Failed to fetch dynamically imported module。
+const staleChunk = computed(() =>
+  /dynamically imported module|Importing a module script failed/i.test(String(rawMessage.value)))
+
+/** 整页刷新：带时间戳强制绕过 HTML/模块缓存，同时保留原有查询参数（如 ?view= 入口），
+ *  避免 location.reload() 命中的还是缓存里的旧 index.html → 刷新后依旧失败。 */
 function reload() {
-  window.location.reload()
+  try {
+    const url = new URL(window.location.href)
+    url.searchParams.set('_r', Date.now().toString(36))
+    window.location.replace(url.toString())
+  } catch {
+    window.location.reload()
+  }
 }
 
 // 单页重试：回到初始页，让动态 import 重新发起一次（不整页刷新，保留登录态与输入）

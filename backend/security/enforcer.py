@@ -722,24 +722,31 @@ def rewrite_sql(sql: str, ctx: AclContext | None, dialect: str | None = None) ->
         return sql, f"权限改写失败（SQL 无法解析），已拒绝执行：{e}", applied
 
     # ── DML/DDL 防护：权限链路只允许查询（SELECT），拒绝一切写操作 ──
-    # 注意：不同 sqlglot 版本的 exp 类集合不一致（如部分版本无 Truncate），
-    # 逐个 try/find 避免 AttributeError 被外层吞掉导致防护静默失效。
-    try:
-        from sqlglot import exp as _exp
-        # 多语句（Block）或任何非查询语句一律拒绝
-        if isinstance(ast, _exp.Block):
-            return sql, "权限控制仅允许单条查询语句（SELECT），检测到多语句，已拒绝执行。", applied
-        _danger_types = (_exp.Insert, _exp.Update, _exp.Delete, _exp.Drop, _exp.Alter,
-                         _exp.Create, _exp.Merge, _exp.Command, _exp.Grant, _exp.Revoke)
-        for _t in _danger_types:
-            try:
-                if ast.find(_t) is not None:
-                    return sql, (f"权限控制仅允许查询语句（SELECT），检测到写操作"
-                                 f"（{_t.__name__}），已拒绝执行。"), applied
-            except AttributeError:
-                continue  # 该版本无此节点类型，跳过
-    except Exception:
-        pass
+    # 注意：不同 sqlglot 版本的 exp 类集合不一致（如部分版本没有 Truncate / Grant）。
+    # 这里用 getattr 先把「本版本真实存在的节点类型」挑出来再逐个 find，
+    # 而不是把整段防护包进 `try: ... except Exception: pass`——那种写法一旦抛异常
+    # （版本差异、find 内部报错）就会静默跳过全部写操作检查，防护形同虚设，
+    # 随后代码照常继续做查询改写并放行 SQL，属安全 fail-open。
+    from sqlglot import exp as _exp
+
+    _block_cls = getattr(_exp, "Block", None)
+    if _block_cls is not None and isinstance(ast, _block_cls):
+        return sql, "权限控制仅允许单条查询语句（SELECT），检测到多语句，已拒绝执行。", applied
+
+    _danger_names = ("Insert", "Update", "Delete", "Drop", "Alter", "Create", "Merge",
+                     "Command", "Grant", "Revoke", "Truncate", "Transaction")
+    _danger_types = tuple(
+        t for t in (getattr(_exp, _n, None) for _n in _danger_names)
+        if isinstance(t, type) and issubclass(t, _exp.Expression)
+    )
+    if not _danger_types:
+        # 一个节点类型都没解析出来 = 当前 sqlglot 的 AST 结构与预期完全不符，
+        # 无法完成写操作检查 → 拒绝执行（fail-close），而不是放行
+        return sql, "权限校验异常（无法识别 SQL 节点类型），已拒绝执行。", applied
+    for _t in _danger_types:
+        if ast.find(_t) is not None:
+            return sql, (f"权限控制仅允许查询语句（SELECT），检测到写操作"
+                         f"（{_t.__name__}），已拒绝执行。"), applied
 
     try:
         # CTE 名不是物理表，参与权限判定会误伤（WITH x AS (...) SELECT * FROM x）

@@ -92,11 +92,20 @@ function buildOption(chart: any) {
 }
 
 // 仪表盘：综合良率等单值 KPI
-function buildGauge(chart: any) {
+// 返回类型显式标 any：animationEasing 等字面量在对象推断里会被放宽成 string，
+// 直接进 setOption 会撞 ECBasicOption 的 AnimationEasing 联合类型（vue-tsc 报 TS2769）。
+function buildGauge(chart: any): any {
   const d = chart.data || {}
   const value = d.value ?? 0
   const gradeColor = d.grade === '优秀' ? '#1d2129' : d.grade === '良好' ? '#1677ff' : '#d97706'
   return {
+    // 指针扫过表盘这一段动画由 ECharts 的 enter 动画驱动（GaugeView 用 initProps 把 rotation
+    // 从起始角推到终值）。显式写死时长/缓动，避免上游任何一处改动把它静默关掉。
+    animation: true,
+    animationDuration: 1000,
+    animationDurationUpdate: 700,
+    animationEasing: 'cubicOut',
+    animationEasingUpdate: 'cubicOut',
     series: [{
       type: 'gauge',
       startAngle: 210,
@@ -368,7 +377,8 @@ function buildLine(chart: any) {
       type: 'line', data: values, smooth: true,
       itemStyle: { color: '#1d2129' },
       lineStyle: { color: '#1d2129', width: 2 },
-      areaStyle: { color: 'rgba(53,74,55,0.08)' },
+      // 面积填充与线同色相（原来用的是 rgba(53,74,55,.08) 偏绿的灰，和全线蓝/深灰的体系对不上）
+      areaStyle: { color: 'rgba(29,33,41,0.06)' },
       symbolSize: 5,
     }],
   }
@@ -427,11 +437,30 @@ watch(
 
 // 修复：接入 ResizeObserver。原实现没有任何尺寸自适应（AskPage 的共享 observer 只观察 .echart，
 // 而本组件用的是 .chart-card-canvas），侧栏折叠动画/窗口缩放/栅格换列后画布会被裁切或拉伸模糊。
+//
+// 2026-09-28 修复（仪表盘指针不转的根因）：observer 挂上后浏览器会立刻回调一次（初始尺寸通知），
+// 此时尺寸其实没变，但 resizeChart() → chart.resize() → ECharts 内部用
+// `update({type:'resize', animation:{duration:0}})` 整图重绘一次 —— 入场动画被当场掐断：
+// 仪表盘指针直接落在终值（实测旋转角从第 1 帧起就是 -8.2754 恒定），柱/线/旭日图同样没有入场动画。
+// 所以这里只在「尺寸真的变了」时才 resize。
 let ro: ResizeObserver | null = null
+let lastW = -1
+let lastH = -1
 onMounted(() => {
   nextTick(render)
   if (el.value) {
-    ro = new ResizeObserver(() => { if (el.value) resizeChart(el.value) })
+    lastW = el.value.clientWidth
+    lastH = el.value.clientHeight
+    ro = new ResizeObserver(() => {
+      const node = el.value
+      if (!node) return
+      const w = node.clientWidth
+      const h = node.clientHeight
+      if (w === lastW && h === lastH) return   // 尺寸未变 → 不 resize，保住入场动画
+      lastW = w
+      lastH = h
+      resizeChart(node)
+    })
     ro.observe(el.value)
   }
 })
@@ -641,12 +670,13 @@ onBeforeUnmount(() => {
   background: #f2f3f5;
   color: #4e5969;
 }
+/* 标签底色原来用橄榄绿 rgba(146,166,62)/rgba(53,74,55)，与字色（蓝/深灰）不同色相，像没改完的旧主题 */
 .lineage-field-role.role-dim {
-  background: rgba(146, 166, 62, 0.14);
+  background: rgba(22, 119, 255, 0.12);
   color: #1677ff;
 }
 .lineage-field-role.role-measure {
-  background: rgba(53, 74, 55, 0.1);
+  background: rgba(29, 33, 41, 0.08);
   color: #1d2129;
 }
 .lineage-field-role.role-time {

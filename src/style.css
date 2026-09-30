@@ -122,6 +122,11 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   display: block;
   width: 36px;
   height: 36px;
+  /* 圆角必须与图标自身一致（图标视框 512、圆角 rx=116 → 22.7%），
+     否则元素是方框、图标是圆角方：方框的四个角是透明的，
+     而 CSS 的投影只画在 border-box 之外 —— 那四个角便露出底色（白），
+     看起来就像图标被切掉了角、外圈还糊着一块方形灰晕。 */
+  border-radius: 22.7%;
   background: url('/brand/vequo-app-icon.svg') center/contain no-repeat;
 }
 .workspace-sidebar nav {
@@ -332,8 +337,10 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .workspace-sidebar.collapsed .back-home i {
   font-size: 20px;
 }
-.workspace-sidebar nav button span,
-.workspace-sidebar .back-home span {
+/* 只收直接子 span（菜单文字）。用后代选择器会连带命中图标组件内部包裹的 span，
+   导致折叠后图标被 max-width:0 一起藏掉（2026-09-28 修复） */
+.workspace-sidebar nav button > span,
+.workspace-sidebar .back-home > span {
   white-space: nowrap;
   overflow: hidden;
   max-width: 180px;
@@ -342,8 +349,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
     max-width .35s cubic-bezier(.4, 0, .2, 1),
     opacity .14s ease .05s;
 }
-.workspace-sidebar.collapsed nav button span,
-.workspace-sidebar.collapsed .back-home span {
+.workspace-sidebar.collapsed nav button > span,
+.workspace-sidebar.collapsed .back-home > span {
   max-width: 0;
   opacity: 0;
   pointer-events: none;
@@ -683,6 +690,10 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .workspace-content .bg-primary:hover {
   background: #2E7CF0 !important;
 }
+/* 登录弹窗等 fixed 层也统一改色皮 */
+.ops-login-overlay [class*=bg-white] {
+  background: #ffffff !important;
+}
 
 @keyframes workspace-appear {
   from { opacity: .35; transform: translateY(-7px); }
@@ -792,8 +803,10 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 /* —— 7.（页面 .ov-rise 由各自 scoped 定义，此处不再全局注入，避免同名覆盖）—— */
 
 /* —— 8. 侧栏品牌 logo 微光 —— */
+/* 原先 0 2px 8px / .18 在白色侧栏上是一圈 8px 的灰晕，块头比图标还大；
+   收成贴边的一层浅影，图标边缘才干净。 */
 .workspace-brand b {
-  box-shadow: 0 2px 8px rgba(29, 33, 41, .18);
+  box-shadow: 0 1px 3px rgba(29, 33, 41, .16);
 }
 
 /* —— 9. 表格表头行 hover 语义（若页面用原生 table）—— */
@@ -1196,4 +1209,226 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   display: block;
   width: 100%;
   height: 100%;
+}
+
+/* ================================================================
+   17. 智能问析 · 结果回答信息分层（2026-09-29）
+   统一「分析结论 / 数据概览 / 数据明细 / 趋势预测 / 推荐问题」的卡片语言。
+   这些类由 renderAgentResult / renderAnalysis / renderTable 经 v-html 注入，
+   必须写在全局（scoped 的 data-v 属性不会落到 v-html 注入的节点上）。
+   只做视觉，不承载任何业务语义。
+   ================================================================ */
+
+/* —— 17.1 统计口径微卡：品牌淡蓝底 + 细描边，克制不喧宾夺主 —— */
+.anl-caliber {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin-bottom: 14px;
+  padding: 7px 12px;
+  border: 1px solid var(--brand-200);
+  border-radius: var(--radius-sm);
+  background: var(--brand-050);
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--brand-700);
+}
+.anl-caliber-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  margin-top: 7px;
+  border-radius: 9999px;
+  background: var(--brand-500);
+}
+.anl-caliber-text b { color: var(--brand-700); font-weight: 600; }
+.anl-caliber-dim { color: var(--brand-600); }
+.anl-caliber-badge {
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 9999px;
+  background: #EEF2FF;
+  color: #6366F1;
+  font-size: 11px;
+  vertical-align: 1px;
+  white-space: nowrap;
+}
+.anl-caliber-warn { border-color: #FDE68A; background: #FFFBEB; color: #B45309; }
+.anl-caliber-warn .anl-caliber-dot { background: #F59E0B; }
+.anl-caliber-warn .anl-caliber-text b { color: #92400E; }
+.anl-caliber-muted { border-color: var(--line-200); background: #F7F8FA; color: var(--ink-500); }
+.anl-caliber-muted .anl-caliber-dot { background: var(--ink-400); }
+.anl-caliber-hint {
+  margin: -6px 0 14px;
+  padding-left: 13px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--ink-500);
+}
+.anl-caliber-link { color: #6366F1; cursor: pointer; }
+.anl-caliber-link:hover { text-decoration: underline; }
+
+/* —— 17.2 分析结论区：无描边、柔和底 + 品牌竖标，整条回复的视觉重心 —— */
+.anl-conclusion {
+  margin-bottom: 18px;
+  padding: 16px 18px;
+  border-radius: var(--radius-lg);
+  background: linear-gradient(180deg, #F5FAFF 0%, #FFFFFF 100%);
+  box-shadow: var(--shadow-card);
+}
+.anl-conclusion-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--brand-700);
+}
+.anl-conclusion-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 9999px;
+  background: linear-gradient(135deg, var(--brand-400), var(--brand-600));
+  box-shadow: 0 1px 4px rgba(46, 124, 240, .4);
+}
+.anl-conclusion-body { font-size: 14px; line-height: 1.9; color: var(--ink-700); }
+
+/* 结论分区小标题：左竖线引导，替代原先扁平的加粗小字 */
+.anl-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 14px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-900);
+}
+.anl-head:first-child { margin-top: 0; }
+.anl-head-bar {
+  width: 3px;
+  height: 14px;
+  border-radius: 2px;
+  background: var(--brand-500);
+}
+/* 结论要点：圆点引导 + 悬挂缩进，读起来像分析要点而非代码列表 */
+.anl-li {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding-left: 2px;
+}
+.anl-dot {
+  flex: none;
+  width: 5px;
+  height: 5px;
+  margin-top: 11px;
+  border-radius: 9999px;
+  background: var(--brand-400);
+}
+.anl-li-plain { padding-left: 0; }
+.anl-li-plain .anl-dot { display: none; }
+/* 关键结论加粗高亮：主色，让数字/判断第一眼跳出来 */
+.anl-strong { color: var(--brand-700); font-weight: 600; }
+
+/* —— 17.3 数据分区标题（数据概览 / 数据明细 / 趋势预测）—— */
+.anl-section-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 16px 0 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink-700);
+}
+.anl-section-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  background: var(--brand-100);
+  color: var(--brand-600);
+}
+.anl-chart {
+  margin-top: 2px;
+}
+
+/* —— 17.4 数据表格：去边框、细线分隔，表头淡蓝、数字右对齐 —— */
+.anl-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--line-200);
+  border-radius: var(--radius-md);
+}
+.anl-table {
+  min-width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+.anl-table thead th {
+  padding: 9px 12px;
+  text-align: left;
+  font-weight: 600;
+  color: var(--ink-700);
+  background: #F7FAFD;
+  border-bottom: 1px solid var(--line-200);
+  white-space: nowrap;
+}
+.anl-table tbody td {
+  padding: 9px 12px;
+  color: var(--ink-700);
+  border-bottom: 1px solid var(--line-100);
+  white-space: nowrap;
+}
+.anl-table tbody tr:last-child td { border-bottom: none; }
+.anl-table tbody tr:hover td { background: #FAFBFD; }
+.anl-table .anl-table-more {
+  text-align: center;
+  color: var(--ink-400);
+  font-size: 11.5px;
+}
+
+/* —— 17.5 归因告警：克制的红调，不与结论争抢 —— */
+.anl-attribution {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: #FEF2F2;
+  border: 1px solid #FECACA;
+  color: #B91C1C;
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+/* —— 17.6 推荐问题：分隔线之上的次级区，胶囊化可点 —— */
+.anl-recommend {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line-100);
+}
+.anl-recommend-label {
+  font-size: 12px;
+  color: var(--ink-400);
+  margin-bottom: 9px;
+}
+.anl-recommend-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.anl-recommend-chip {
+  padding: 5px 12px;
+  border-radius: 9999px;
+  border: 1px solid var(--brand-200);
+  background: #fff;
+  color: var(--brand-600);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all .15s ease;
+}
+.anl-recommend-chip:hover {
+  background: var(--brand-050);
+  border-color: var(--brand-400);
+  color: var(--brand-700);
 }

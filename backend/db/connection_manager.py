@@ -161,16 +161,29 @@ def get_connection_status() -> dict:
     }
 
 
+# 本地库自动发现属于「拿一组常见口令去试连 localhost」的撞库式操作，
+# 是显式开启的本机管理工具，默认关闭：只有 ALLOW_LOCAL_DB_DISCOVERY=1 时才真正探测。
+ALLOW_LOCAL_DB_DISCOVERY = (os.getenv("ALLOW_LOCAL_DB_DISCOVERY") or "").strip().lower() in ("1", "true", "yes")
+
+# 候选凭据：只保留「本地 trust 认证的空口令」与「用户名同口令」两种常见开发配置。
+# 原先还带 123456 / admin 这类通用弱口令——一旦被端口扫描类接口调用，
+# 等于对内网做口令爆破；命中后还会把明文口令原样回传给调用方。
+_LOCAL_DISCOVERY_CREDS = [("postgres", ""), ("postgres", "postgres")]
+
+
 def discover_local_databases() -> list[dict]:
-    """自动发现本地 PostgreSQL 数据库（扫描端口 + 常见凭据）"""
+    """自动发现本地 PostgreSQL 数据库（扫描端口 + 少量候选凭据）。
+
+    默认关闭，见 ALLOW_LOCAL_DB_DISCOVERY。
+    返回结果**不含口令**：调用方拿到的是「哪个端口上跑着哪些库」，
+    要用它连接需自行补口令——服务端不再把探测命中的明文口令回传出去。
+    """
+    if not ALLOW_LOCAL_DB_DISCOVERY:
+        return []
+
     results = []
     ports = [5432, 5433, 5434]
-    creds = [
-        ("postgres", ""),
-        ("postgres", "postgres"),
-        ("postgres", "123456"),
-        ("postgres", "admin"),
-    ]
+    creds = _LOCAL_DISCOVERY_CREDS
     seen = set()
 
     for port in ports:
@@ -195,7 +208,6 @@ def discover_local_databases() -> list[dict]:
                         "host": "localhost",
                         "port": port,
                         "user": user,
-                        "password": pwd,
                         "database_list": dbs,
                     })
                 break  # 该端口已连通，不再试其他凭据

@@ -42,7 +42,12 @@ MIN_ROWS = 5               # 表行数少于此数直接跳过
 
 
 def _safe_execute(sql: str) -> dict:
-    """只读校验 + 权限改写 + 执行（复用 monitor 的护栏，保持一致）。"""
+    """只读校验 + 行/列级 ACL 改写 + 执行（统一走 monitor 的护栏，保持一致）。
+
+    注意这里**不再自带一份实现**：monitor._safe_execute 已经接上 enforcer.rewrite_sql
+    （原先它只做只读校验，导致本模块的扫描取数也一并漏掉行级过滤与列脱敏）。
+    下面的 fallback 仅在 agent.monitor 导入失败时兜底，只保证只读安全。
+    """
     try:
         from agent.monitor import _safe_execute as _mon_exec
         return _mon_exec(sql)

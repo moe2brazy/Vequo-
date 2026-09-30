@@ -23,6 +23,10 @@ const cards = ref<any[]>([])
 const elapsed = ref(0)
 const panelRef = ref<HTMLElement | null>(null)
 let observer: ResizeObserver | null = null
+// 卸载守卫：生成看板是「await 取数（最长几十秒）→ 写 title/cards/elapsed → 再渲染」，
+// 期间用户完全可能切页或关掉这个面板。卸载后回调继续写已销毁实例的 ref 虽不会报错，
+// 但属于对失效组件的操作，统一用一个标志挡掉。
+let disposed = false
 
 async function renderCards() {
   await nextTick()
@@ -68,14 +72,17 @@ async function generate() {
       body: JSON.stringify({ query: props.query, max_cards: 6 }),
     })
     const data = await res.json().catch(() => ({}))
+    if (disposed) return
     if (!res.ok) throw new Error(data?.detail || `生成失败(${res.status})`)
     if (!data.success) throw new Error(data.error || '看板生成失败')
     title.value = data.title || props.query
     cards.value = data.cards || []
     elapsed.value = data.elapsed_ms || 0
   } catch (e: any) {
+    if (disposed) return
     errorMsg.value = e?.message || '网络错误'
   } finally {
+    if (disposed) return
     // 修复：必须在 loading 复位之后再渲染。
     // 模板是 v-if="!started" → v-else-if="loading" → v-else-if="errorMsg" → v-else(卡片网格)，
     // loading 为 true 时 .echart 容器尚未挂载，此时 querySelectorAll 返回空数组 → 图表永不渲染。
@@ -85,6 +92,7 @@ async function generate() {
 }
 
 onBeforeUnmount(() => {
+  disposed = true
   panelRef.value?.querySelectorAll<HTMLElement>('.echart').forEach((el) => disposeChart(el))
   try { observer?.disconnect() } catch { /* 忽略 */ }
   observer = null

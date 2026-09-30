@@ -623,22 +623,50 @@ def get_row_count(db: Session, table_name: str) -> int:
 
 
 def get_row_counts_fast(db: Session) -> dict:
-    """批量估算全部表行数：PG 用 pg_class.reltuples，MySQL 用 information_schema.table_rows，
-    一次查询替代逐表 COUNT（20 表串行 COUNT 是表列表慢的主因之一）"""
+    """批量获取全部表行数：PG 用 pg_class.reltuples，MySQL 用 information_schema.table_rows，
+    一次查询替代逐表 COUNT（20 表串行 COUNT 是表列表慢的主因之一）。
+
+    ⚠️ 估算值不可靠时必须精确计数兜底：PG 对**从未 ANALYZE** 的表返回 reltuples = -1
+    （导入数据后未做统计时普遍如此），MySQL 未统计时为 NULL，而 0 无法区分「真空表」与
+    「从未统计」——此前统一 `max(0, ...)` 会把有数据的表显示成 0 行，只有点开表详情
+    （详情接口走精确 COUNT 的 total_count）才变正常（实测 dim_product / dim_process /
+    dim_production_line / dim_equipment 的 reltuples 均为 -1，实际有 30 / 8 / 6 / 48 行）。
+    因此估算 ≤ 0 的表逐表精确 COUNT（空表代价极低），口径与 db/executor.get_table_row_counts 一致。
+    """
+    estimates: dict[str, int] = {}
     try:
         from database import get_db_type
         if get_db_type() == "mysql":
             result = db.execute(text(
                 "SELECT table_name, table_rows FROM information_schema.tables "
                 "WHERE table_schema=DATABASE()"))
-            return {r[0]: max(0, int(r[1] or 0)) for r in result}
-        result = db.execute(text(
-            "SELECT c.relname, c.reltuples::bigint FROM pg_class c "
-            "JOIN pg_namespace n ON n.oid = c.relnamespace "
-            "WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND c.relkind='r'"))
-        return {r[0]: max(0, int(r[1] or 0)) for r in result}
+        else:
+            result = db.execute(text(
+                "SELECT c.relname, c.reltuples::bigint FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND c.relkind='r'"))
+        # NULL（从未统计）与负数（PG 未 ANALYZE 返回 -1）统一记为 -1，便于下面识别为不可靠估算
+        estimates = {r[0]: (int(r[1]) if r[1] is not None else -1) for r in result}
     except Exception:
         return {}
+
+    counts: dict[str, int] = {t: n for t, n in estimates.items() if n > 0}
+    for table_name, est in estimates.items():
+        if est > 0:
+            continue
+        # 估算不可靠（-1 / NULL / 0）→ 精确 COUNT 兜底，避免误报 0 行
+        try:
+            counts[table_name] = int(db.execute(
+                text(f'SELECT COUNT(*) FROM {_quote_qualified(table_name)}')).scalar() or 0)
+        except Exception:
+            counts[table_name] = 0
+            # 某表 COUNT 失败后 PG 事务进入 aborted 态（25P02），不 rollback 会让后续
+            # COUNT 连坐失败全部置 0（与 db/executor.get_table_row_counts 同样的处理）
+            try:
+                db.rollback()
+            except Exception:
+                pass
+    return counts
 
 
 # ========== 更新字段备注 ==========
@@ -943,25 +971,11 @@ def _build_overview(db: Session) -> dict:
     except Exception:
         topic_count = len(get_dynamic_topics(db, inspector))
     
-    # 6. 各表行数（估算：PG 用 pg_class.reltuples，MySQL 用 information_schema.table_rows；
-    #    一次查询，避免逐表 COUNT 串行扫描；不依赖具体业务表名，跨库通用）
-    table_row_counts = {}
-    try:
-        from database import get_db_type
-        if get_db_type() == "mysql":
-            result = db.execute(text(
-                "SELECT table_name, table_rows FROM information_schema.tables "
-                "WHERE table_schema=DATABASE()"))
-            table_row_counts = {r[0]: max(0, int(r[1] or 0)) for r in result}  # reltuples -1（未分析）按 0
-        else:
-            result = db.execute(text(
-                "SELECT c.relname, c.reltuples::bigint FROM pg_class c "
-                "JOIN pg_namespace n ON n.oid = c.relnamespace "
-                "WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND c.relkind='r'"))
-            table_row_counts = {r[0]: max(0, int(r[1] or 0)) for r in result}  # reltuples -1（未分析）按 0
-        total_rows = sum(table_row_counts.values())
-    except Exception:
-        pass
+    # 6. 各表行数（与表列表同源：get_row_counts_fast 估算 + 不可靠估算的精确计数兜底。
+    #    此前这里独立实现 `max(0, reltuples)`，未 ANALYZE 的表（reltuples=-1）被算成 0，
+    #    导致总览的总行数偏少、按表行数看也像空表）
+    table_row_counts = get_row_counts_fast(db)
+    total_rows = sum(table_row_counts.values())
     
     return {
         "data": {

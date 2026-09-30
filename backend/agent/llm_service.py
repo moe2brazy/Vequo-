@@ -115,6 +115,79 @@ def _record_llm_call(kind: str, model: str, site: str, latency_ms: float,
         pass
 
 
+# ── 基础设施类 LLM 故障的分类与透出（2026-09-28）────────────────────────
+# 背景（实测）：API Key 失效时，5 次 LLM 调用全部 0.1s 秒回 401，但整条生成链
+# 每一层都是 `except Exception: return None`（_run_infer / _run_escape_sql /
+# _direct_gen_sql / _infer_analysis_confirm / _GuardedLLM…），401 被层层吞成
+# 「没产出 SQL」，最后统一报「AI 未能根据问题生成查询 SQL，可换个说法再问」。
+# 把「服务不可用」误导成「模型不会答」——用户按提示反复换说法、换模型，永远试不出来。
+#
+# 解法：在 LLM 调用的**唯一收口点** _GuardedLLM 上做分类记录（线程局部），
+# 主链失败出口读取并替换文案。不改任何生成行为，只改"怎么把失败讲清楚"。
+_LLM_FAULT_LOCAL = threading.local()
+
+
+def _classify_llm_error(e: BaseException) -> tuple[str, str]:
+    """把 LLM 调用异常分类为 (类别, 用户可读原因)；类别为空 = 非基础设施故障。"""
+    try:
+        status = getattr(e, "status_code", None)
+        if status is None:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+        text = f"{type(e).__name__}: {e}"
+        low = text.lower()
+        if status == 401 or "authentication" in low or ("invalid" in low and "api key" in low):
+            return ("auth", "API Key 无效、已过期，或与当前接口地址不匹配")
+        if (status == 402 or "insufficient balance" in low or "arrearage" in low
+                or "欠费" in text or "余额不足" in text):
+            return ("balance", "账户余额不足")
+        if status == 403 or ("permission" in low and "denied" in low):
+            return ("forbidden", "当前 API Key 没有该模型的调用权限")
+        if status == 429 or "rate limit" in low or "too many requests" in low:
+            return ("rate_limit", "请求过于频繁，被上游限流")
+        if "timeout" in low or "timed out" in low:
+            return ("timeout", "接口响应超时")
+        if any(k in low for k in ("connection", "connect", "network", "unreachable",
+                                  "name or service", "ssl", "certificate")):
+            return ("network", "网络不可达（接口地址、代理或证书配置有误）")
+        if isinstance(status, int) and status >= 500:
+            return ("upstream", f"上游服务错误（HTTP {status}）")
+    except Exception:
+        pass
+    return ("", "")
+
+
+def _note_llm_fault(e: BaseException) -> None:
+    """记录本线程最近一次基础设施类故障（供主链失败出口透出真因）。"""
+    try:
+        cat, reason = _classify_llm_error(e)
+        if cat:
+            _LLM_FAULT_LOCAL.fault = (cat, reason, time.time())
+    except Exception:
+        pass
+
+
+def last_llm_fault(max_age_s: float = 900.0) -> tuple[str, str] | None:
+    """取本线程最近一次基础设施故障 (类别, 原因)；超过 max_age_s 视为过期返回 None。"""
+    try:
+        f = getattr(_LLM_FAULT_LOCAL, "fault", None)
+        if not f:
+            return None
+        cat, reason, ts = f
+        if time.time() - ts > max_age_s:
+            return None
+        return (cat, reason)
+    except Exception:
+        return None
+
+
+def clear_llm_fault() -> None:
+    """清空本线程故障记录（每次请求开始前调用，避免上一轮的故障串到本轮）。"""
+    try:
+        _LLM_FAULT_LOCAL.fault = None
+    except Exception:
+        pass
+
+
 def get_llm_metrics() -> list[dict]:
     """取出全部埋点记录（供评测脚本 / 诊断接口使用）。"""
     with _LLM_METRICS_LOCK:
@@ -209,7 +282,12 @@ class _GuardedLLM:
     def invoke(self, *args, **kwargs):
         with _LLM_SEMAPHORE:
             if not _LLM_METRICS_ENABLED:
-                return self._inner.invoke(*args, **kwargs)
+                # 关掉埋点也要记录基础设施故障（否则 401/欠费在这条快路径上完全静默）
+                try:
+                    return self._inner.invoke(*args, **kwargs)
+                except Exception as e:
+                    _note_llm_fault(e)
+                    raise
             _t0 = time.monotonic()
             _ok, _err, _r = False, "", None
             try:
@@ -218,6 +296,7 @@ class _GuardedLLM:
                 return _r
             except Exception as e:
                 _err = f"{type(e).__name__}: {str(e)[:200]}"
+                _note_llm_fault(e)
                 raise
             finally:
                 _ti, _to, _est = _extract_usage(_r) if _ok else (0, 0, True)
@@ -232,7 +311,11 @@ class _GuardedLLM:
     def stream(self, *args, **kwargs):
         with _LLM_SEMAPHORE:
             if not _LLM_METRICS_ENABLED:
-                yield from self._inner.stream(*args, **kwargs)
+                try:
+                    yield from self._inner.stream(*args, **kwargs)
+                except Exception as e:
+                    _note_llm_fault(e)
+                    raise
                 return
             _t0 = time.monotonic()
             _ok, _err, _chars = False, "", 0
@@ -246,6 +329,7 @@ class _GuardedLLM:
                 _ok = True
             except Exception as e:
                 _err = f"{type(e).__name__}: {str(e)[:200]}"
+                _note_llm_fault(e)
                 raise
             finally:
                 # stream 路径实测拿不到 usage（DeepSeek 兼容接口不返回），统一按字符数估算，
@@ -616,6 +700,20 @@ _SUPERLATIVE_RE = re.compile(r"最(?:大|高|多|久|长|小|低|少|短|晚|早
 # 若沿用 `_GROUP_BY_RE`，本文件里读到的将是那个词表，永远匹配不到 SQL 关键字（已踩）。
 
 
+# 主键/编号类分组列：`id` / `*_id` / `*_no` / `*_code` —— 一行一个实体，属明细粒度
+_KEY_GROUP_COL_RE = re.compile(r"(?i)(?:^|_)(?:id|no|code)$")
+
+
+def _is_key_grouping(expr: str) -> bool:
+    """GROUP BY 的列**全**是主键/编号类 ⇒ 一行一个实体，是明细粒度而非维度列举。"""
+    cols = []
+    for part in (expr or "").split(","):
+        c = part.strip().strip('"').split(".")[-1].strip()
+        if c:
+            cols.append(c)
+    return bool(cols) and all(_KEY_GROUP_COL_RE.search(c) for c in cols)
+
+
 def _fix_dim_listing_limit(query: str, sql: str) -> str:
     """「各X/按X」类**全量分组**问题不得被默认 LIMIT 20 截断。
 
@@ -663,6 +761,17 @@ def _fix_dim_listing_limit(query: str, sql: str) -> str:
         # （`_global_topn1_intent` 定义在文件后部 —— 模块级名字在**调用时**解析，引用安全。）
         if _global_topn1_intent(query):
             return s
+        # 护栏③（2026-09-29 规则审计实测）：「SQL 反推语义」这条判据本身太弱。
+        # 实测「严重缺陷占比」被 LLM 写成 `GROUP BY defect_id`（要的是单值占比，
+        # 压根不是列举），规则看到"有 GROUP BY"就放开 LIMIT ⇒ 20 行变 1000 行，
+        # 等于把一条本该判死刑的错 SQL 放大了 50 倍，且放大后更难看出是错的。
+        # 判据：问句**没说**各/按/每个，且分组列全是主键/编号类 ⇒ 一行一个实体，
+        # 是明细粒度不是维度列举，不放。用户明说「各/每」的问句不受此限
+        # （那种场景下按 id 分组列举正是他要的）。
+        if not _DIM_LISTING_RE.search(query or ""):
+            _gb = _S_GROUPBY_RE.search(s)
+            if _gb and _is_key_grouping(_gb.group(1)):
+                return s
 
         def _sub(m):
             return "LIMIT %d" % max(int(m.group(1)), 1000)
@@ -1029,8 +1138,902 @@ def _fix_cte_rank_to_limit(query: str, sql: str) -> str:
 # 区间算术原样保留（-29 days 之类不动），最小侵入。
 _REL_WINDOW_RE = re.compile(
     r"最近|近\s*\d+\s*[天日月周]|本月|这个月|当月|上月|上个月|本周|这周|上周|今天|今日|昨天|昨日")
+
+
+# ── 数据实际时间范围探测（2026-09-28）────────────────────────────────
+# 背景（真跑复现）：问「上个月每个车间的平均停机时长」，编译器按注册口径生成
+# `start_time >= date_trunc('month',CURRENT_DATE) - INTERVAL '1 month'`，而演示库
+# 数据只到 2026-07-15 → 必然 0 行。此前 0 行重试**特意排除编译路径**（见主链注释：
+# 「编译产物来自人工验证口径，0 行更可能是真实无数据」）——这个假设在**相对时间问句**上
+# 不成立：确定性编译保证了 SQL 写法对，但保证不了「库里有没有那个时间段的数据」。
+#
+# 处理原则：**不改写编译产物**（确定性是它的价值，重写会破坏可解释性），
+# 改为**把「数据实际在哪」告诉用户**——0 行时探测涉及表的日期列范围，把结论写进洞察文案。
+# 与 investigator.py:378 的既有做法一致（那里也是 0 行时追加数据范围查询）。
+
+_DATA_RANGE_CACHE: dict = {}   # 表名 -> (ts, {"col": 日期列, "min": .., "max": ..})，10 分钟 TTL
+_DATA_RANGE_TTL = 600
+_DATA_RANGE_MAX_TABLES = 3     # 最多探测 3 张表，控成本
+# 排除明显非「数据发生时间」的日期列（这些是登记/更新时刻，不是业务时间）
+_DATA_RANGE_EXCLUDE_COL_RE = re.compile(
+    r"create|update|insert|delete|modif|_at$|created_at|updated_at", re.I)
+
+
+def _data_range_cols(table: str) -> list[str]:
+    """取表里可能的「业务时间」列（date/timestamp 类型，排除 create/update 审计列）。"""
+    try:
+        from db.tools import get_table_fields
+        fields = get_table_fields(table) or []
+    except Exception:
+        return []
+    out = []
+    for f in fields:
+        if not isinstance(f, dict):
+            continue
+        name = str(f.get("name") or f.get("field") or "").strip()
+        ftype = str(f.get("type") or f.get("data_type") or "").lower()
+        if not name:
+            continue
+        if not any(k in ftype for k in ("date", "timestamp", "datetime")):
+            continue
+        if _DATA_RANGE_EXCLUDE_COL_RE.search(name):
+            continue
+        out.append(name)
+    # 优先选「业务发生时刻」列。事实表惯例是 start_time / stat_date / order_date 这类
+    # 「起点/统计口径」列，而不是 end_time（结束时刻常因跨天/补录而偏移，且不是用户
+    # 提问时脑子里那个日期）。实测（2026-09-28）：eqp_downtime_record 同时有 start_time
+    # 与 end_time，若不加区分会取到 end_time，与用户问「上个月」时的直觉不符。
+    def _rank(c: str) -> tuple:
+        lc = c.lower()
+        if re.search(r"start|begin|stat|^dt$|_dt$", lc):
+            return (0, len(c))
+        if re.search(r"time|date", lc):
+            return (1, len(c))
+        return (2, len(c))
+    out.sort(key=_rank)
+    return out
+
+
+def _probe_data_range(sqlexec, tables: list[str]) -> dict | None:
+    """0 行时探测这些表里「业务时间列」的实际取值范围。
+
+    sqlexec: 可调用对象，签名为 (sql) -> dict（返回 {"success":..,"rows":..}），
+             由调用方传入，以复用既有的权限改写与安全执行链。
+    返回 {"col","min","max","table"} 或 None（探不到就静默放弃，绝不影响主链）。
+    """
+    import time as _t
+    for tbl in (tables or [])[:_DATA_RANGE_MAX_TABLES]:
+        bare = str(tbl).split(".")[-1]
+        if not bare or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", bare):
+            continue
+        now = _t.time()
+        hit = _DATA_RANGE_CACHE.get(bare)
+        if hit and now - hit[0] < _DATA_RANGE_TTL:
+            if hit[1]:
+                return hit[1]
+            continue
+        got = None
+        for col in _data_range_cols(bare):
+            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", col):
+                continue
+            try:
+                r = sqlexec(
+                    f'SELECT MIN("{col}") AS mn, MAX("{col}") AS mx FROM "{bare}"')
+            except Exception:
+                continue
+            if r and r.get("success") and r.get("rows"):
+                row = r["rows"][0]
+                vals = list(row.values()) if isinstance(row, dict) else list(row)
+                if len(vals) >= 2 and vals[0] is not None and vals[1] is not None:
+                    got = {"col": col, "min": vals[0], "max": vals[1], "table": bare}
+                    break
+        _DATA_RANGE_CACHE[bare] = (now, got)
+        if got:
+            return got
+    return None
+
+
+def _fmt_dt(v) -> str:
+    s = str(v or "")
+    return s[:10] if len(s) >= 10 else s
+
+
+def _zero_row_data_range_hint(sqlexec, tables: list[str], query: str) -> str:
+    """0 行 + 相对时间问句 → 生成一句「数据实际在哪」的提示；探不到返回空串。"""
+    if not _REL_WINDOW_RE.search(str(query or "")):
+        return ""
+    try:
+        probed = _probe_data_range(sqlexec, tables)
+    except Exception:
+        return ""
+    if not probed:
+        return ""
+    mn, mx = _fmt_dt(probed["min"]), _fmt_dt(probed["max"])
+    hint = (f"\n\n【数据范围提示】本次查询条件里的时间区间在当前库里没有数据。"
+            f"表 `{probed['table']}` 的实际数据范围是 **{mn} ~ {mx}**"
+            f"（时间字段 `{probed['col']}`），请据此改用具体日期区间再问一次。")
+    # 两期对比（本月 vs 上月）额外点破「两期长度不对等」：
+    # 实测「哪些产线本月产量超过上个月」——最新月只到 15 号（半个月），
+    # 与完整的上一整月比必然偏低，答案就是 0 条。只报数据范围的话，
+    # 用户会以为是查询写错了，反复重试。
+    if _PERIOD_PAIR_RE.search(str(query or "")) and _PERIOD_CMP_RE.search(str(query or "")):
+        try:
+            import datetime as _dt
+            _mx = probed["max"]
+            _d = _mx.date() if isinstance(_mx, _dt.datetime) else _mx
+            _dmax = _dt.date(int(str(_d)[0:4]), int(str(_d)[5:7]), int(str(_d)[8:10])) \
+                if not isinstance(_d, _dt.date) else _d
+            import calendar as _cal
+            _last = _cal.monthrange(_dmax.year, _dmax.month)[1]
+            if _dmax.day < _last:
+                hint += (f"\n\n【为什么是 0 条】你要比较的两期长度不对等：最新月 "
+                         f"**{_dmax.year}-{_dmax.month:02d}** 的数据只到 "
+                         f"**{_dmax.day} 号**（该月共 {_last} 天，仅 {_dmax.day}/{_last}），"
+                         f"而上一期是完整的一个月。产线本期产量因此普遍低于上期，"
+                         f"筛不出「超过」的产线——这是数据本身的情况，不是查询写错。")
+        except Exception:
+            pass
+    return hint
+_HARDCODED_DATE_RE = re.compile(r"'(\d{4}-\d{2}-\d{2})(?:[ T]\d{2}:\d{2}:\d{2})?'")
+
+
+def _reanchor_hardcoded_range(sqlexec, query: str, sql: str):
+    """LLM 硬编码了错误年份的日期字面量 → 整段平移到「以最新有数据月为终点」的等长区间。
+
+    病根（实测「哪些产线本月产量超过上个月」）：LLM 直接写出 `>= '2024-05-01'
+    AND <= '2024-06-30'`，而真实数据在 2026-06-01 ~ 2026-07-15 —— 差了整整两年。
+    已有的 `_reanchor_sql_to_month` 只认 `CURRENT_DATE` / `date_trunc` 形态，
+    **对硬编码字面量无能为力**（实测该函数在这条 SQL 上返回原串），于是锚点
+    形同虚设，查询必然 0 行。
+
+    为什么不改 LLM 提示词去压年份幻觉：那是主体生成链路，本次不动；且提示词
+    压不住（同一份 prompt 上一条对了、下一条又错）。确定性改写能兜住。
+
+    判据要严，避免误伤「用户明确指定历史月份」的正常查询：
+      ① 问句含相对时间词（本月/上月/最近…）— 说明用户没指定具体年月；
+      ② SQL 里有日期字面量；
+      ③ 这些字面量**全部**落在真实数据范围之外（整段不相交）。
+    三条缺一不可；只含单个字面量时按其与数据上限的关系单独平移。
+
+    返回 (新SQL, 说明文案) 或 None。
+    """
+    q = str(query or "")
+    s = str(sql or "")
+    if not s or not _ANCHOR_WINDOW_WORD_RE.search(q):
+        return None
+    lits = _HARDCODED_DATE_RE.findall(s)
+    if not lits:
+        return None
+    try:
+        tables = sorted(_extract_sql_tables(s))
+    except Exception:
+        return None
+    if not tables:
+        return None
+    try:
+        probed = _probe_data_range(sqlexec, tables)
+    except Exception:
+        return None
+    if not probed:
+        return None
+    import datetime as _dt
+    import calendar as _cal
+
+    def _d(v):
+        try:
+            if isinstance(v, _dt.datetime):
+                return v.date()
+            if isinstance(v, _dt.date):
+                return v
+            return _dt.date(int(str(v)[0:4]), int(str(v)[5:7]), int(str(v)[8:10]))
+        except Exception:
+            return None
+
+    dmin, dmax = _d(probed.get("min")), _d(probed.get("max"))
+    if not dmin or not dmax:
+        return None
+    ds = sorted({_d(x) for x in lits} - {None})
+    if not ds:
+        return None
+    # ③ 全部落在数据范围之外才动；任何一个落在范围内 → 视为用户有意指定，不动
+    if any(dmin <= d <= dmax for d in ds):
+        return None
+    today = _dt.date.today()
+    if (dmax.year, dmax.month) >= (today.year, today.month):
+        return None  # 数据是新鲜的，没理由怀疑硬编码日期
+
+    y, m = dmax.year, dmax.month
+    end = _dt.date(y, m, _cal.monthrange(y, m)[1])      # 最新有数据月的月末
+    if len(ds) >= 2:
+        span = (ds[-1] - ds[0]).days                     # 保持原区间跨度
+        start = end - _dt.timedelta(days=span)
+        mapping = {ds[0]: start, ds[-1]: end}
+        for d in ds[1:-1]:                               # 中间的字面量按比例插值
+            try:
+                ratio = (d - ds[0]).days / max(span, 1)
+                mapping[d] = start + _dt.timedelta(days=int(span * ratio))
+            except Exception:
+                pass
+    else:
+        # 单字面量：锚到真实数据上限（与「最近N天」同一处理，见 _reanchor_sql_to_month ③）
+        mapping = {ds[0]: dmax}
+    out = s
+    for old, new in mapping.items():
+        out = out.replace("'%s'" % old.isoformat(), "'%s'" % new.isoformat())
+    for old, new in mapping.items():                     # 带时间后缀的形态
+        out = out.replace("'%s 00:00:00'" % old.isoformat(), "'%s'" % new.isoformat())
+    if out == s:
+        return None
+    note = ("查询条件里写的是 %s，但当前库数据只在 %s ~ %s 之间，"
+            "已按「最新有数据的月份」把时间段平移到 %s 附近重新查询"
+            % ("、".join(x.isoformat() for x in ds), dmin.isoformat(), dmax.isoformat(),
+               (mapping[ds[0]].isoformat() + " ~ " + mapping[ds[-1]].isoformat())
+               if len(ds) >= 2 else dmax.isoformat()))
+    return out, note
+
+
+# ── 两期对比的分支聚合（2026-09-29）──────────────────────────────────
+_PERIOD_PAIR_RE = re.compile(
+    r"(本月|这个月|当月|本期|今年|本周|这周)[^。；]{0,10}(上月|上个月|上期|去年|上周)"
+    r"|(上月|上个月|上期|去年|上周)[^。；]{0,10}(本月|这个月|当月|本期|今年|本周|这周)")
+_PERIOD_CMP_RE = re.compile(r"超过|高于|大于|多于|少于|低于|小于|不如|增长|下降|提升|减少")
+# SELECT 列表里的聚合项：SUM(col) AS "别名" / SUM(col)（无别名）
+_AGG_ITEM_RE = re.compile(
+    r"\b(SUM|COUNT|AVG|MAX|MIN)\s*\(\s*([A-Za-z_][\w\.\"]*)\s*\)\s*(?:AS\s+(\"[^\"]+\"|[A-Za-z_]\w*))?",
+    re.I)
+# WHERE 里的单一时间区间：col >= 'A' AND col [<|<=] 'B'
+_RANGE_RE = re.compile(
+    r"([\w\.\"]+)\s*>=\s*'(\d{4}-\d{2}-\d{2})'\s*(?:::\s*date)?\s*AND\s*"
+    r"([\w\.\"]+)\s*(?:<|<=)\s*'(\d{4}-\d{2}-\d{2})'\s*(?:::\s*date)?", re.I)
+
+
+def _minus_one_month(d):
+    """日期减一个月，处理月末溢出（3-31 → 2-28/29）。"""
+    import datetime as _dt
+    import calendar as _cal
+    y, m = d.year, d.month
+    if m == 1:
+        return _dt.date(y - 1, 12, min(d.day, _cal.monthrange(y - 1, 12)[1]))
+    return _dt.date(y, m - 1, min(d.day, _cal.monthrange(y, m - 1)[1]))
+
+
+def _fix_period_compare_branches(query: str, sql: str) -> str:
+    """「本月 vs 上月」类两期对比：把「两个完全相同的聚合 + 单一时间窗」改成分期条件聚合。
+
+    病根（实测「哪些产线本月产量超过上个月」）：LLM 生成
+        SELECT SUM(good_qty) AS "本月产量", SUM(good_qty) AS "上月产量", line_name
+        WHERE stat_date >= A AND stat_date < B GROUP BY line_name
+    两个聚合列**表达式完全相同、共享同一时间窗** → 两列恒等，「超过」这个比较根本
+    没发生。这类 SQL 即便查到数据也是错的，且错得很隐蔽（看起来像有答案）。
+
+    改法：本期用 [A,B)，上期用 [A-1月, A)，WHERE 扩到 [A-1月, B)，末尾补 HAVING
+    完成真正的比较。
+
+    触发条件刻意收得很窄（四个条件全满足才动），因为改写会重建 SELECT 与 WHERE：
+      ① 问句同时含「本期词 + 上期词」与比较词（超过/高于…）；
+      ② SQL 里没有 CASE WHEN（已有条件聚合就不必插手）；
+      ③ SELECT 里出现 ≥2 个**表达式完全相同**的聚合（正是恒等的证据）；
+      ④ WHERE 里恰好一个时间区间（改写依赖它确定两期边界）。
+    缺一条即原样返回。
+    """
+    q = str(query or "")
+    s = (sql or "").strip()
+    if not s or "CASE" in s.upper():
+        return sql
+    if not (_PERIOD_PAIR_RE.search(q) and _PERIOD_CMP_RE.search(q)):
+        return sql
+    rng = _RANGE_RE.search(s)
+    if not rng:
+        return sql
+    try:
+        import datetime as _dt
+        lo = _dt.date(*[int(x) for x in rng.group(2).split("-")])
+        hi = _dt.date(*[int(x) for x in rng.group(4).split("-")])
+    except Exception:
+        return sql
+    if hi <= lo:
+        return sql
+    # 边界必须**恰好是一个自然月**才能安全定义「上期 = 本期减一个月」。
+    # 实测翻车：LLM 给出跨两月的区间 [06-01, 07-31)，改写后上期落到 [05-01, 06-01)，
+    # 而库里根本没有 5 月数据 → 上期恒为 0 → HAVING「本期 > 上期」全部成立，
+    # 凭空产出 5 条「产量超过上月的产线」。假阳性比返回 0 行更危险，必须挡住。
+    if not (27 <= (hi - lo).days <= 32):
+        return sql
+    # 只在 SELECT 段内找聚合项（避免把 HAVING / 子查询里的聚合也算进来）
+    sel = s
+    gpos = re.search(r"\bGROUP\s+BY\b", s, re.I)
+    if gpos:
+        sel = s[:gpos.start()]
+    items = list(_AGG_ITEM_RE.finditer(sel))
+    if len(items) < 2:
+        return sql
+    # 按「函数(列)」归一化，找出重复出现的那个
+    from collections import Counter
+    keys = [("%s(%s)" % (m.group(1).upper(), m.group(2).lower())) for m in items]
+    dup = [k for k, c in Counter(keys).items() if c >= 2]
+    if not dup:
+        return sql
+    key = dup[0]
+    idxs = [i for i, k in enumerate(keys) if k == key]
+    if len(idxs) < 2:
+        return sql
+    prev_lo = _minus_one_month(lo)
+    fn, col = key.split("(", 1)
+    col = col.rstrip(")")
+    date_col = rng.group(1)
+    # 构造两个分期表达式：本期 [lo,hi) / 上期 [prev_lo,lo)
+    def _case(a, b):
+        return ("%s(CASE WHEN %s >= '%s' AND %s < '%s' THEN %s ELSE 0 END)"
+                % (fn, date_col, a.isoformat(), date_col, b.isoformat(), col))
+    cur_expr = _case(lo, hi)
+    prv_expr = _case(prev_lo, lo)
+    # 只用**原始** items 的位置，从后往前替换：后面的替换不影响前面的偏移。
+    # 不能替换后重新 finditer —— 新构造成的 `SUM(CASE WHEN ...)` 自己又会被
+    # _AGG_ITEM_RE 匹配到（CASE 被当成列名），items 结构随即错乱（实测 IndexError）。
+    pair = idxs[:2]
+    out = s
+    for n, i in sorted(enumerate(pair), key=lambda x: -x[1]):
+        m = items[i]
+        alias = m.group(3)
+        repl = (cur_expr if n == 0 else prv_expr)
+        if alias:
+            repl = repl + " AS " + alias
+        out = out[:m.start()] + repl + out[m.end():]
+    if out == s:
+        return sql
+    # WHERE 扩到 [prev_lo, hi)，否则上期数据会被过滤掉。
+    # 必须**限定在 WHERE 段内**替换：同样的区间片段此刻也已出现在 SELECT 的 CASE 里
+    # （实测整串 replace 会把本期边界 07-01 一并改成 06-01，本期就多算了一个月）。
+    wpos = re.search(r"\bWHERE\b", out, re.I)
+    if wpos:
+        wend = re.search(r"\b(GROUP\s+BY|ORDER\s+BY|LIMIT|HAVING)\b", out[wpos.end():], re.I)
+        wend = wpos.end() + (wend.start() if wend else len(out) - wpos.end())
+        seg = out[wpos.end():wend]
+        seg_new = seg.replace(rng.group(0),
+                              "%s >= '%s' AND %s < '%s'"
+                              % (rng.group(1), prev_lo.isoformat(), rng.group(3), hi.isoformat()))
+        out = out[:wpos.end()] + seg_new + out[wend:]
+    # 上面几处拼接可能吃掉日期字面量与后继关键字之间的空格（实测产出
+    # `'2026-08-01'THEN` / `'2026-08-01'GROUP`）。统一补回，避免语法错误。
+    out = re.sub(r"('\d{4}-\d{2}-\d{2}')(?=(?:THEN|ELSE|END|AND|OR|GROUP|ORDER|LIMIT|HAVING|WHERE|AS|\)|,))",
+                 r"\1 ", out, flags=re.I)
+    # 补 HAVING 完成真正的比较。
+    # 注意：PostgreSQL 的 HAVING **不能引用 SELECT 别名**（实测报 42703
+    # 「字段 "本月产量" 不存在」），必须把两个聚合表达式原样重复一遍。
+    cmp_op = ">" if re.search(r"超过|高于|大于|多于|增长|提升", q) else "<"
+    having = " HAVING %s %s %s" % (cur_expr, cmp_op, prv_expr)
+    pos = re.search(r"\b(ORDER\s+BY|LIMIT|OFFSET)\b", out, re.I)
+    out = (out[:pos.start()] + having + " " + out[pos.start():]) if pos else out + having
+    return out
+
+
+# 月初常量（`DATE_TRUNC('MONTH', x) = 'YYYY-MM-01'` 里的右值）
+_MONTH_CONST_RE = re.compile(r"'(\d{4})-(\d{2})-01'")
+# 「整月等值」写法：DATE_TRUNC('MONTH', col) = 'YYYY-MM-01'::date
+_TRUNC_MONTH_EQ_RE = re.compile(
+    r"DATE_TRUNC\s*\(\s*'\s*MONTH\s*'\s*,\s*([\w\.]+)\s*\)\s*=\s*'(\d{4})-(\d{2})-01'\s*(?:::\s*date)?",
+    re.I)
+
+
+def _align_period_compare_trunc(query: str, sql: str, sqlexec=None,
+                                notes: list | None = None) -> str:
+    """期长对齐的另一条路径：两期用 `DATE_TRUNC('MONTH',col) = 'MM-01'` 表达时。
+
+    `_align_period_compare_length` 只认 `col >= 'A' AND col < 'B'` 区间形式，
+    而 LLM 也会写出「整月等值」形式（实测第三种生成形态），那条路径便无从下手。
+    病根与修法同 `_align_period_compare_length`：本期只有半个月数据时，
+    把上期从整月收窄到同期的 N 天，避免「半月 vs 全月」让所有分组都显示下降。
+
+    触发条件（同主路径一样收紧）：
+      ① 问句是「本期 vs 上期」型；
+      ② SQL 里 ≥2 个整月等值，且能分出两个不同的月份（本期/上期）；
+      ③ 表数据上限落在本期内、且本期确实不完整；
+      ④ 本期实际天数不足名义天数七成。
+    """
+    if sqlexec is None:
+        return sql
+    q = str(query or "")
+    s = (sql or "").strip()
+    if not s or not _PERIOD_PAIR_RE.search(q):
+        return sql
+    tm = list(_TRUNC_MONTH_EQ_RE.finditer(s))
+    if len(tm) < 2:
+        return sql
+    import datetime as _dt
+    try:
+        months = sorted(set((int(m.group(2)), int(m.group(3))) for m in tm))
+        if len(months) < 2:
+            return sql      # 两期同月 → 归 _fix_degenerate_self_compare 管
+        cy, cmo = months[-1]                       # 本期
+        py, pmo = months[0]                        # 上期
+        cur_lo = _dt.date(cy, cmo, 1)
+        cur_hi = _plus_one_month(cur_lo)
+        prv_lo = _dt.date(py, pmo, 1)
+    except Exception:
+        return sql
+    try:
+        tables = sorted(_extract_sql_tables(s))
+    except Exception:
+        return sql
+    if not tables:
+        return sql
+    try:
+        probed = _probe_data_range(sqlexec, tables)
+    except Exception:
+        return sql
+    mx = (probed or {}).get("max")
+    try:
+        if isinstance(mx, _dt.datetime):
+            dmx = mx.date()
+        elif isinstance(mx, _dt.date):
+            dmx = mx
+        else:
+            t = str(mx)[:10]
+            dmx = _dt.date(int(t[0:4]), int(t[5:7]), int(t[8:10]))
+    except Exception:
+        return sql
+    if not (cur_lo <= dmx < cur_hi) or dmx >= cur_hi - _dt.timedelta(days=1):
+        return sql
+    n_actual = (dmx - cur_lo).days + 1
+    n_nominal = (cur_hi - cur_lo).days
+    if n_nominal <= 0 or n_actual < 1 or n_actual >= n_nominal * 0.7:
+        return sql
+    n_align = min(n_actual, (cur_lo - prv_lo).days)
+    new_prv_hi = prv_lo + _dt.timedelta(days=n_align)
+    if new_prv_hi >= cur_lo:
+        return sql
+    # 把「上期」的整月等值改写成同期区间；本期保持原样（它本来就是「本月至今」）
+    out = s
+    changed = False
+    for m in reversed(tm):
+        if int(m.group(2)) == py and int(m.group(3)) == pmo:
+            col = m.group(1)
+            repl = ("%s >= '%s' AND %s < '%s'"
+                    % (col, prv_lo.isoformat(), col, new_prv_hi.isoformat()))
+            out = out[:m.start()] + repl + out[m.end():]
+            changed = True
+    if not changed:
+        return sql
+    if notes is not None:
+        notes.append(
+            "本期（%s 起）数据只到 %s、共 %d 天，与上一期整段（%d 天）天数不对等，"
+            "直接比会让所有分组都显示下降。已把上一期对齐到同期（%s ~ %s，同样 %d 天）"
+            "再比较。" % (cur_lo.isoformat(), dmx.isoformat(), n_actual,
+                          (cur_lo - prv_lo).days, prv_lo.isoformat(),
+                          (new_prv_hi - _dt.timedelta(days=1)).isoformat(), n_align))
+    return out
+
+
+def _fix_degenerate_self_compare(query: str, sql: str) -> str:
+    """「本期 vs 上期」退化成自己跟自己比：HAVING 两侧表达式完全相同 → 恒假 → 必然 0 行。
+
+    病根（实测「哪些产线本月产量超过上个月」的第三种生成形态，2026-09-29）：
+        WHERE DATE_TRUNC('MONTH', mo.stat_date) IN ('2026-07-01', '2026-07-01')
+        HAVING SUM(CASE WHEN ...='2026-07-01' ... END) > SUM(CASE WHEN ...='2026-07-01' ... END)
+    两期被写成了同一个月，比较退化成 `X > X`。这种 SQL **不管语义如何都必然返回 0 行**，
+    且 0 行毫无信息量——不是「没有产线增长」，是「比较根本没发生」。
+    同一题 LLM 三次生成出三种形态，前两种已被 branches / merged 接住，这是第三种。
+
+    改法：把「上期」那半边改回上一个月——HAVING 右侧 + WHERE IN 的第二个值。
+    不改 SELECT（本期列保持不变），结果筛出的就是「本期 > 上期」的那批分组。
+
+    触发条件（四条全满足才动，误伤风险极低）：
+      ① 问句含「本期词+上期词」与比较词；
+      ② 存在 HAVING，且按最外层比较符切开后**左右两侧归一化后完全相同**；
+      ③ SQL 里 ≥2 个月份常量，且**全部相同**（已经分期的不算退化）；
+      ④ 比较符两侧是空白（排除 >= / <= ，避免误切）。
+    """
+    q = str(query or "")
+    s = (sql or "").strip()
+    if not s or not (_PERIOD_PAIR_RE.search(q) and _PERIOD_CMP_RE.search(q)):
+        return sql
+    hm = re.search(r"\bHAVING\b", s, re.I)
+    if not hm:
+        return sql
+    tail = s[hm.end():]
+    endm = re.search(r"\b(ORDER\s+BY|LIMIT|OFFSET)\b", tail, re.I)
+    having = tail[:endm.start()] if endm else tail
+    # ② 只在两侧都是空白时才切（>= / <= 紧邻 = 不会被切开）
+    parts = re.split(r"\s([<>])\s", having)
+    if len(parts) != 3:
+        return sql
+    _norm = lambda x: re.sub(r"\s+", " ", x).strip()
+    if _norm(parts[0]) != _norm(parts[2]):
+        return sql
+    ms = list(_MONTH_CONST_RE.finditer(s))
+    if len(ms) < 2:
+        return sql
+    # ③ 全部常量同一个月才算退化
+    if len(set((m.group(1), m.group(2)) for m in ms)) != 1:
+        return sql
+    y, mo = int(ms[0].group(1)), int(ms[0].group(2))
+    py, pm = (y - 1, 12) if mo == 1 else (y, mo - 1)
+    prev = "'%04d-%02d-01'" % (py, pm)
+    out = s
+    changed = False
+    # ① WHERE 的 IN 列表：把**第二个**值改成上月（IN 是集合，顺序不影响语义）
+    wm = re.search(r"\bWHERE\b", out, re.I)
+    if wm:
+        wend = re.search(r"\b(GROUP\s+BY|ORDER\s+BY|LIMIT|HAVING)\b", out[wm.end():], re.I)
+        wend = wm.end() + (wend.start() if wend else len(out) - wm.end())
+        wseg = out[wm.end():wend]
+        ims = list(_MONTH_CONST_RE.finditer(wseg))
+        if len(ims) >= 2:
+            m2 = ims[1]
+            wseg2 = wseg[:m2.start()] + prev + wseg[m2.end():]
+            out = out[:wm.end()] + wseg2 + out[wend:]
+            changed = True
+    # ② HAVING 右侧改成上月。重新定位（上面可能已改动字符串，但只动了 WHERE 段，
+    #    HAVING 在 WHERE 之后，故此处重新查找最稳）
+    hm2 = re.search(r"\bHAVING\b", out, re.I)
+    if hm2:
+        tail2 = out[hm2.end():]
+        e2 = re.search(r"\b(ORDER\s+BY|LIMIT|OFFSET)\b", tail2, re.I)
+        hseg = tail2[:e2.start()] if e2 else tail2
+        p2 = re.split(r"\s([<>])\s", hseg)
+        if len(p2) == 3:
+            rhs = p2[2]
+            rms = list(_MONTH_CONST_RE.finditer(rhs))
+            if rms:
+                rstart = hm2.end() + (len(p2[0]) + len(p2[1]) + 2)
+                # 直接用 hsge 内偏移更稳：右侧在原串中的起点
+                rhs_off = hseg.rfind(rhs) if rhs in hseg else -1
+                if rhs_off >= 0:
+                    rm = rms[0]
+                    abs_start = hm2.end() + rhs_off + rm.start()
+                    out = out[:abs_start] + prev + out[abs_start + (rm.end() - rm.start()):]
+                    changed = True
+    return out if changed else sql
+
+
+def _fix_period_compare_merged(query: str, sql: str) -> str:
+    """「本月 vs 上月」的另一变体：LLM 把两个月的量**合并**成一个聚合，比较根本没发生。
+
+    与 `_fix_period_compare_branches` 的区别（同一个病根的两种写法）：
+      - branches 形态：SELECT 里两个表达式完全相同的聚合（SUM(x) AS "本月"、SUM(x) AS "上月"）；
+      - merged   形态（本函数）：SELECT 里**只有一个**聚合，WHERE 却横跨两个自然月，
+        于是「本月 vs 上月」被算成了「两月合计」。
+    实测「哪些产线本月产量超过上个月」两种形态都出现过（同一题两次生成不一样），
+    branches 那条接不住 merged，Critic 虽能报警、改写后又变 0 行，系统回退交付了
+    那个被判定为错的「两月合计」答案——看着像查出数了，其实答非所问。
+
+    改法：把跨两月的单聚合拆成「本期 / 上期」两个条件聚合 + HAVING 比较，
+    产出形态与 branches 一致，好让后面的期长对齐能继续接上。
+
+    触发条件（五条全满足才动，宁可不改也不改错）：
+      ① 问句同时含「本期词 + 上期词」与比较词；
+      ② SQL 里没有 CASE（已有分期就不插手）；
+      ③ SELECT 段内恰好 1 个聚合项（≥2 个归 branches 管）；
+      ④ WHERE 里恰好一个时间区间，且**正好覆盖两个相邻自然月**；
+      ⑤ 有 GROUP BY（分组对比才有意义；无分组的全局合计不拆）。
+    """
+    q = str(query or "")
+    s = (sql or "").strip()
+    if not s or "CASE" in s.upper():
+        return sql
+    if not (_PERIOD_PAIR_RE.search(q) and _PERIOD_CMP_RE.search(q)):
+        return sql
+    if not re.search(r"\bGROUP\s+BY\b", s, re.I):
+        return sql
+    rng = _RANGE_RE.search(s)
+    if not rng:
+        return sql
+    try:
+        import datetime as _dt
+        lo = _dt.date(*[int(x) for x in rng.group(2).split("-")])
+        hi = _dt.date(*[int(x) for x in rng.group(4).split("-")])
+    except Exception:
+        return sql
+    # `<= 'B'` 的写法要把上界转成半开区间的 B+1 天，否则少算最后一天
+    opseg = s[rng.start(3):rng.start(4)]
+    hi_excl = hi + _dt.timedelta(days=1) if "<=" in opseg else hi
+    # ④ 必须正好是两个相邻自然月：lo 是月初、hi_excl 是月初、相隔 2 个月
+    if lo.day != 1 or hi_excl.day != 1:
+        return sql
+    n_months = (hi_excl.year - lo.year) * 12 + (hi_excl.month - lo.month)
+    if n_months != 2 or hi_excl <= lo:
+        return sql
+    # ③ 只在 SELECT 段内数聚合项
+    sel = s
+    gpos = re.search(r"\bGROUP\s+BY\b", s, re.I)
+    if gpos:
+        sel = s[:gpos.start()]
+    items = list(_AGG_ITEM_RE.finditer(sel))
+    if len(items) != 1:
+        return sql
+    m = items[0]
+    fn, col = m.group(1).upper(), m.group(2)
+    alias = m.group(3)
+    date_col = rng.group(1)
+    cur_lo = _plus_one_month(lo)   # lo 已保证是月初
+    cur_hi = hi_excl
+
+    def _case(a, b):
+        return ("%s(CASE WHEN %s >= '%s' AND %s < '%s' THEN %s ELSE 0 END)"
+                % (fn, date_col, a.isoformat(), date_col, b.isoformat(), col))
+    cur_expr, prv_expr = _case(cur_lo, cur_hi), _case(lo, cur_lo)
+    cur_alias = alias or '"本期"'
+    prv_alias = '"上期"' if not alias else alias.replace('"', '')  # 占位，下面重算
+    # 上期别名：沿用原名但加「上期」前缀，避免两列同名
+    if alias and alias.startswith('"'):
+        prv_alias = '"上期' + alias.strip('"') + '"'
+        cur_alias = '"本期' + alias.strip('"') + '"'
+    else:
+        prv_alias = '"上期"'
+        cur_alias = alias or '"本期"'
+    repl = "%s AS %s, %s AS %s" % (cur_expr, cur_alias, prv_expr, prv_alias)
+    out = s[:m.start()] + repl + s[m.end():]
+    # WHERE 扩到覆盖两期（本来就已覆盖，这里统一成半开写法，避免 <= 漏最后一天）
+    wpos = re.search(r"\bWHERE\b", out, re.I)
+    if wpos:
+        wend = re.search(r"\b(GROUP\s+BY|ORDER\s+BY|LIMIT|HAVING)\b", out[wpos.end():], re.I)
+        wend = wpos.end() + (wend.start() if wend else len(out) - wpos.end())
+        seg = out[wpos.end():wend]
+        seg_new = seg.replace(rng.group(0),
+                              "%s >= '%s' AND %s < '%s'"
+                              % (date_col, lo.isoformat(), date_col, cur_hi.isoformat()))
+        out = out[:wpos.end()] + seg_new + out[wend:]
+    out = re.sub(r"('\d{4}-\d{2}-\d{2}')(?=(?:THEN|ELSE|END|AND|OR|GROUP|ORDER|LIMIT|HAVING|WHERE|AS|\)|,))",
+                 r"\1 ", out, flags=re.I)
+    cmp_op = ">" if re.search(r"超过|高于|大于|多于|增长|提升", q) else "<"
+    having = " HAVING %s %s %s" % (cur_expr, cmp_op, prv_expr)
+    pos = re.search(r"\b(ORDER\s+BY|LIMIT|OFFSET)\b", out, re.I)
+    out = (out[:pos.start()] + having + " " + out[pos.start():]) if pos else out + having
+    return out
+
+
+def _plus_one_month(d):
+    """日期加一个月。调用方保证 d 是月初（day==1），故下月同日一定存在，
+    无需处理月末溢出；仅年末需进位到次年 1 月。"""
+    import datetime as _dt
+    return _dt.date(d.year + 1, 1, d.day) if d.month == 12 else _dt.date(d.year, d.month + 1, d.day)
+
+
+# CASE 分期聚合里的时间区间（`_fix_period_compare_branches` 的产出形态）：
+# `col >= 'A' AND col < 'B'`，反向引用保证两端是同一列。
+_CASE_RANGE_RE = re.compile(
+    r"([\w\.]+)\s*>=\s*'(\d{4}-\d{2}-\d{2})'\s+AND\s+\1\s*<\s*'(\d{4}-\d{2}-\d{2})'")
+
+
+def _align_period_compare_length(query: str, sql: str, sqlexec=None,
+                                 notes: list | None = None) -> str:
+    """两期对比的期长对齐（MTD 口径）：本期数据不完整时，把上期截到同样的天数。
+
+    病根（实测「哪些产线本月产量超过上个月」，2026-09-29）：
+    库里 6 月是 30 天完整数据、7 月只有 1-15 日共 15 天。分期聚合改写正确地把
+    本期定为 7 月、上期定为 6 月，于是变成「7 月半个月 vs 6 月整月」——5 条产线
+    全部显示下降，HAVING「本期 > 上期」一条不中，返回 0 行。
+    **SQL 是对的，0 行也是真实结果，但这个对比本身不公平**——用户看到 0 行
+    只会以为系统坏了，而真实情况是三车间-3号线同比 +118.8%。
+
+    改法（业务上通行的 MTD 同期对比）：探测本期实际有数据的天数 N，把上期从整月
+    截断到「同期的 N 天」（7/1-15 对 6/1-15）。实测 0 行 → 4 条产线增长，
+    仅二车间-5号线 -17.5%。**必须写进 notes**，否则等于偷偷换口径。
+
+    触发条件（缺一即原样返回，宁可不改也不改错）：
+      ① sqlexec 可用（要探测真实数据范围）；
+      ② 问句是「本期 vs 上期」型（复用 _PERIOD_PAIR_RE）；
+      ③ SQL 里能识别出相邻的两期 CASE 区间（上期上界 == 本期下界）；
+      ④ 表数据上限落在本期区间内（本期确实不完整）；
+      ⑤ 本期实际天数不足名义天数的 70%（缺口足够大，值得对齐）。
+    另外由链尾总闸门兜底：若对齐后反而从「有行」变「0 行」，会被整体回滚。
+    """
+    if sqlexec is None:
+        return sql
+    q = str(query or "")
+    s = (sql or "").strip()
+    if not s or not _PERIOD_PAIR_RE.search(q):
+        return sql
+    ms = list(_CASE_RANGE_RE.finditer(s))
+    if len(ms) < 2:
+        return sql
+    import datetime as _dt
+    try:
+        spans = []
+        for m in ms:
+            a = _dt.date(*[int(x) for x in m.group(2).split("-")])
+            b = _dt.date(*[int(x) for x in m.group(3).split("-")])
+            spans.append((a, b, m))
+        # 本期 = 起点最大的区间；上期 = 上界正好等于本期下界的那个区间
+        cur = max(spans, key=lambda x: x[0])
+        lo, hi = cur[0], cur[1]
+        prevs = [x for x in spans if x[1] == lo and x[0] < lo]
+        if not prevs:
+            return sql
+        prev_lo = prevs[0][0]
+    except Exception:
+        return sql
+    # 探测本期实际有数据到哪天
+    try:
+        tables = sorted(_extract_sql_tables(s))
+    except Exception:
+        return sql
+    if not tables:
+        return sql
+    probed = None
+    try:
+        probed = _probe_data_range(sqlexec, tables)
+    except Exception:
+        return sql
+    mx = (probed or {}).get("max")
+    try:
+        if isinstance(mx, _dt.datetime):
+            dmx = mx.date()
+        elif isinstance(mx, _dt.date):
+            dmx = mx
+        else:
+            t = str(mx)[:10]
+            dmx = _dt.date(int(t[0:4]), int(t[5:7]), int(t[8:10]))
+    except Exception:
+        return sql
+    # ④ 数据上限必须落在本期区间内，且确实没到本期末（否则本期是完整的，无需对齐）
+    if not (lo <= dmx < hi) or dmx >= hi - _dt.timedelta(days=1):
+        return sql
+    n_actual = (dmx - lo).days + 1
+    n_nominal = (hi - lo).days
+    if n_nominal <= 0 or n_actual < 1:
+        return sql
+    # ⑤ 缺口不足三成就不动（避免为几天的差异改变用户问的口径）
+    if n_actual >= n_nominal * 0.7:
+        return sql
+    prev_span_days = (lo - prev_lo).days
+    n_align = min(n_actual, prev_span_days)  # 不越过本期起点
+    new_prev_hi = prev_lo + _dt.timedelta(days=n_align)
+    if new_prev_hi >= lo:
+        return sql
+    out = s
+    changed = False
+    # 必须从后往前替换：spans 是按 finditer 的位置升序，正序替换会让后面的
+    # span 偏移失效（等长替换也别赌，实测踩过同类坑）。
+    for a, b, m in reversed(spans):
+        if a == prev_lo and b == lo:
+            out = out[:m.start()] + ("%s >= '%s' AND %s < '%s'"
+                                     % (m.group(1), prev_lo.isoformat(),
+                                        m.group(1), new_prev_hi.isoformat())) + out[m.end():]
+            changed = True
+    if not changed:
+        return sql
+    # 重新扫描替换（上一轮已从后往前逐个替换同长度串，index 仍有效；此处仅兜底）
+    if notes is not None:
+        notes.append(
+            "本期（%s 起）数据只到 %s、共 %d 天，与上一期整段（%d 天）天数不对等，"
+            "直接比会让所有分组都显示下降。已把上一期对齐到同期（%s ~ %s，同样 %d 天）"
+            "再比较。" % (lo.isoformat(), dmx.isoformat(), n_actual,
+                          prev_span_days, prev_lo.isoformat(),
+                          (new_prev_hi - _dt.timedelta(days=1)).isoformat(), n_align))
+    return out
+
+
 _MAX_DATE_THRESHOLD_RE = re.compile(
     r"([<>=!]+\s*)\(\s*SELECT\s+MAX\s*\(\s*(" + _S_IDENT + r")\s*\)\s+FROM\s+([^()]+?)\s*\)", re.I)
+
+
+# ── 数据感知的相对时间锚定（2026-09-29）───────────────────────────────
+# 病根（真跑基线实证）：演示库所有表的数据都停在 2026-07-15，而「上个月 / 本月 /
+# 最近7天」这类问句按 CURRENT_DATE（2026-09-29）算，条件恒为假 → **必然 0 行**。
+# 实测：上个月各车间的平均停机时长 / 本月各产线产量 / 最近7天各产线的投入数量，
+# 三条全部 0.1s 返回 0 行。编译器保证了 SQL 写法正确，但保证不了「库里有没有那段数据」。
+#
+# 修法（对标 Wren dry-plan「先验证再执行」）：SQL 生成后，把 SQL 里出现的
+# `CURRENT_DATE` / `date_trunc('month', CURRENT_DATE)` 锚点，按**该表真实数据范围**
+# 重新锚定到「最新一个有数据的自然月」，并在答案里显式标注改成了哪个月。
+# 为什么是「锚到有数据的月份」而不是「如实返回 0 行」：用户问「上个月」时真正想要的是
+# 「最近一个有数据的时段」；给空结果等于没回答。但**必须标注**，否则就成了另一种答非所问。
+#
+# 只在「问句含相对时间词」+「SQL 用了 CURRENT_DATE 锚点」+「该表数据不覆盖当前窗口」时触发。
+# 三个条件缺一不可 —— 数据新鲜的库上（真生产库）本函数恒不触发，零影响。
+_ANCHOR_MONTH_WORD_RE = re.compile(r"本月|这个月|当月|上月|上个月|上上个月")
+_ANCHOR_WINDOW_WORD_RE = _REL_WINDOW_RE
+_ANCHORED_MONTH: dict = {}   # 本次请求内缓存：表 -> (月份字符串, 数据上限)
+
+
+def _latest_month_with_data(sqlexec, tables: list[str]):
+    """探测这些表里「最新一个有数据的自然月」，返回 (月份 'YYYY-MM', 数据上限日期) 或 None。"""
+    probed = None
+    try:
+        probed = _probe_data_range(sqlexec, tables)
+    except Exception:
+        return None
+    if not probed:
+        return None
+    mx = probed.get("max")
+    try:
+        import datetime as _dt
+        if isinstance(mx, _dt.datetime):
+            d = mx.date()
+        elif isinstance(mx, _dt.date):
+            d = mx
+        else:
+            s = str(mx)[:10]
+            d = _dt.date(int(s[0:4]), int(s[5:7]), int(s[8:10]))
+    except Exception:
+        return None
+    return ("%04d-%02d" % (d.year, d.month), d)
+
+
+def _needs_time_reanchor(sqlexec, query: str, sql: str):
+    """判断是否要做数据感知的锚点重定：返回 (month, data_max_date) 或 None。
+
+    三重条件：问句含相对时间词 + SQL 含 CURRENT_DATE 锚点 + 该表数据不覆盖当前窗口。
+    """
+    q = str(query or "")
+    s = str(sql or "")
+    if not s or not _ANCHOR_WINDOW_WORD_RE.search(q):
+        return None
+    if "CURRENT_DATE" not in s.upper() and "NOW()" not in s.upper():
+        return None
+    tables = []
+    try:
+        tables = sorted(_extract_sql_tables(s))
+    except Exception:
+        return None
+    if not tables:
+        return None
+    info = _latest_month_with_data(sqlexec, tables)
+    if not info:
+        return None
+    month, dmax = info
+    import datetime as _dt
+    today = _dt.date.today()
+    # 数据覆盖到本月（或至少覆盖到"上个月"）→ 说明数据是新鲜的，不动
+    if (dmax.year, dmax.month) >= (today.year, today.month):
+        return None
+    if dmax.year == today.year and dmax.month == today.month - 1:
+        # 上个月有完整数据 → 「上个月」问句本来就对，不动；只有「本月」问句才需重锚
+        if not re.search(r"本月|这个月|当月", q):
+            return None
+        return (month, dmax)
+    return (month, dmax)
+
+
+def _reanchor_sql_to_month(sql: str, month: str, data_max: str = "") -> str:
+    """把 SQL 里基于 CURRENT_DATE 的时间锚点平移到 `month`（最新有数据的自然月）。
+
+    实现要点（实测两轮才定稿，两个坑都踩过）：
+    ① **先整段替换「上月区间」**，再处理零散锚点。否则 `date_trunc(...)-INTERVAL '1 month'`
+       会被裸 `date_trunc` 的规则先吃掉，上下界塌成同一个值 → 区间空 → 仍然 0 行。
+    ② **裸 `date_trunc('month',CURRENT_DATE)` 的落点取决于语境**：
+       - 作为「上月区间」的上界时 → 必须是 M+1 月初（区间才非空）
+       - 单独作为「本月」下界时   → 必须是 M 月初（M 是"最新有数据的月"）
+       两种语境靠**先做整段替换**天然区分。
+    ③ **裸 `CURRENT_DATE`（「最近N天」锚点）用 `data_max`（真实数据上限），不用月末**：
+       实测用月末（7-31）会让「最近7天」落到 7/24~7/31 —— 那段没有数据，仍然 0 行。
+       锚到真实上限（7/15）才是「离今天最近、且真有数据的那 N 天」。
+    """
+    import datetime as _dt
+    import calendar as _cal
+    s = str(sql or "")
+    if not s:
+        return s
+    y, m = int(month[0:4]), int(month[5:7])
+    cur = _dt.date(y, m, 1)                                             # M 月初
+    nxt = _dt.date(y + 1, 1, 1) if m == 12 else _dt.date(y, m + 1, 1)   # M+1 月初
+    cur_s, nxt_s = cur.isoformat(), nxt.isoformat()
+    # 滑窗锚点：优先用真实数据上限；拿不到就退回月末
+    anchor_s = str(data_max)[:10] if data_max else \
+        _dt.date(y, m, _cal.monthrange(y, m)[1]).isoformat()
+    try:
+        out = s
+        _DT = (r"date_trunc\s*\(\s*'month'\s*,\s*CURRENT_DATE\s*\)")
+        # ① 整段「上月区间」：[M初, M+1初) —— 必须在零散替换之前
+        out = re.sub(
+            _DT + r"\s*-\s*INTERVAL\s*'1\s*month'\s*AND\s*([\w\.\"]+)\s*<\s*" + _DT,
+            "'%s'::date AND \\1 < '%s'::date" % (cur_s, nxt_s), out, flags=re.I)
+        # ①b 单独的上月下界
+        out = re.sub(_DT + r"\s*-\s*INTERVAL\s*'1\s*month'",
+                     "'%s'::date" % cur_s, out, flags=re.I)
+        # ② 下月起点 → M+1 月初
+        out = re.sub(_DT + r"\s*\+\s*INTERVAL\s*'1\s*month'",
+                     "'%s'::date" % nxt_s, out, flags=re.I)
+        # ③ 剩余裸 date_trunc = 「本月」语义 → M 月初
+        out = re.sub(_DT, "'%s'::date" % cur_s, out, flags=re.I)
+        # ④ 裸 CURRENT_DATE / NOW()（「最近N天」回溯锚点）→ 真实数据上限
+        out = re.sub(r"CURRENT_DATE", "'%s'::date" % anchor_s, out, flags=re.I)
+        out = re.sub(r"NOW\s*\(\s*\)", "'%s'::timestamp" % anchor_s, out, flags=re.I)
+        return out
+    except Exception:
+        return sql
+
 
 
 def _fix_relative_date_anchor(query: str, sql: str) -> str:
@@ -1580,7 +2583,14 @@ def _fix_global_superlative_topn(query: str, sql: str) -> str:
 # 顺序有意为之：先归一化 LIMIT/窗口兜底/并列名次 → 再做「值放错列」语义修正 →
 # 最后补列（补列放最后，才能看见前几步改写后的 SELECT 列表）。
 _FIX_STEP_MSG = {
+    "_fix_data_aware_time_anchor": "库里没有你问的那个时间段的数据，已按「最新有数据的月份」重新锚定（详见结果说明）",
+    "_guard_fix_regression": "改写会让结果变空，已回滚改写、保留原查询结果",
     "_fix_dim_listing_limit": "「各X」类问题需返回全部分组行，已放开 LIMIT 20 截断",
+    "_fix_period_compare_branches": "「本期 vs 上期」的两个指标原本算的是同一个时间段，已改为分期条件聚合并补上真正的比较",
+    "_fix_period_compare_merged": "「本期 vs 上期」被算成了两个月的合计，已拆成分期对比并补上真正的比较",
+    "_fix_degenerate_self_compare": "「本期 vs 上期」的两个条件写成了同一个月（比较恒不成立），已把上期改回上一个月",
+    "_align_period_compare_length": "本期数据只到月中、与上一期天数不对等，已把上一期对齐到同期天数再比较（详见结果说明）",
+    "_align_period_compare_trunc": "本期数据只到月中、与上一期天数不对等，已把上一期对齐到同期天数再比较（详见结果说明）",
     "_fix_relative_date_anchor": "「最近N天/本月」等相对窗口已改用当前日期为锚点（不再以数据最大日期为准）",
     "_fix_relative_month_literal": "「上月/本月」的硬编码年月已归一为按当前日期推算",
     "_fix_relative_window_days": "「最近N天」的窗口天数已对齐问句里的 N",
@@ -1599,13 +2609,111 @@ _FIX_STEP_MSG = {
 }
 
 
-def apply_output_fixes(query: str, sql: str, fired: list | None = None) -> str:
-    """按固定顺序施加全部确定性改写；`fired` 收集实际生效的步骤名（供步骤日志）。"""
+def _guard_fix_regression(sqlexec, original: str, fixed: str):
+    """改写链总闸门：若改写把「原本有行的查询」变成「0 行」，则回滚改写。
+
+    为什么需要（2026-09-29 实测抓到）：`最近30天各产线的投入数量` 上，四条改写叠加后
+    `_fix_relative_date_anchor` 把锚点换成 CURRENT_DATE（数据陈旧→条件恒假），
+    结果 **5 行 → 0 行**。各改写函数只看 SQL 文本、看不到数据，谁也发现不了"我这一改
+    把结果改没了"。
+    这里是纯保险：只拦「有行 → 0 行」这一种**可确定性判定**的退化，不新增任何语义判断。
+    代价：各多一次轻量 COUNT 探测（只在真正发生改写时执行，且复用探针执行器）。
+    返回 (sql_to_use, rolled_back: bool)。
+    """
+    if not sqlexec or fixed == original or not original:
+        return fixed, False
+    try:
+        a = sqlexec(original)
+        b = sqlexec(fixed)
+    except Exception:
+        return fixed, False
+    if not (isinstance(a, dict) and isinstance(b, dict)):
+        return fixed, False
+    # 只有「原本能跑且有行」才值得保护；原本就是 0 行/报错 → 改写后的结果更可信
+    if not a.get("success") or not (a.get("rows") or []):
+        return fixed, False
+    if b.get("success") and (b.get("rows") or []):
+        return fixed, False
+    return original, True
+
+
+# ── 确定性编译产物**不跑**的改写（2026-09-29 规则审计实测）──────────────
+# 34 条真实 SQL 回放里，改写链 6 次触发中有 5 次作用在编译产物上，全部是等价改写
+# （把编译器写死的 `LIMIT 200` 改成 `LIMIT 1000`、重排已经正确的分组列），
+# 另有 1 次把「严重缺陷占比」的错 SQL 从 20 行放大到 1000 行。
+# 编译产物的口径在编译期就已经定对，下面这些规则全是在补 LLM 写歪的「两期对比」，
+# 对确定性产物只可能是负作用（实测：把我新写的 period_compare_grouped 产物里的
+# `LIMIT 200` 改成 `LIMIT 1000`，纯等价 churn）。
+# 注意 `_fix_dim_listing_limit` **不在此列**：它在编译产物上有真实收益
+# （实测「每天的产量趋势」放开 LIMIT 后 20 行→45 行），改由护栏③区分放大与截断。
+_COMPILED_FIX_SKIP = frozenset({
+    "_fix_period_compare_branches",
+    "_fix_period_compare_merged",
+    "_fix_degenerate_self_compare",
+    "_align_period_compare_length",
+    "_align_period_compare_trunc",
+})
+
+
+def apply_output_fixes(query: str, sql: str, fired: list | None = None,
+                       sqlexec=None, notes: list | None = None,
+                       skip: frozenset | None = None) -> str:
+    """按固定顺序施加全部确定性改写；`fired` 收集实际生效的步骤名（供步骤日志）。
+
+    sqlexec: 可选，签名 (sql)->dict。传入后启用「数据感知的相对时间锚定」——
+    问句含相对时间词、SQL 用了 CURRENT_DATE 锚点、且该表数据不覆盖当前窗口时，
+    把锚点重定到「最新一个有数据的自然月」（见 _needs_time_reanchor）。
+    **不传则行为与旧版完全一致**（离线回放/回归测试不受影响）。
+    notes: 可选，收集「需要展示给用户的说明」（如数据范围已重新锚定）。
+    skip: 可选，要跳过的步骤名集合。确定性编译产物传 `_COMPILED_FIX_SKIP`。
+    """
     out = sql or ""
     if not out:
         return out
+    # 数据感知锚点重定：必须在其它改写**之前**，因为后续 `_fix_relative_window_days`
+    # 等要基于重定后的日期字面量工作（顺序反了会把刚换好的锚点又改回去）。
+    if sqlexec is not None:
+        try:
+            _info = _needs_time_reanchor(sqlexec, query, out)
+            if _info:
+                _month, _dmax = _info
+                _new = _reanchor_sql_to_month(out, _month, str(_dmax))
+                if _new != out:
+                    out = _new
+                    if fired is not None:
+                        fired.append("_fix_data_aware_time_anchor")
+                    if notes is not None:
+                        notes.append(
+                            "库里没有你问的那个时间段的数据（相关表数据最新到 %s），"
+                            "已按最近一个有数据的月份（%s）重新查询。"
+                            % (str(_dmax)[:10], _month))
+            else:
+                # 现有锚点只认 CURRENT_DATE/date_trunc 形态；LLM 直接硬编码错误年份时
+                # （实测写出 2024-05，真实数据在 2026 年）它救不了，这里补上。
+                # 只在上面没命中时才试，两者互斥，不叠加。
+                try:
+                    _hr = _reanchor_hardcoded_range(sqlexec, query, out)
+                    if _hr:
+                        out = _hr[0]
+                        if fired is not None:
+                            fired.append("_fix_data_aware_time_anchor")
+                        if notes is not None:
+                            notes.append(_hr[1])
+                except Exception:
+                    pass
+        except Exception:
+            pass
     steps = (
         ("_fix_dim_listing_limit", lambda s: _fix_dim_listing_limit(query, s)),
+        # 两期对比的分支聚合：必须在日期类改写**之后**——它依赖 WHERE 里已经是
+        # 纠偏过的真实日期区间（否则会拿 2024 年当本期边界）。
+        ("_fix_period_compare_branches", lambda s: _fix_period_compare_branches(query, s)),
+        # 同一病根的另一种写法：两个月被合并成一个聚合。必须在 branches 之后、
+        # 期长对齐之前——它造出的正是 branches 那种分期结构，对齐才有东西可对齐。
+        ("_fix_period_compare_merged", lambda s: _fix_period_compare_merged(query, s)),
+        # 第三种写法：两期写成同一个月、HAVING 退化成 X>X（必然 0 行）。
+        # 必须在前两条之后——前两条产出的 HAVING 左右不同，不会与之重复作用。
+        ("_fix_degenerate_self_compare", lambda s: _fix_degenerate_self_compare(query, s)),
         ("_fix_relative_date_anchor", lambda s: _fix_relative_date_anchor(query, s)),
         ("_fix_relative_month_literal", lambda s: _fix_relative_month_literal(query, s)),
         # 天数归一必须在日期锚点之后：锚点先把 `MAX(date)-INTERVAL '29 days'` 换成
@@ -1628,6 +2736,8 @@ def apply_output_fixes(query: str, sql: str, fired: list | None = None) -> str:
         ("_fix_global_superlative_topn", lambda s: _fix_global_superlative_topn(query, s)),
     )
     for name, fn in steps:
+        if skip and name in skip:
+            continue
         try:
             nxt = fn(out)
         except Exception:
@@ -1636,6 +2746,37 @@ def apply_output_fixes(query: str, sql: str, fired: list | None = None) -> str:
             out = nxt
             if fired is not None:
                 fired.append(name)
+    # 两期对比的期长对齐（MTD）：必须在 steps **之后**——它要吃的是
+    # `_fix_period_compare_branches` 刚造出来的那两个 CASE 分期区间，
+    # 在它之前 SQL 里根本没有分期结构可对齐。
+    if sqlexec is not None:
+        for _fn, _nm in ((_align_period_compare_length, "_align_period_compare_length"),
+                         (_align_period_compare_trunc, "_align_period_compare_trunc")):
+            if skip and _nm in skip:
+                continue
+            try:
+                _aligned = _fn(query, out, sqlexec, notes)
+                if _aligned != out:
+                    out = _aligned
+                    if fired is not None:
+                        fired.append(_nm)
+                    break   # 两条路径互斥：区间形式 / 整月等值形式，命中一条即可
+            except Exception:
+                continue
+    # 总闸门：整条链跑完后，若把「原本有行的查询」变成了 0 行 → 回滚到链前版本。
+    # 放在链尾而不是每步之后：单步的中间态可能本身就暂时 0 行（如刚放开 LIMIT 那一刻），
+    # 逐步判定会误回滚；只看**最终产物 vs 链前版本**才是我们要保护的那个语义。
+    # 也覆盖上面这一步：若期长对齐反而让结果变空，同样回滚。
+    if sqlexec is not None and out != (sql or ""):
+        _guarded, _rolled = _guard_fix_regression(sqlexec, sql or "", out)
+        if _rolled:
+            if fired is not None:
+                fired.append("_guard_fix_regression")
+            if notes is not None:
+                notes.append(
+                    "确定性改写会让本次查询从「有结果」变成「0 行」，已回滚改写、"
+                    "保留原始查询结果（改写链未生效，请核对结果口径）。")
+            out = _guarded
     return out
 
 
@@ -3365,9 +4506,12 @@ class LLMService:
                 acl_fp,
                 compiled=(self.compiled_mql is not None),
                 mql=self.compiled_mql,
+                metric_hits=((getattr(self, "_metric_resolution", None) or {}).get("hits") or []),
             )
-        except Exception:
-            pass
+        except Exception as _e:
+            # 沉淀失败不阻断主流程，但要留痕：此前这里是裸 pass，
+            # 掩盖了 _semantic_store 内部 NameError 导致缓存长期空转的问题。
+            logging.getLogger("llm_service").debug("语义缓存沉淀失败: %s", _e)
 
     def _build_analysis_confirm(self) -> dict | None:
         """未定义口径（no_hit）场景：表匹配 + schema 上下文 + LLM 推断（一体版本）。
@@ -3558,6 +4702,8 @@ class LLMService:
         # 必须在这里重设，否则 metric_registry.get_effective_metrics() 等
         # 无参调用链拿不到 acl，会导致指标级权限在流式接口静默失效。
         self._bind_acl()
+        # 本轮故障记录清零：SSE 在线程池里复用线程，上一轮的 Key 失效不能串到本轮
+        clear_llm_fault()
 
         def _step(name: str, detail: str, evidence: dict | None = None) -> dict:
             """记录一步推理过程。
@@ -3643,6 +4789,12 @@ class LLMService:
 
         # ── Step 1: 意图分类 ──
         self.compiled_mql = None  # 确定性编译产出的结构化 MQL（非编译路径为 None）
+        self._data_range_hint = ""  # 0 行时的「数据实际时间范围」提示（见 _quick_analysis）
+        # 确定性改写链产生的「必须告知用户」的说明（如时间锚点已按数据范围重定、
+        # 改写被总闸门回滚）——由 apply_output_fixes 的 notes 参数收集，末尾并入答案。
+        self._fix_notes: list[str] = []
+        # 多候选口径时采用的主口径 + 备选（非阻塞，挂结果旁提示）。见 run() 口径解析处。
+        self._metric_alt_hint = None
         self.intent = _classify_intent(self.query)
         # P0-4：多轮追问修正——上一轮有成功 SQL 且本次是修改型短句，即使规则判 chat/gibberish 也转 data
         if self.intent in ("chat", "gibberish") and _is_followup_query(self.query) and self._build_prev_context():
@@ -3693,19 +4845,41 @@ class LLMService:
                                 "candidates": candidates}}
             return
 
-        # 口径意图前置解析（P1 口径管理）：≥2 并列命中且无并列连词 → 阻塞澄清，不执行查询
+        # 口径意图前置解析（P1 口径管理）：多个口径并列命中时的处置。
+        # 2026-09-29（可用性修正）：原先「≥2 并列命中且无并列连词 → 一律阻塞澄清」。
+        # 现改为：**只有真的分不出主口径时才阻塞**；能按最长匹配定出唯一主口径的
+        # （如「严重缺陷占比」包含子串「严重缺陷数」，占比更长 → 主口径明确）直接放行执行，
+        # 备选挂到 answer 旁提示，不再要求用户先点一次。
+        # 依据：口径 registry 的 find_metrics 已是「最长匹配优先」，编译链路本身能选中
+        # 正确口径；此前一律阻塞等于把可自动判定的题也推给人，是「又慢又难用」的来源之一。
+        # 阻塞权仍然保留（不砍）——真正无主口径的（primary 缺失或并列最长）才澄清。
         self._metric_resolution = {"status": "skip", "hits": [], "hints": []}
         try:
             from agent.metric_registry import resolve_metric_intent
             self._metric_resolution = resolve_metric_intent(self.query, self.acl)
         except Exception:
             self._metric_resolution = {"status": "skip", "hits": [], "hints": []}
+        self._metric_alt_hint = None
         if self._metric_resolution["status"] == "ambiguous":
-            yield {"type": "done", "elapsed_ms": 0,
-                   "response": {"type": "metric_clarify", "query": self.query,
-                                "answer": "您提到的指标存在多个口径，请选择其一（或选择「都不是，自定义」）：",
-                                "hits": self._metric_resolution["hits"]}}
-            return
+            _primary = self._metric_resolution.get("primary")
+            _rest = self._metric_resolution.get("alternatives") or []
+            if _primary is not None and len(_rest) >= 1:
+                # 有唯一最长主口径 → 不阻塞，出数；备选留作结果旁的提示
+                self._metric_alt_hint = {
+                    "chosen": _primary.get("name"),
+                    "others": [h.get("name") for h in _rest],
+                }
+                # 把主口径排到 hits 首位，保证下游缓存绑定/埋点取到的是真正执行的那个
+                _hits = self._metric_resolution.get("hits") or []
+                self._metric_resolution["hits"] = (
+                    [_primary] + [h for h in _hits if h is not _primary]
+                )
+            else:
+                yield {"type": "done", "elapsed_ms": 0,
+                       "response": {"type": "metric_clarify", "query": self.query,
+                                    "answer": "您提到的指标存在多个口径，请选择其一（或选择「都不是，自定义」）：",
+                                    "hits": self._metric_resolution["hits"]}}
+                return
 
         # ── 语义缓存快速路径：命中相似历史问题 → 复用 SQL，跳过最慢的选表与 SQL 生成 ──
         # 对标 Wren AI / AWS 的亚秒级手段：重复/相似业务问题命中后直接复用历史 SQL 重新执行。
@@ -3748,6 +4922,17 @@ class LLMService:
                         self._precompiled = try_compile_metric(self.query)
                     except Exception:
                         self._precompiled = None
+                if not self._precompiled:
+                    # 维度与这份数据无关（如「各产线库存量」——库存只按产品/仓库记录，
+                    # 不关联产线）→ 编译链按设计放行给 LLM，而 LLM 实测会编出答非所问的
+                    # 分组（GROUP BY snapshot_id）。不拦执行，只补一句可核对的提示。
+                    try:
+                        from agent.metric_compiler import dimension_mismatch_hint
+                        _dmh = dimension_mismatch_hint(self.query)
+                    except Exception:
+                        _dmh = None
+                    if _dmh and _dmh not in self._fix_notes:
+                        self._fix_notes.append(_dmh)
 
             # ── 二次确认（架构强约定，2026-08-31 收紧）──
             # 以下情况必须弹窗让用户确认口径与执行方案，不得静默让 LLM 直接生成 SQL：
@@ -3811,11 +4996,33 @@ class LLMService:
                 # 对编译产物同样安全（92 题真实回放：零误伤）。
                 try:
                     _cfired: list = []
-                    _cfx = apply_output_fixes(self.query, self.sql, _cfired)
+                    # 传入探针执行器 → 启用数据感知锚点重定（编译产物套的是 CURRENT_DATE，
+                    # 演示库数据陈旧时必然 0 行；这里按真实数据范围重锚）。
+                    _cfx = apply_output_fixes(self.query, self.sql, _cfired,
+                                              sqlexec=self._exec_sql_for_probe,
+                                              notes=self._fix_notes,
+                                              skip=_COMPILED_FIX_SKIP)
                     if _cfx != self.sql:
                         self.sql = _cfx
                         yield _step("SQL校验", "编译产物：" + "；".join(
                             _FIX_STEP_MSG.get(n, n) for n in _cfired))
+                    # 编译期已把「本月/上月」锚到库内最新数据月（metric_compiler._build_time_filter），
+                    # SQL 里不再有 CURRENT_DATE ⇒ 改写链的锚点规则不会触发、说明文案也就没了。
+                    # 这里补发：否则用户看到的是「本月」标签下的历史月份数据，却毫不知情。
+                    if "date_trunc('month', (SELECT MAX(" in (self.sql or ""):
+                        try:
+                            import datetime as _dt
+                            _info = _latest_month_with_data(
+                                self._exec_sql_for_probe, compiled.get("tables") or [])
+                            _this_mo = "%04d-%02d" % (_dt.date.today().year,
+                                                      _dt.date.today().month)
+                            if _info and _info[0] != _this_mo:
+                                self._fix_notes.append(
+                                    "库里没有你问的那个时间段的数据（相关表数据最新到 %s），"
+                                    "已按最近一个有数据的月份（%s）重新查询。"
+                                    % (str(_info[1])[:10], _info[0]))
+                        except Exception:
+                            pass
                 except Exception:
                     pass
             else:
@@ -3917,10 +5124,35 @@ class LLMService:
                         return
                 except Exception:
                     pass
-                # 未匹配到任何表：人话提示（查不到表 ≠ 让 AI 硬生成）
+                # 未匹配到任何表：给出**系统侧**的下一步，而不是要求用户重述
+                # （2026-09-28 改。旧文案是「换个业务上的叫法再问一次」—— 这等于让
+                # 用户替系统做词表映射，而词表恰恰是系统自己该维护的东西。改成：
+                # ① 先告诉用户库里到底有哪些业务对象（他自己就能判断该问什么）；
+                # ② 把这次失败的问题落进 feedback_queue，交给 metric_miner / 后台口径
+                #    挖掘去补词表 —— 用户不必重复描述同一件事。
                 if not self.matched_tables:
-                    self.error = ("没找到与这个问题相关的数据。换个业务上的叫法再问一次，"
-                                  "比如「产线」「设备」「工单」「客户」；也可以到「业务知识」页看看有哪些业务对象。")
+                    _objs = ""
+                    try:
+                        from agent.ontology import ONTOLOGY_ENTITIES as _OE  # type: ignore
+                        _objs = "、".join(list(_OE)[:12])
+                    except Exception:
+                        pass
+                    if not _objs:
+                        try:
+                            from db.tools import get_all_tables as _gat
+                            _objs = "、".join(
+                                str(t.get("table_name", "")).split(".")[-1]
+                                for t in (_gat() or [])[:10])
+                        except Exception:
+                            _objs = ""
+                    self.error = ("这个问题没能对应到库里的任何数据对象，因此没有生成查询。"
+                                  + (f"当前库里可问的对象有：{_objs}。" if _objs else "")
+                                  + "可以换个对象再问，或在左侧「业务知识」页查看完整的业务对象与口径清单。")
+                    # 落库：把"问了但没匹配上"的问题记下来（这是词表该补的地方）
+                    try:
+                        _record_unmatched_query(self.query)
+                    except Exception:
+                        pass
                     yield {"type": "error", "message": self.error}
                     return
                 # 未注册复合指标缺源数据（人均/周转/稼动率…）：源头拒绝，不让 LLM
@@ -3944,6 +5176,7 @@ class LLMService:
                 try:
                     _sql = ""
                     _rejected_fallback = ""      # 闸门打标后被弃用的 SQL（保底用，见下）
+                    _why_q = ""                  # 被质量闸门拒绝的原因（透传给兜底重生成）
                     # 对快慢 provider 都跑结构化推断（慢 provider 走 invoke 模式，见 infer_query_analysis）
                     _analysis = self._infer_analysis_confirm()
                     if _analysis:
@@ -3964,9 +5197,11 @@ class LLMService:
                             _sql = ""
                     if not _sql:
                         # 兜底：自由生成，拿剩余预算（下限 6s 保证至少一次完整尝试）
+                        # 带上一版被拒原因（若有）→ 让兜底"知道错在哪"，不是从零重赌
                         _left = max(6.0, _SQL_GEN_WALL_S - (time.monotonic() - _t_gen0))
                         _sql = _direct_gen_sql(self.query, self.matched_tables,
-                                               budget_s=_left) or ""
+                                               budget_s=_left,
+                                               reject_reason=_why_q or "") or ""
                     if not _sql and _rejected_fallback:
                         _sql = _rejected_fallback
                         yield _step("SQL校验", "兜底重生成未产出 SQL，回退使用被质量闸门标记的那条"
@@ -3976,7 +5211,9 @@ class LLMService:
                     # LIMIT 归一 → 窗口差值兜底 → TOP-N 稳定次序 → 值放错列 → 补列。
                     # 步骤日志由 fired 回放，消息表见 _FIX_STEP_MSG。
                     _fired: list = []
-                    _after = apply_output_fixes(self.query, self.sql, _fired)
+                    _after = apply_output_fixes(self.query, self.sql, _fired,
+                                                sqlexec=self._exec_sql_for_probe,
+                                                notes=self._fix_notes)
                     if _after != self.sql:
                         self.sql = _after
                         for _nm in _fired:
@@ -3989,10 +5226,33 @@ class LLMService:
                 except Exception as _e:
                     self.error = f"AI 生成查询失败：{_e}"
                 if not self.sql:
-                    self.error = (self.error or "AI 未能根据问题生成查询 SQL。"
-                                  "可换个说法再问，或在结果处「去登记口径」把算法固定下来。"
-                                  f"如果多次遇到，可点击输入框上方的「切换模型」换一个 AI 模型再试"
-                                  f"（当前模型：{LLM_CONFIG.get('model', '')}）。")
+                    # 先看是不是"模型服务根本调不通"：Key 失效/欠费/限流/超时/网络这类
+                    # 故障会被各层 `except: return None` 吞成"没生成出 SQL"，
+                    # 再报"换个说法再问"就是把用户往错方向引（实测：Key 401 时 5 次调用
+                    # 全部 0.1s 秒回 401，用户按提示反复换说法、换模型，永远试不出来）。
+                    _fault = last_llm_fault()
+                    if _fault:
+                        self.error = (
+                            "模型服务不可用：%s。\n请到输入框上方的「切换模型」核对该模型的 "
+                            "API Key 与接口地址，并确认账号有可用额度；也可以先切换成别的模型再试。"
+                            "\n（当前模型：%s）" % (_fault[1], LLM_CONFIG.get("model", ""))
+                        )
+                    else:
+                        # 2026-09-28 改文案：旧版三条建议全是**用户动作**
+                        # （「换个说法再问」「去登记口径」「切换模型」），等于让用户
+                        # 自己拆解系统为什么没答上来。新版保留"能自己动手的"（切模型
+                        # 确实是用户可选项），但把主建议换成系统会自己做的事：
+                        # 问题已落台账 → 管理员在「业务知识」补口径后同一句话直接能答。
+                        self.error = (self.error or "AI 未能根据问题生成查询 SQL。")
+                        self.error += (
+                            "\n这个问题已自动记入待补口径台账，管理员在「业务知识」页"
+                            "补上对应口径后，同样的问题就能答了，不需要你重复描述。"
+                            f"如果你认为这是模型能力问题，可以在输入框上方「切换模型」"
+                            f"换一个 AI（当前模型：{LLM_CONFIG.get('model', '')}）。")
+                        try:
+                            _record_unmatched_query(self.query)
+                        except Exception:
+                            pass
                     # 权限缺表是"生成失败"的高频真因：此时提示"换个说法"毫无意义，
                     # 必须点名缺哪张表，用户才知道要去找管理员开通什么。
                     if self.acl_dropped_tables:
@@ -4256,6 +5516,46 @@ class LLMService:
                    "rows": self.sql_result["rows"],
                    "row_count": self.sql_result["row_count"]}
 
+        # ── 0 行时的「数据范围」提示（2026-09-28）────────────────────
+        # 无论走编译还是 LLM，只要「0 行 + 问句含相对时间词」，就探测一下涉及表的
+        # 实际数据时间范围，把结论落到 self._data_range_hint，由 _rule_insight 拼进答案。
+        # 与下面的重试链**互补**：编译路径被重试链排除（保确定性），但恰恰是它最容易
+        # 撞上「相对时间问句 vs 静态演示数据」这个坑，所以这层必须覆盖它。
+        self._data_range_hint = ""
+        if (ok and self.sql_result.get("success")
+                and not (self.sql_result.get("rows") or [])
+                and (self.sql or "").strip()
+                and _REL_WINDOW_RE.search(str(self.query or ""))):
+            try:
+                _tbls = sorted(_extract_sql_tables(self.sql))
+                # ⚠️ 表级权限闸门（2026-09-28 自测发现后加固）：
+                # 探测会读表的 MIN/MAX，**等于多开一个「这表有没有数据、数据到哪天」的
+                # 信息面**。用户本就无权看这些表时，探测就是越权泄露。
+                # 三重自查，任一不通过就**整段跳过**：
+                #   ① allowed_tables 非 None → 涉及表必须全在集合内；
+                #   ② allowed_tables 为 None 且走权限中心 → 用 acl.is_table_allowed
+                #      逐个复核（权威判据，覆盖「白名单不限但 policy 层另有拒绝」）；
+                #   ③ 既无白名单、又无 acl 上下文 → 保守跳过，宁可不提示。
+                _probe_ok = bool(_tbls)
+                if _probe_ok:
+                    _allow = None
+                    if self.allowed_tables is not None:
+                        _allow = self.allowed_tables
+                    elif self.acl is not None and getattr(self.acl, "allowed_tables", None) is not None:
+                        _allow = self.acl.allowed_tables
+                    if _allow is not None:
+                        _probe_ok = all(
+                            str(t).split(".")[-1].lower() in _allow for t in _tbls)
+                    elif self.acl is None or not getattr(self.acl, "superuser", False):
+                        # 白名单不限 + 非超管：判不准，保守跳过（宁可不提示，也不越权）
+                        _probe_ok = False
+                if _probe_ok:
+                    yield _step("数据范围", "本次结果为空：正在核对这些表的实际数据时间范围…")
+                    self._data_range_hint = _zero_row_data_range_hint(
+                        self._exec_sql_for_probe, _tbls, self.query)
+            except Exception:
+                self._data_range_hint = ""
+
         # ── 0 行重试（2026-09-16 BIRD Mini-Dev 评测驱动）──
         # 执行成功但返回 0 行：主链此前直接把空结果交给用户。
         # 实测（BIRD 500 题，口径 set 相等）：判对的题里 agent 返回 0 行的有 **0 道**、
@@ -4276,7 +5576,17 @@ class LLMService:
             _zero_retry = True
             _zero_orig_sql = self.sql
             _zero_orig_result = dict(self.sql_result)
-            yield _step("SQL校验", "执行成功但返回 0 行：大概率是过滤条件过严或 JOIN 关联错了表，尝试重试…")
+            # 提速（2026-09-29）：0 行时把**已经探测到的真实数据范围**喂给候选生成，
+            # 而不是让 LLM 盲猜时间区间。实测（问「上个月每台设备的故障次数」，演示库数据
+            # 停在 2026-07-15）：不喂范围时锚定会漂到没数据的月份 → 0 行 → 走
+            # 「2 条候选 + 迭代修复」链（实测该链 25.7s，端到端 53s）；喂了范围后候选
+            # 第一版就能落在真实区间内。这是纯信息增强：不改任何判定逻辑，只是把
+            # 主链上方已算好的 _data_range_hint 透传下去，判定与回退行为完全不变。
+            _hint0 = str(getattr(self, "_data_range_hint", "") or "")
+            if _hint0:
+                yield _step("SQL校验", "执行成功但返回 0 行：已探测到库内真实数据区间，按该区间重试…")
+            else:
+                yield _step("SQL校验", "执行成功但返回 0 行：大概率是过滤条件过严或 JOIN 关联错了表，尝试重试…")
             self.sql_result = {
                 "success": False,
                 "error": ("执行成功但返回 0 行。这几乎总是以下原因之一："
@@ -4285,7 +5595,8 @@ class LLMService:
                           "② JOIN 关联错了表或关联条件漏写；"
                           "③ 日期/状态等取值与库中实际存储的格式不一致。"
                           "请先用宽松条件确认相关表里有数据，再逐条收紧过滤条件；"
-                          "JOIN 必须使用上面给出的表间关联键。"),
+                          "JOIN 必须使用上面给出的表间关联键。"
+                          + (_hint0 or "")),
                 "rows": [], "row_count": 0}
             ok = False
 
@@ -4298,13 +5609,19 @@ class LLMService:
                        "message": "没能生成出可执行的查询。可以换个说法再问，"
                                    "或在结果处「去登记口径」把统计方式固定下来。"}
                 return
-            # ── 多候选一致性采纳（改造2）：首次失败先试 2-3 条不同写法的候选，
+            # ── 多候选一致性采纳（改造2）：首次失败先试 2 条不同写法的候选，
             #    执行结果一致者采纳；全部失败才走迭代修复。按需启用，控制成本 ──
+            # 2026-09-28 由 n=3 改为 n=2：三条候选要**逐一执行**（每次都是一轮
+            # 真实 SQL 执行 + 表范围/业务语义/退化三重复查），而"两条结果一致即采纳"
+            # 的判据在 n=2 时同样成立（`len(ok_rows) >= 2 and sig in ...`）。
+            # 第三条只在"前两条结果都不一致"时才起作用，此时它带来第三条独立结果的
+            # 概率本就低（同一模型同一 prompt，写法多样性有限），却要固定多付一次
+            # 生成 + 一次执行。稀有收益换固定成本，不划算。
             yield _step("SQL重试", "首次执行失败，AI 正在修复…")
             current_sql = self.sql
             current_error = self.sql_result.get("error", "")
             current_result = dict(self.sql_result)   # 候选失败后恢复用（改造4修复）
-            candidates = self._generate_candidates(n=3)
+            candidates = self._generate_candidates(n=2)
             if candidates:
                 yield _step("SQL重试", f"生成 {len(candidates)} 条候选 SQL，逐一执行比选…")
                 accepted: str | None = None
@@ -4375,7 +5692,19 @@ class LLMService:
                 # ── 迭代式修复：最多 3 轮，每轮把错误发回 LLM ──
                 current_error = self.sql_result.get("error", "") or current_error
                 # 表不存在（首次）：也走重试，让 LLM 拿到真实表清单后换表（如 123 库误用 postgres 表名）
-                for _ in range(3):
+                # 2026-09-28：轮数 3→2，并加整体墙钟闸门。
+                # 为什么砍到 2 轮：每轮成本 = 1 次 LLM 修复（≤_FIX_ROUND_TIMEOUT_S）
+                # + 1 次真实执行 + 表范围/业务语义/退化三重复查。错误分类定向修复
+                # （表名/列名两条正则命中，见 _retry_sql_fix 的 fix_hints）本质是
+                # 「拿到真实清单后改一次」，第二次之后 prompt 内容与第一次几乎相同，
+                # 模型没有新信息可依据，属于空转。源码里 rescue 相关注释也记录了
+                # 「修复后的 SQL 仍引用不存在的表 → 不再空转重试」的同类判断。
+                # 墙钟闸门兜住另一头：即使单轮都没超时，累计也不能突破 _SQL_FIX_TOTAL_S。
+                _fix_deadline = time.monotonic() + _SQL_FIX_TOTAL_S
+                for _ in range(2):
+                    if time.monotonic() >= _fix_deadline:
+                        yield _step("SQL执行", "修复已用尽时间预算，改用兜底查询")
+                        break
                     retry_sql = self._retry_sql_fix(current_error, prev_sql=current_sql)
                     if not retry_sql:
                         break
@@ -4388,7 +5717,9 @@ class LLMService:
                     # 收口到唯一入口 apply_output_fixes，位置必须在列校验**之前**，
                     # 否则改写新引入的列得不到校验。
                     _r_fired: list = []
-                    _r_after = apply_output_fixes(self.query, self.sql, _r_fired)
+                    _r_after = apply_output_fixes(self.query, self.sql, _r_fired,
+                                                  sqlexec=self._exec_sql_for_probe,
+                                                  notes=self._fix_notes)
                     if _r_after != self.sql:
                         self.sql = _r_after
                         for _nm in _r_fired:
@@ -4612,7 +5943,8 @@ class LLMService:
         # 低分说明结果虽能跑但质量存疑 → 生成多条独立写法，用评分择优。
         if not self.fast and self._evaluation and not issue:
             try:
-                from config import RESULT_EVAL_MIN_SCORE
+                from config import (RESULT_EVAL_MIN_SCORE, RESULT_CROSS_VALIDATE,
+                                    RESULT_CROSS_VALIDATE_N)
                 ev = self._evaluation
                 _dims = ev.get("dims") or {}
                 _dim_txt = "、".join(f"{k} {v}" for k, v in _dims.items())
@@ -4629,7 +5961,9 @@ class LLMService:
                     },
                 )
                 if self._eval_score < RESULT_EVAL_MIN_SCORE:
-                    if self._cross_validate(n=2):
+                    # 低分 → 多候选交叉比对重选。可用 RESULT_CROSS_VALIDATE=0 整体关闭
+                    # （关闭后仍保留"质量分偏低"的留痕，只是不再触发重选那一串调用）。
+                    if RESULT_CROSS_VALIDATE and self._cross_validate(n=RESULT_CROSS_VALIDATE_N):
                         yield {"type": "sql", "sql": self.sql}
                         yield {"type": "sql_result",
                                "columns": self.sql_result["columns"],
@@ -4996,6 +6330,18 @@ class LLMService:
             # 改写异常 → 安全优先拒绝执行，不让权限绕过
             return sql, f"行列级权限改写失败，已拒绝执行: {e}"
 
+    def _exec_sql_for_probe(self, sql: str) -> dict:
+        """仅供「数据范围探测」使用的执行入口。
+
+        直接复用 _exec_sql，因此**同样走权限改写与 fail-close 闸门**——
+        探测 SQL 命中的表若不在授权范围内，会被照常拒绝（返回 success=False），
+        _probe_data_range 见失败即静默跳过，不会因探测而泄露未授权表的行数/范围。
+        """
+        try:
+            return self._exec_sql(sql)
+        except Exception as e:
+            return {"success": False, "error": str(e)[:200], "rows": [], "row_count": 0}
+
     def _exec_sql(self, sql: str) -> dict:
         """带多级权限的 SQL 执行：所有执行点统一走这里，
         保证 首次/多候选/重试/fallback/复核 任何一条 SQL 都应用权限改写。
@@ -5058,7 +6404,14 @@ class LLMService:
             return ""
         try:
             from agent.prompt_builder import build_sql_prompt
-            llm = _make_llm(temp=None, max_tokens=_sql_gen_max_tokens(), model=_sql_gen_model())
+            # 修复轮超时必须显式设短并禁重试（2026-09-28）：此前走 _make_llm 默认
+            # timeout=120 / max_retries=2，单轮最坏 3×120s=360s；而修复是**最多 3 轮**
+            # 的循环（run() 里 `for _ in range(3)`），最坏能拖到 18 分钟——用户侧表现
+            # 就是"卡住不动"。逃生舱（_run_escape_sql_v2）早已显式传 max_retries=0，
+            # 这里对齐同一策略。超时后返回空串，调用方 `if not retry_sql: break`
+            # 立即退出循环，不再空转。
+            llm = _make_llm(temp=None, max_tokens=_sql_gen_max_tokens(), model=_sql_gen_model(),
+                            timeout=_FIX_ROUND_TIMEOUT_S, max_retries=0)
             target = prev_sql or self.sql
 
             # ── 错误分类（支持 PG 中文/英文错误、MySQL）──
@@ -5145,8 +6498,11 @@ class LLMService:
         """
         try:
             from agent.prompt_builder import build_sql_prompt
-            # 稍高温度制造写法多样性；json_mode 保证输出可解析
-            llm = _make_llm(temp=0.7, max_tokens=_sql_gen_max_tokens(), json_mode=True, model=_sql_gen_model())
+            # 稍高温度制造写法多样性；json_mode 保证输出可解析。
+            # 超时同样设短并禁重试：候选生成是"锦上添花"（失败就退修复链），
+            # 不该为它多等一个 120s 往返。
+            llm = _make_llm(temp=0.7, max_tokens=_sql_gen_max_tokens(), json_mode=True,
+                            model=_sql_gen_model(), timeout=_FIX_ROUND_TIMEOUT_S, max_retries=0)
             ddl_list, docs, sql_examples = [], [], []
             try:
                 from agent.memory import get_memory
@@ -5315,7 +6671,9 @@ class LLMService:
         try:
             rows = self.sql_result.get("rows") or []
             cols = self.sql_result.get("columns") or []
-            sample = json.dumps(rows[:5], ensure_ascii=False, default=str)[:800]
+            # 2026-09-28：原为 rows[:5] + 0 行时空串 —— 评审看不到真实数据却照样判 OK。
+            # 改走 _review_sample（30 行预算；0 行时显式说明"结果集为空"）。
+            result_block = _review_sample(rows, cols, budget=30)
             sql = (self.sql or "")[:1000]
             # 命中口径提示：让 Critic 知道注册的业务口径，避免误判"符合口径的 SQL"
             hint = ""
@@ -5340,7 +6698,9 @@ class LLMService:
                 "1. 维度是否覆盖：问题要求按 X 分组（各/按/每），SQL 是否真的 GROUP BY X 且结果包含 X 列；\n"
                 "2. 指标是否答对：问题要求的指标（数量/金额/率/占比/排名/趋势）SQL 是否用对了聚合；\n"
                 "3. 过滤是否一致：问题的筛选条件（如某状态/某时间范围）SQL 是否正确体现；\n"
-                "4. 是否答非所问：SQL 是否引用了与问题无关的表或列，或返回了问题没要的东西。\n"
+                "4. 是否答非所问：SQL 是否引用了与问题无关的表或列，或返回了问题没要的东西；\n"
+                "5. 结果是否可用：下面给出的**查询结果**里到底有没有数据。若行数为 0 或\n"
+                "   结果为空，即使 SQL 语法与口径都对，也必须判不合格（用户拿到的是空答案）。\n"
                 "如果 SQL 与结果能回答用户问题，只输出：OK\n"
                 "如果存在问题，输出一句问题描述（60 字以内），指出具体缺什么/错在哪。\n\n"
                 f"## 用户问题\n{self.query}\n\n"
@@ -5348,7 +6708,7 @@ class LLMService:
                 f"## 业务口径提示（如有）\n{hint or '（无）'}\n\n"
                 f"## 聚合语义提示（与生成器共享的确定性规则，判定指标时以此为基准）\n"
                 f"{agg_hint or '（无）'}\n\n"
-                f"## 查询结果（列: {cols}，行数: {self.sql_result.get('row_count', 0)}）\n{sample}"
+                f"## 查询结果\n{result_block}"
             )
             llm = _make_llm(temp=0.0, max_tokens=140)
             resp = llm.invoke([SystemMessage(content=prompt)])
@@ -5369,17 +6729,52 @@ class LLMService:
 
         复杂 = 含 JOIN / 多表 / 聚合 / 子查询 / 去重 / 窗口函数 —— 这类 SQL 出错面大、
         值得多花一次 LLM 调用做二次审查；简单单表明细查询直接放行省成本。
+
+        2026-09-28 收窄：把原来的「JOIN / UNION / 子查询 / GROUP BY / 聚合 / 窗口」
+        六类信号拆成**结构复杂度**与**聚合**两组，后者默认不再单独触发。
+        依据见 config.RESULT_CHECK_AGG_COUNTS_COMPLEX 的说明：纯聚合查询的错法集中在
+        业务口径，而口径由指标注册表 + 10 道确定性前置校验把关，同模型 LLM 再审一遍
+        既拦不住系统性口径偏差（同源共偏），又有把正确结果改坏的风险。
+        可用环境变量 RESULT_CHECK_AGG_COUNTS_COMPLEX=1 恢复旧行为。
         """
         if not self.sql:
             return False
-        sql = self.sql.upper()
-        if re.search(r"\bJOIN\b|\bUNION\b|\bINTERSECT\b|\bEXCEPT\b|\bWITH\b", sql):
+        # 2026-09-28 修复：此前函数体里用的是裸名 `sql`，但从未赋值（只有 `self.sql`）
+        # → 每次调用必抛 NameError，被 `_review_chain` 的 except 吞掉 →
+        # **Critic 与 Evaluator 在 auto 模式下从未真正执行过**（步骤链里看不到「结果评价」）。
+        # 这也解释了实测里 LLM 路径"只有 SQL生成+校验"就结束的现象。
+        sql = self.sql
+        # ── 结构复杂度：多表/集合运算/CTE/子查询 —— 这类必须复查 ──
+        # 2026-09-29（提速，不降准）：原「任何 JOIN 都算复杂」把最高频的
+        # 「单事实表 JOIN 维度表（dim_*）做分组展示」也判成复杂 → 多付一次 Critic
+        # （实测 deepseek-v4-flash 上约 9s）。而这类是 NL2SQL 里最简单、最不易错、
+        # 且已被 10 道确定性前置校验把关的模式，无需 LLM 二次审。
+        # 收窄为：只有「多事实表 JOIN / 集合运算 / CTE / 子查询」才触发 Critic。
+        if re.search(r"\bUNION\b|\bINTERSECT\b|\bEXCEPT\b|\bWITH\b", sql):
             return True
+        if sql.count("SELECT") > 1:  # 子查询 / 派生表
+            return True
+        if re.search(r"\bJOIN\b", sql):
+            # 有 JOIN：区分「单事实 + 维度表」简单模式 vs 多事实表复杂模式
+            try:
+                _tbls = _extract_sql_tables(sql)
+                _facts = {t for t in _tbls if not t.startswith("dim_")}
+                if len(_facts) >= 2:
+                    return True  # 多事实表关联（粒度/外键易错），复查
+                # 单事实表 + 若干维度表：简单展示模式，放行（不触发 Critic）
+            except Exception:
+                return True  # 表提取失败 → 保守按复杂处理
+        # ── 聚合类：默认不单独触发（见上方说明）──
+        # ── 聚合类：默认不单独触发（见上方说明）──
+        try:
+            from config import RESULT_CHECK_AGG_COUNTS_COMPLEX as _agg_complex
+        except Exception:
+            _agg_complex = False
+        if not _agg_complex:
+            return False
         if re.search(r"\bGROUP BY\b|\bHAVING\b", sql):
             return True
         if re.search(r"\b(SUM|COUNT|AVG|MAX|MIN|DISTINCT|ROW_NUMBER|RANK|LAG|LEAD)\s*\(", sql):
-            return True
-        if sql.count("SELECT") > 1:  # 子查询
             return True
         return False
 
@@ -5399,7 +6794,9 @@ class LLMService:
         """
         try:
             rows = self.sql_result.get("rows") or []
-            sample = json.dumps(rows[:5], ensure_ascii=False, default=str)[:800]
+            cols = self.sql_result.get("columns") or []
+            # 2026-09-28：原为 rows[:5] + 0 行时空串（同 Critic）。改走 _review_sample。
+            result_block = _review_sample(rows, cols, budget=30)
             hint = ""
             try:
                 from agent.metric_registry import get_metric_hint
@@ -5413,13 +6810,14 @@ class LLMService:
                 "2. dimension_coverage（维度完整性）：问题要求的分组维度是否都覆盖到；\n"
                 "3. filter_consistency（过滤一致性）：时间范围 / 状态等筛选条件是否与问题一致；\n"
                 "4. usability（结果可用性）：结果是否可直接用于回答（非空、非全 0、行列结构合理）。\n"
+                "   ⚠️ 打分前必须先看下面「查询结果」里**实际返回了什么**：行数为 0 时\n"
+                "   usability 必须给 0，不许因为 SQL 写得漂亮就给高分。\n"
                 "只输出 JSON：{\"score\": 总分0-100, \"metric_match\": 分, \"dimension_coverage\": 分,"
                 " \"filter_consistency\": 分, \"usability\": 分, \"comment\": \"一句话评价（40字内）\"}\n\n"
                 f"## 用户问题\n{self.query}\n\n"
                 f"## SQL\n{(self.sql or '')[:800]}\n\n"
                 f"## 业务口径提示（如有）\n{hint or '（无）'}\n\n"
-                f"## 结果（列: {self.sql_result.get('columns') or []}，"
-                f"行数: {self.sql_result.get('row_count', 0)}）\n{sample}"
+                f"## 查询结果\n{result_block}"
             )
             llm = _make_llm(temp=0.0, max_tokens=220, json_mode=True)
             raw = str(llm.invoke([SystemMessage(content=prompt)]).content or "")
@@ -5533,7 +6931,8 @@ class LLMService:
                 + f"\n## 存在的问题\n{issue}\n\n"
                 f"请针对上述问题重写 SQL，确保结果能真正回答用户的问题。重新输出完整 JSON。"
             )
-            llm = _make_llm(temp=None, max_tokens=_sql_gen_max_tokens(), model=_sql_gen_model())
+            llm = _make_llm(temp=None, max_tokens=_sql_gen_max_tokens(), model=_sql_gen_model(),
+                            timeout=_FIX_ROUND_TIMEOUT_S, max_retries=0)
             resp = llm.invoke([SystemMessage(content=refine_prompt)])
             sql, _, _ = self._parse_sql_response(str(resp.content or "").strip())
             return sql
@@ -5616,7 +7015,15 @@ class LLMService:
                 return "", {}
             if not (self.sql_result.get("success") and self.sql_result.get("rows")):
                 return "", {}
-            complex_q = self._is_complex_query()
+            # 2026-09-29（提速，不降准）：时间锚定已发生时跳过 Critic。
+            # 锚定是确定性规则（_fix_data_aware_time_anchor，正则替换，不调 LLM），
+            # 它把 SQL 按「最新有数据的自然月」重定后，结果的数据范围是确定的、已标注的；
+            # 再让 Critic 用 LLM 审一遍，反而会把刚锚定好的时间条件当「错误」质疑
+            # （实测：Critic 花 ~9s 判"时间过滤漏了上月第一天"→ 改写后 0 行，把 5 行
+            # 有数据的结果改坏了）。锚定命中即确定性结果，与编译命中同理免审。
+            _anchored = any("重新锚定" in str(n) or "重新查询" in str(n)
+                            for n in getattr(self, "_fix_notes", []) or [])
+            complex_q = self._is_complex_query() if not _anchored else False
             if (RESULT_LLM_CHECK_MODE or "auto").strip().lower() == "on" or (
                     (RESULT_LLM_CHECK_MODE or "auto").strip().lower() == "auto" and complex_q):
                 llm_issue = self._llm_result_check()
@@ -5721,7 +7128,10 @@ class LLMService:
                 "confidence": self._build_confidence(),
             },
             # 口径意图检测结果（P1 口径管理）：skip=零打扰，no_hit=反馈条，hit=静默
+            # ambiguous：多候选。2026-09-29 起若已定出主口径则不阻塞、照常出数，
+            # 此处带上「采用的主口径 + 备选」供前端挂提示。
             "metric_resolution": getattr(self, "_metric_resolution", None) or {"status": "skip", "hits": [], "hints": []},
+            "metric_alternatives": getattr(self, "_metric_alt_hint", None),
             "steps": self._steps or [
                 {"step": 1, "name": "意图理解", "status": "done", "detail": self.query[:60]},
                 {"step": 2, "name": "表匹配", "status": "done", "detail": f"定位到 {len(matched)} 张候选表"},
@@ -5947,7 +7357,31 @@ class LLMService:
         """
         rows = self.sql_result.get("rows") or []
         cols = self.sql_result.get("columns") or []
-        return _rule_insight(rows, cols)
+        text = _rule_insight(rows, cols)
+        # 0 行 + 相对时间问句 → 附上「数据实际在哪」（2026-09-28）。
+        # 只在这里追加而**不改写 SQL**：编译产物的确定性必须保住，
+        # 该做的是把「库里没有这个时间段」如实告诉用户，而不是偷偷换一个区间给他。
+        hint = getattr(self, "_data_range_hint", "")
+        if hint and not rows:
+            text = (text or "").rstrip() + hint
+        # 确定性改写链的说明（2026-09-29）：如「时间锚点已按最新有数据的月份重定」、
+        # 「改写会造成 0 行已回滚」。必须落到答案里——重定锚点等于替用户换了一个时间段，
+        # 不标注就从「答得准」变成「偷偷换题」。这里是无条件的（不看行数）。
+        _fixn = getattr(self, "_fix_notes", None)
+        if _fixn:
+            # 各条 note 自身已以「。」结尾，拼接处再补一个就成了「。。」——先各自去尾。
+            _nn = [str(x).strip().rstrip("。") for x in _fixn if str(x).strip()]
+            if _nn:
+                text = (text or "").rstrip() + "\n\n【执行说明】" + "；".join(_nn) + "。"
+        # 口径多候选时，本次实际采用的主口径 + 备选（2026-09-29）：不阻塞出数，
+        # 但要让用户知道「你问的词我按哪个口径算的、还有哪几个近似口径」。
+        _alt = getattr(self, "_metric_alt_hint", None)
+        if _alt and _alt.get("others"):
+            text = (text or "").rstrip() + (
+                "\n\n【口径说明】本问按「%s」口径计算；近似口径还有：%s。"
+                "如需改用其中某个，请在追问里点名。"
+                % (_alt.get("chosen"), "、".join(_alt["others"])))
+        return text
 
     def _retrieve_docs(self, k: int = 3) -> list[str]:
         """混合问答第一步：检索知识库业务文档（口径说明/SOP/制度）。
@@ -6013,7 +7447,12 @@ class LLMService:
         try:
             _compiled = getattr(self, "compiled_mql", None) is not None
             _sem_hit = bool(getattr(self, "_semantic_hit", False))
-            _simple_rows = len(rows) <= 20 and len(cols) <= 5 and len(self.matched_tables or []) <= 1
+            # 2026-09-29（提速）：原 `len(matched_tables) <= 1` 把「单事实表 JOIN 维度表」
+            # 的简单分组（2~3 张表）排除在规则摘要之外，被迫走 ~11s 的 LLM 解读。
+            # 改用 _is_complex_query() 判据：单事实表（含维度表 JOIN）→ 结构简单 → 规则摘要；
+            # 多事实表 JOIN / CTE / 子查询 → 复杂 → 保留 LLM 解读（洞察价值高）。
+            _simple_rows = (len(rows) <= 20 and len(cols) <= 5
+                            and not self._is_complex_query())
             # P0-修复（2026-09-03）：分析类问法（相关/对比/趋势/是否…）禁止规则降级——
             # 规则摘要只会报"最大值/平均值/最高是哪天"，回答不了"是否相关/什么趋势"。
             # 即使命中语义缓存/确定性编译（最常见复用路径）也必须走下方 LLM 洞察
@@ -6039,11 +7478,13 @@ class LLMService:
         if _cached:
             return _cached + (f"\n\n⚠️ 结果可靠性提示：{warn}" if warn else "")
         try:
-            data_json = json.dumps(rows[:15], ensure_ascii=False, default=str)[:1500]
+            # 洞察取样子集（2026-09-28 修）：原为 `rows[:15]`，且 prompt 里明确告诉模型
+            # 「以上为前 15 行样例」——模型很诚实地照做，凡是超过 15 行的结果，
+            # 洞察都会退化成「完整结果共 N 行，后 N-15 行未给出，因此无法判断…」。
+            # 实测（「最近的产量趋势」45 行）：结论直接写「后 30 行未给出」。
+            # 现改为确定性降采样（见 _insight_sample）：首尾必留 + 中间等距，40 行预算。
+            data_json, fields_info = _insight_sample(rows, cols)
             total = self.sql_result.get("row_count", len(rows))
-            fields_info = ", ".join(cols)
-            if total > len(rows[:15]):
-                fields_info += f"（共 {total} 行，以上为前 {min(15, len(rows))} 行样例）"
             prompt = ANALYSIS_SYSTEM_PROMPT.format(
                 data_json=data_json,
                 fields_info=fields_info,
@@ -7001,6 +8442,65 @@ def _is_ratio_like(col: str) -> bool:
     return any(t in _RATIO_EN_TOKENS for t in toks)
 
 
+def _insight_sample(rows: list, cols: list, budget: int = 40) -> tuple[str, str]:
+    """为「数据洞察」构造喂给 LLM 的样本 + 字段说明。
+
+    2026-09-28 新增。此前两处洞察入口都写 `rows[:15]` 且注明「以上为前 15 行样例」，
+    模型于是照实回答「完整结果共 45 行，后 30 行未给出，无法判断」——**分析退化成免责声明**。
+    改为：
+      - ≤budget 行：全给；
+      - >budget 行：首 12 + 尾 8 + 中间等距 20（首尾必留，趋势类问题靠端点定形状），
+        并在字段说明里告诉模型这是「代表性子集」，且**不要在结论里强调哪些行没给出**。
+
+    返回 (data_json, fields_info)。
+    """
+    rows = list(rows or [])
+    cols = [str(c) for c in (cols or []) if c is not None]
+    fields_info = ", ".join(cols)
+    n = len(rows)
+    if n <= budget:
+        data_json = json.dumps(rows, ensure_ascii=False, default=str)[:4000]
+        return data_json, fields_info
+    head, tail, mid_n = 12, 8, max(1, budget - 20)
+    mid = rows[head:n - tail]
+    step = max(1, len(mid) // mid_n)
+    picked = mid[::step][:mid_n]
+    sample = rows[:head] + picked + rows[n - tail:]
+    data_json = json.dumps(sample, ensure_ascii=False, default=str)[:4000]
+    fields_info += (f"（共 {n} 行，以下为 {len(sample)} 行代表性子集：含首 {head} 行与"
+                    f"末 {tail} 行，中间为等距抽样 {len(picked)} 行；"
+                    f"请基于子集判断整体趋势，不要在结论里强调「哪些行没给出」）")
+    return data_json, fields_info
+
+
+def _review_sample(rows: list, cols: list, budget: int = 30) -> str:
+    """为 Critic / Evaluator 构造「能看到真实数据」的结果样本（2026-09-28 新增）。
+
+    背景（实测驱动）：两处评审 prompt 此前都写 `rows[:5]`，且 0 行时 sample 为**空串**。
+    实测「设备停机原因」返回 7 行，评审只看到前 5 行，Evaluator 仍给 usability=90，
+    并在自己的 comment 里承认「未考虑时长影响」——即**它是在样本不全的情况下打分**。
+    评审的全部意义是判断「答案对不对」，而答案就在数据里；样本给不全是硬伤。
+
+    改为：≤budget 行全给；>budget 行走 `_insight_sample` 的首尾+等距抽样。
+    0 行时**显式**返回「（无数据行）」而不是空串——空串会让模型误以为"结果没显示出来"，
+    而显式说"0 行"才能让它正确判定 usability=0。
+
+    返回可直接拼进 prompt 的结果块（含列名、总行数、样本 JSON）。
+    """
+    rows = list(rows or [])
+    cols = [str(c) for c in (cols or []) if c is not None]
+    n = len(rows)
+    if n == 0:
+        return f"（列: {cols}，行数: 0 —— 结果集为空，没有任何数据行）"
+    data_json, fields_info = _insight_sample(rows, cols, budget=budget)
+    # _insight_sample 只在超预算时追加"代表性子集"说明；行数信息这里统一补一次
+    if n <= budget:
+        fields_info = f"（列: {fields_info}，行数: {n}）"
+    else:
+        fields_info = f"（列: {fields_info}"
+    return f"{fields_info}\n{data_json}"
+
+
 def _rule_insight(rows: list[dict], cols: list[str]) -> str:
     """规则版详细洞察（零 LLM、确定性）：概览 + 整体情况 + 排名 + 主要发现 + 建议关注。
 
@@ -7276,10 +8776,7 @@ def generate_insight_text(query: str, sql: str, columns: list[str], rows: list[d
         cached = _insight_cached(query, rc)
         if cached:
             return (cached + (f"\n\n⚠️ 结果可靠性提示：{warning}" if warning else ""))
-        data_json = json.dumps(rows[:15], ensure_ascii=False, default=str)[:1500]
-        fields_info = ", ".join(cols)
-        if len(rows) > 15:
-            fields_info += f"（共 {len(rows)} 行，以上为前 15 行样例）"
+        data_json, fields_info = _insight_sample(rows, cols)
         prompt = ANALYSIS_SYSTEM_PROMPT.format(
             data_json=data_json, fields_info=fields_info, query=query,
         )
@@ -7410,6 +8907,24 @@ _SQL_GEN_WALL_S = float(os.getenv("SQL_GEN_WALL_S", "160"))
 # 列名/表名/关联键都由编译器按真实 schema 把关，是又快又稳的主路径；自由生成 SQL
 # 降为兜底（拿剩余 35%）。两者合计仍受 _SQL_GEN_WALL_S 封顶。
 _SQL_GEN_INFER_RATIO = float(os.getenv("SQL_GEN_INFER_RATIO", "0.65"))
+
+# ── 修复/润色/候选生成 单轮 LLM 超时（2026-09-28 新增）────────────────────
+# 这三条路径此前全都用 _make_llm 的默认 timeout=120 / max_retries=2，且**不在**
+# _SQL_GEN_WALL_S 的封顶范围内（那个墙钟只管推断段）。后果：
+#   _retry_sql_fix 在 run() 里是 `for _ in range(3)` 循环 → 最坏 3×3×120s = 18 分钟
+#   _cross_validate(n=2) 内部还会再调 _generate_candidates → 又叠一层
+# 而这三条路径的性质都是"救急"：修复/候选若在 45s 内出不来，再多等也大概率出不来
+# （模型要么在长 schema 上原地打转，要么被思考 token 吃光预算）。
+# 参照逃生舱既有的 `max_retries=0` + 短 timeout 策略，统一到本常量。
+# 可用环境变量 SQL_FIX_TIMEOUT_S 调整（演示节奏优先时可调到 25）。
+_FIX_ROUND_TIMEOUT_S = float(os.getenv("SQL_FIX_TIMEOUT_S", "45"))
+
+# 修复链（run() 里 `for _ in range(2)`）的**累计**墙钟上限。
+# 单轮超时管不住总时长：2 轮 × (45s LLM + 执行 + 三重复查) 仍可达 2 分钟以上。
+# 这个常量是最后一道闸门——到点就跳出循环走兜底 SQL，不再继续修。
+_FIX_TOTAL_WALL_S = float(os.getenv("SQL_FIX_TOTAL_S", "100"))
+# 兼容别名：run() 内使用 _SQL_FIX_TOTAL_S 命名（与 _SQL_GEN_WALL_S 统一风格）
+_SQL_FIX_TOTAL_S = _FIX_TOTAL_WALL_S
 
 
 # ── 确定性 SQL 编译（推断用，2026-09-02）────────────────────
@@ -7701,6 +9216,9 @@ _ENUM_MAX_DISTINCT = 20        # distinct 超过此值 = 高基数列，不注�
 _ENUM_VALS_PER_COL = 10        # 每列最多注入 10 个值
 _ENUM_VAL_MAXLEN = 20          # 单值截断长度（防长文本撑爆 prompt）
 _ENUM_COLS_PER_TABLE = 6       # 每表最多查 6 个文本列（启发式排序后取前 6）
+# 跨集合 JOIN 提示条数上限（见 _infer_join_relations 末尾）。
+# 不设上限时单张事实表会列出 12 条（含大量事实表之间互相关联），撑长 prompt。
+_CROSS_JOIN_MAX = 4
 _ENUM_TOTAL_BUDGET = 400       # 枚举段总字符预算（2026-09-06 700→400：控 prompt 长度防 0 输出）
 # 枚举触发词：仅问题含这些词才收集注入枚举（否则纯增 prompt 无收益）
 _ENUM_TRIGGER_RE = (r"状态|类型|类别|种类|方式|性质|是否|级别|等级|班次|单位|仓库|"
@@ -7738,7 +9256,10 @@ def _infer_join_relations(table_names: list) -> list[str]:
     try:
         cm = _all_table_columns() or {}
         names = [str(t) for t in (table_names or []) if t]
-        if len(names) < 2:
+        # 2026-09-28：由 `< 2 直接返回空` 改为「至少 1 张即可」——单张事实表时，
+        # 下面补的「跨集合 JOIN 目标」仍有价值（告诉模型这张表能 JOIN 到哪些维表），
+        # 而候选表之间的关联在 <2 张时本来就不会产生行，无副作用。
+        if not names:
             return []
         norm: dict[str, str] = {}
         for t in names:
@@ -7769,6 +9290,49 @@ def _infer_join_relations(table_names: list) -> list[str]:
                     if line not in seen:
                         seen.add(line)
                         lines.append(line)
+
+        # ── 2026-09-28 补：跨集合 JOIN 目标（候选表之外的库内维表）──
+        # 缺陷：上面的匹配只在**本次候选表**（names）内部找关联。事实表想关联一张
+        # 没被召回的维表时（典型：「各产线的良率」召回了 mes_process_output，
+        # dim_production_line 可能因关键词未命中而不在候选里），JOIN 提示为空，
+        # 模型只能凭列名猜 —— 这正是 `process_id = process_code` 那类错法的来源。
+        # 现补一条：对候选表里的每个 `X_id`，若**库内任意表**有同名列 `X_id`，
+        # 把它作为「可 JOIN 目标」列出（标注该表未在候选中，供模型判断是否要引入）。
+        # 只列**同名列关联**（X_id = X_id），不推断 _code/_name，避免制造新错法。
+        try:
+            all_bare: dict[str, list[str]] = {}
+            for k in (cm or {}):
+                bk = str(k).split(".")[-1].lower()
+                raw = cm.get(k) or []
+                for c in raw:
+                    cc = str(c).lower()
+                    if cc.endswith("_id") and cc != "id":
+                        all_bare.setdefault(cc, [])
+                        if bk not in all_bare[cc]:
+                            all_bare[cc].append(bk)
+            _in_names = {str(t).split(".")[-1].lower() for t in names}
+            _cross: list[tuple[int, str]] = []
+            for child in sorted(cols):
+                for c in cols[child]:
+                    if not c.endswith("_id") or c == "id":
+                        continue
+                    for tgt in sorted(all_bare.get(c) or []):
+                        if tgt in _in_names or tgt == child:
+                            continue
+                        # 优先级：`dim_*` 开头（标准维表，通常是用户真正想分组的那张）
+                        # 排前面，其余（事实表互相关联）排后面。prompt 长度是稀缺资源
+                        # ——本模块注释多处记录「长 prompt 会让 DeepSeek 静默 0 输出」，
+                        # 故这里只保留前 _CROSS_JOIN_MAX 条最有价值的。
+                        _prio = 0 if tgt.startswith("dim_") else 1
+                        line = f"- {norm[child]}.{c} = {tgt}.{c}（{tgt} 未在候选中，如需要请显式加入）"
+                        if line not in seen:
+                            seen.add(line)
+                            _cross.append((_prio, line))
+            _cross.sort(key=lambda x: x[0])
+            for _p, _l in _cross[:_CROSS_JOIN_MAX]:
+                lines.append(_l)
+        except Exception:
+            pass
         return lines
     except Exception:
         return []
@@ -7844,11 +9408,28 @@ def _enum_block_for_tables(query: str, table_names: list, force: bool = False) -
     force=True 时无条件注入：直生路径候选表少（≤4 张）、LLM 倾向凭先验编造
     英文枚举值（status='running'/'in_progress'，真实值是中文），实测触发词门槛
     挡不住（「开机率」「在制工单数」都不含"状态"二字却用到了 status 列）。
+
+    2026-09-28 补第二判据「问句点名的枚举值」。原门槛是**只看问句有没有枚举类名词**
+    （状态/类型/类别…），漏检极严重——用本机 8 个真实问法实测：7 个漏掉，包括
+    「设备故障造成的停机时长占比」（downtime_reason='设备故障' 是索引里的真实取值）、
+    「贴片机的产量是多少」（equipment_type 取值）、「L04 产线本月产量」（line_id 取值）、
+    「哪些产线既生产过传感器又生产过控制器」（product_category 取值）。
+    这四类问法的共同点：**用户已经点名了枚举值本身**，只是没带"类型"这种元词汇。
+    判据改为「命中枚举触发词」**或**「_tables_by_literal 能在问句里认出已登记的枚举值」，
+    后者直接用现成的倒排索引，零额外查询成本。
     """
     try:
-        if not force and not re.search(_ENUM_TRIGGER_RE, query or "", re.I):
-            return ""
-        _enums = _enum_values_for_tables([t for t in (table_names or [])[:4]]) or {}
+        if not force:
+            _hit_trigger = bool(re.search(_ENUM_TRIGGER_RE, query or "", re.I))
+            if not _hit_trigger:
+                # 第二判据：问句里是否出现了已登记的枚举值（如「传感器」「设备故障」「L04」）
+                try:
+                    _hit_trigger = bool(_tables_by_literal(query or "", limit=1))
+                except Exception:
+                    _hit_trigger = False
+            if not _hit_trigger:
+                return ""
+        _enums = _enum_values_for_tables([t for t in (table_names or [])[:4]], query=query) or {}
         if not _enums:
             return ""
         _parts = [f"- {k}: " + " | ".join(v) for k, v in sorted(_enums.items())][:6]
@@ -7947,6 +9528,58 @@ def _fact_output_table_exists() -> bool:
         return False
 
 
+# ── 未匹配问题台账（2026-09-28 新增）────────────────────────────────────
+# 用途：记录「用户问了、但没对应上库里任何数据对象」的问题，供后续补词表/建口径。
+# 为什么单独一个文件、而不是复用 feedback_queue.jsonl：
+#   feedback 那条链是「用户主动纠错 → 管理员复核 → 标记 resolved/rejected」的闭环，
+#   每条都要人工处理；未匹配问题是**系统侧自动产生**的统计信号（比如同一句话被问了
+#   20 次），混进 feedback 会把复核队列淹掉。这里只做**去重计数**，不产生待办。
+# 落盘格式：{归一化问题: {"count": n, "first": ts, "last": ts, "raw": 原始问法}}
+_UNMATCHED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", ".unmatched_queries.json")
+_unmatched_lock = threading.Lock()
+
+
+def _record_unmatched_query(query: str) -> None:
+    """把未匹配的问题计数落盘（归一化后去重，最多保留 500 条）。失败静默。"""
+    q = (query or "").strip()
+    if len(q) < 2:
+        return
+    # 归一化：去掉空白与常见语气词，让"各产线的良率是多少"与"各产线良率"归到一条
+    key = re.sub(r"[\s？?。，,、：:！!]+", "", q)
+    key = re.sub(r"^(请问|帮我|麻烦|我想知道|想看看|查一下|查询)", "", key)
+    key = key[:60]
+    if not key:
+        return
+    p = os.path.normpath(_UNMATCHED_PATH)
+    with _unmatched_lock:
+        data: dict = {}
+        try:
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                data = {}
+        except Exception:
+            data = {}
+        ent = data.get(key)
+        now = time.time()
+        if isinstance(ent, dict):
+            ent["count"] = int(ent.get("count") or 0) + 1
+            ent["last"] = now
+        else:
+            ent = {"count": 1, "first": now, "last": now, "raw": q[:200]}
+        data[key] = ent
+        # 超过上限时丢最早的一批（按 last 升序）
+        if len(data) > 500:
+            for k in sorted(data, key=lambda x: data[x].get("last") or 0)[:len(data) - 500]:
+                data.pop(k, None)
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+        except Exception:
+            pass
+
+
 def _safe_ident(name: str) -> bool:
     """SQL 标识符白名单校验（表名/列名只允许字母数字下划线，防注入）。"""
     return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(name or "").strip()))
@@ -7983,17 +9616,41 @@ def _text_columns_of(table_short: str) -> list[str]:
     return cols
 
 
-def _enum_values_for_tables(table_names: list) -> dict:
+def _enum_values_for_tables(table_names: list, query: str = "") -> dict:
     """收集候选表低基数文本列的 distinct 值。
 
     返回 {"表短名.列名": [v1, v2, ...]}；高基数/空列/超时限的列不返回。
     按 (db_key, 表) 粒度缓存 5min —— 同库重复问法零 DB 成本。
     护栏：execute_sql 自带的 EXPLAIN 估算闸门/statement_timeout 天然兜底大表扫描。
+
+    2026-09-28 新增 query 参数：把**用户点名枚举值所在的表**提到收集列表前部。
+    问题：原来只扫 `table_names[:4]`，而候选表是关键词/向量召回的结果——用户问
+    「传感器这个产品类别下各产线的产量」时，召回的常是 mes_process_output /
+    dim_production_line，**dim_product 排在第 5 位之后就被 [:4] 切掉了**，
+    于是 dim_product.product_category 的真实取值（传感器/控制器/执行器/通信模块）
+    永远进不了 prompt，模型只能自己编。
+    现用现成的 _literal_table_index 倒排索引反查「用户点到的值属于哪张表的哪一列」，
+    把该表插到列表最前（去重、不改变原有顺序的其余部分）。该索引已按库落盘缓存 1h，
+    额外成本为零。禁用/索引为空时行为与旧版完全一致。
     """
     out: dict = {}
-    deadline = time.monotonic() + _ENUM_DEADLINE_S
-    for tname in (table_names or [])[:4]:
+    ordered: list[str] = []
+    # ① 用户点名枚举值所在的表优先（见上方 docstring）
+    try:
+        if query:
+            _lit_tabs = _tables_by_literal(query, limit=3)
+            for s in _lit_tabs:
+                if s and s not in ordered:
+                    ordered.append(s)
+    except Exception:
+        pass
+    # ② 原候选表按原顺序追加
+    for tname in (table_names or []):
         short = str(tname or "").split(".")[-1].strip().lower()
+        if short and short not in ordered:
+            ordered.append(short)
+    deadline = time.monotonic() + _ENUM_DEADLINE_S
+    for short in ordered[:4]:
         if not _safe_ident(short):
             continue
         with _enum_lock:
@@ -8808,13 +10465,19 @@ def _bird_probe_execute(sql_text: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _direct_gen_sql(query: str, matched_tables: list, budget_s: float = 45.0) -> str | None:
+def _direct_gen_sql(query: str, matched_tables: list, budget_s: float = 45.0,
+                    reject_reason: str = "") -> str | None:
     """主链「直接 LLM 生成 SQL」（逃生式、非 json —— 对 GLM/zhipu 等 json 弱模型友好）。
 
     与 _run_escape_sql 共用同一套 prompt 与安全校验（validate_sql_safety + 列名存在性）。
     schema 只注入列名清单（不注入富文本描述），规避长中文 schema 触发静默 0 输出。
     注意：始终使用【当前用户所选模型】（_make_llm 跟随 LLM_CONFIG），不做模型写死/暗切换——
     用户切换模型即为最直接的换模型重试手段。
+
+    reject_reason（2026-09-28 新增）：上一轮 MQL 草稿被质量闸门拒绝的原因。旧行为是
+    闸门拒绝即丢、兜底从零重来 —— 实测「库存最多的五种物料」MQL 草稿漏了「物料」维度
+    被拒，兜底重生成拿不到这个信息，等于**同一条错误又赌一次**，白等 8.9 秒。
+    把原因透传给兜底 prompt，让它带着"上一版错在哪"生成，一轮内命中率明显提高。
     """
     try:
         try:
@@ -8839,6 +10502,11 @@ def _direct_gen_sql(query: str, matched_tables: list, budget_s: float = 45.0) ->
         # 也拿不到外键（凭列名猜 ON 条件）。两者按需注入，长 prompt 风险由预算参数兜住。
         _names = [t.get("table_name", "") for t in (matched_tables or [])[:6]]
         _extra = _join_hint_for_tables(_names) + _enum_block_for_tables(query, _names, force=True)
+        # 把上一版被拒原因作为「务必修正」项注入，避免重蹈覆辙
+        _rr = str(reject_reason or "").strip()
+        if _rr:
+            _extra = (f"【上一版 SQL 已被质量检查拒绝，以下问题必须在本次生成中修正】\n"
+                      f"{_rr[:300]}\n\n") + _extra
         return _run_escape_sql_v2(query, _tables_desc, _slim_schema, _extra, limit_s=budget_s)
     except Exception:
         return None
@@ -8877,28 +10545,36 @@ def _run_escape_sql_v2(query: str, tables_desc: str, slim_schema: str,
         "10) 问「每月/按月/每月趋势/季度」时必须用日期截断（PG: TO_CHAR(日期列,'YYYY-MM') 或 date_trunc）后分组，"
         "禁止直接 GROUP BY 日期列（会退化成按天）；"
         "11) 问题没有提到时间范围时，禁止自行添加 WHERE 时间过滤；提到了才过滤，且严格按提到的范围。\n"
-        # 12~14 为 2026-09-15 高价值题库实测驱动的补充（每题都对应一个已复现的真实失败）：
+        # ── 2026-09-28 撤除原 12~14 三条提示词约束 ─────────────────────
+        # 撤除的是（原编号与出处）：
         #   12 → #3「停机次数超过5次的设备中前5台」：多带 *_id/*_code 进 GROUP BY 后，
-        #        第 5 名在两台并列设备（12 次 / 540 分钟）之间换人，答案与标准答案不一致；
-        #   13 → #4「既生产过传感器又生产过控制器的产线」：模型写成 product_id = '传感器'，
-        #        把类别值比到了外键上，执行 0 行；
+        #        第 5 名在两台并列设备之间换人；
+        #   13 → #4「既生产过传感器又生产过控制器的产线」：模型写成 product_id = '传感器'；
         #   14 → #6「每天的产量相比前一天变化了多少」：首期 LAG 为 NULL，标准答案是 0。
-        "12) 分组维度只放业务维度列（名称/类别/类型/班次等），"
-        "禁止把主键/外键/编码列（*_id、*_code、*_no）一起放进 SELECT 与 GROUP BY —— "
-        "除非用户明确要求按每条实体分别统计；多带这些列会改变分组粒度，"
-        "并让「前N名」在指标并列时产生不确定结果。\n"
-        "13) 筛选值若来自维表属性列（如产品类别、设备类型、车间名称），"
-        "必须先用外键把该维表 JOIN 进来、在维表的属性列上过滤；"
-        "严禁把中文名称/类别等文本值直接与事实表的外键列（如 product_id = '传感器'）比较。\n"
-        "14) 环比/与上一期差值（LAG/LEAD）的第一个周期没有上一期，"
-        "必须用 COALESCE(差值表达式, 0) 兜底为 0，不要留 NULL。\n"
+        # 理由两条：
+        #   ① 三件事都已有**确定性改写器**作用在产物上，比提示词可靠得多：
+        #      _fix_topn_stable_tiebreak / _fix_value_column_mismatch /
+        #      _fix_window_diff_coalesce（均在 apply_output_fixes 链上）。
+        #   ② 提示词压不住模型惯性：实测同一轮里模型给 SUM 里的列加了 COALESCE，
+        #      却偏偏没给差值加 —— 原约束 14 形同虚设，只白占 prompt 长度。
+        # 直生 prompt 越短，长中文 schema 触发「静默 0 输出」的概率越低（本文件多处实测），
+        # 所以只留确定性改写这一条路。
         # 15 来自 v4 #4「产量高于平均产量的产线有哪些」：模型写成
         # `HAVING SUM(good_qty) > (SELECT AVG(good_qty) FROM mes_process_output)` ——
         # 拿「明细行的平均」去比「按产线汇总后的总量」，粒度不同必然答错。
-        "15) 与「平均值 / 均值 / 平均水平」比较时，比较对象必须与左侧**同粒度**："
+        "12) 与「平均值 / 均值 / 平均水平」比较时，比较对象必须与左侧**同粒度**："
         "左侧是按维度汇总的 SUM，右侧就必须先按同一维度 GROUP BY 再取 AVG"
         "（如 HAVING SUM(qty) > (SELECT AVG(t.qty) FROM (SELECT SUM(qty) AS qty FROM t GROUP BY 维度) t)），"
-        "严禁直接对明细行取 AVG。\nSQL:"
+        "严禁直接对明细行取 AVG。\n"
+        # 13 来自实战「既在7月生产过又出现过设备故障停机的产线有哪些」：
+        # 这类问法两个条件分别落在**两个不同事实表**（产量表 mes_process_output +
+        # 停机表 eqp_downtime_record），没有任何单表能同时满足。模型常见的两种错法 ——
+        # ①只按第一个条件查、把第二个条件漏掉；②硬把两张事实表 JOIN 起来（对不上粒度，
+        # 行数乘积级膨胀）。正确产物是「交集」：各条件各自筛出维度值集合，再取交集。
+        # 加这条是**描述目标产物形态**，不给具体 SQL 写法，避免压制模型对多种正确解法的选择。
+        "13) 若问题的多个条件分别依赖**不同的表**（如「既…又…」「同时满足…和…」「并且」），"
+        "禁止只满足其中一个条件，也禁止把两张事实表直接 JOIN（两张明细表 JOIN 会因多对多而膨胀），"
+        "应当各自筛出满足条件的维度值后再取交集（EXISTS / INTERSECT / IN 子查询任选其一）。\nSQL:"
     )
     try:
         from agent.llm_providers import detect_provider as _dp2b
@@ -9386,10 +11062,20 @@ def infer_query_analysis(query: str, schema_context: str, matched_tables: list,
         _join_block = _join_hint_for_tables([t.get("table_name") for t in (matched_tables or [])[:6]])
         _enum_block = ""
         _enums: dict = {}
-        if re.search(_ENUM_TRIGGER_RE, query or "", re.I):
+        # 2026-09-28 补第二判据：问句直接点名已登记枚举值时也注入（同 _enum_block_for_tables
+        # 的说明——原门槛实测 8 个真实问法漏 7 个）。这里格外重要：MQL 推断只让模型输出
+        # filters 的 value 字面量，模型看不到真实取值就会编（filters value 编错 →
+        # 编译器照编 → SQL 跑通 0 行 → 用户看到"没有数据"，比报错更难排查）。
+        _enum_need = bool(re.search(_ENUM_TRIGGER_RE, query or "", re.I))
+        if not _enum_need:
+            try:
+                _enum_need = bool(_tables_by_literal(query or "", limit=1))
+            except Exception:
+                _enum_need = False
+        if _enum_need:
             try:
                 _enums = _enum_values_for_tables(
-                    [t.get("table_name") for t in (matched_tables or [])[:4]])
+                    [t.get("table_name") for t in (matched_tables or [])[:4]], query=query)
             except Exception:
                 _enums = {}
         if _enums:
@@ -10007,8 +11693,15 @@ def _semantic_lookup(query: str, db_key: str, acl_fp: str):
 
 def _semantic_store(query: str, sql: str, matched_tables: list, schema_context: str,
                     chart_type: str, db_key: str, acl_fp: str,
-                    compiled: bool = False, mql: dict | None = None):
-    """写入语义缓存（仅高质量成功 SQL 调用；同问题去重，超上限淘汰最旧）"""
+                    compiled: bool = False, mql: dict | None = None,
+                    metric_hits: list | None = None):
+    """写入语义缓存（仅高质量成功 SQL 调用；同问题去重，超上限淘汰最旧）
+
+    metric_hits：本次解析命中的注册指标（用于命中侧口径一致性校验）。
+    本函数是模块级函数，拿不到调用方实例的 self —— 指标命中必须由调用方显式传入，
+    不要在这里引用 self（历史上这里写了 self._metric_resolution，导致每次沉淀都抛
+    NameError，而调用方统一 `except Exception: pass` 把错误吞掉，语义缓存长期空转）。
+    """
     if not _SEM_CACHE_ENABLED or not sql:
         return
     vec = _embed_query(query)
@@ -10039,7 +11732,7 @@ def _semantic_store(query: str, sql: str, matched_tables: list, schema_context: 
             # 2026-09-11 指标隔离：沉淀时记录本条 SQL 关联的注册指标名（小写集合），
             # 命中侧据此做口径一致性校验（见 _semantic_cache_hit），防近似口径偷换
             "metrics": sorted({str(h.get("name", "")).lower()
-                               for h in ((getattr(self, "_metric_resolution", None) or {}).get("hits") or [])}),
+                               for h in (metric_hits or [])}),
         })
         if len(entries) > _SEM_CACHE_MAX:
             entries.sort(key=lambda e: e["ts"])

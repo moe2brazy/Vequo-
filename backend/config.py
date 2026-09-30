@@ -176,16 +176,41 @@ AUTH_FULL_MODE = os.getenv("AUTH_FULL_MODE", "1") == "1"
 # 规则校验通过后，再加一轮独立 LLM 判定"这个 SQL + 结果能回答用户的问题吗"。
 # 模式：off=关闭（仅规则校验）/ on=强制开启 / auto=仅复杂查询自动开启（默认）。
 # auto 下简单查询不额外调用 LLM（控成本与延迟），复杂查询（JOIN/聚合/子查询）自动加保险。
+#
+# ⚠️ 2026-09-28 实测复审（dataherald 对照 + 本机 A/B）后补充的限制说明：
+# Critic 与生成用的是**同一个模型**，只换了 system prompt。这带来两个已知代价：
+#   ① 同源共偏——生成模型系统性写错的写法，Critic 往往也认为"没问题"（拦不住）；
+#   ② 反向误杀——生成正确的 SQL 被 Critic 判为"不对"→ 触发改写 → 改写产物更差，
+#      且旧产物能通过 _validate_result，于是**正确答案被覆盖**（见 run() Step 5.5
+#      注释里记录的事故：首版正确 SQL 被改写成裸明细 LIMIT 20）。
+# 现在 run() 已加 _output_quality_reason 二次闸门兜住 ②，但 ① 无法靠同模型解决。
+# 结论：Critic 的净收益集中在「复杂 JOIN / 多表 / 子查询」这类结构错高风险场景，
+# 对「单表聚合」类它更多是在制造改写噪音。因此把 auto 的触发面收窄：
+# 只有出现 JOIN/UNION/子查询（结构复杂度）才开；纯 GROUP BY/聚合不再触发。
 RESULT_LLM_CHECK_MODE = os.getenv("RESULT_LLM_CHECK_MODE", "auto").strip().lower()
 ENABLE_RESULT_LLM_CHECK = RESULT_LLM_CHECK_MODE in ("on", "auto")
+# auto 模式下是否把「纯聚合（GROUP BY/HAVING/SUM/COUNT，但无 JOIN）」也算作复杂查询。
+# 默认 0（不算）：这类查询结构简单、错法集中在口径而非结构，而口径已由
+# 10 道确定性前置校验 + 指标注册表把关，再叠一次同模型 LLM 复查性价比低。
+# 置 1 恢复旧的宽松判定（任何聚合都触发）。
+RESULT_CHECK_AGG_COUNTS_COMPLEX = os.getenv("RESULT_CHECK_AGG_COUNTS_COMPLEX", "0") == "1"
 
 # ── 结果评价 Agent（Evaluator）────────────────────────────
 # 白泽式四 Agent 闭环的第四环：生成→校验→修正→**评价**。
 # 评价 Agent 对最终结果打分（0-100），低分或 Critic/评价分歧时触发多候选交叉比对。
 # 模式：off=关闭 / on=强制 / auto=仅复杂查询（默认，控成本）。
+#
+# ⚠️ 2026-09-28：Evaluator 的**主要用途**是驱动 _cross_validate（低分→多候选重选），
+# 而 _cross_validate 内部要再跑一次 _generate_candidates + 逐个 _llm_result_evaluate。
+# 也就是「低分」这个信号本身要花 1 次调用取得，触发后又要花 1+N 次。实测门槛偏松时
+# 很容易形成「打分→低分→重选→再打分」的长链。默认把门槛由 60 提到 70：
+# 60 分档里混有大量"能用但写法不漂亮"的结果，把它们送进重选是负收益。
 RESULT_EVAL_MODE = os.getenv("RESULT_EVAL_MODE", "auto").strip().lower()
 # 低于该分数判定为"结果不可靠"，触发多候选交叉比对重选
-RESULT_EVAL_MIN_SCORE = int(os.getenv("RESULT_EVAL_MIN_SCORE", "60"))
+RESULT_EVAL_MIN_SCORE = int(os.getenv("RESULT_EVAL_MIN_SCORE", "70"))
+# 低分交叉比对的开关与候选数（0 = 关闭，省掉打分→重选整条链）
+RESULT_CROSS_VALIDATE = os.getenv("RESULT_CROSS_VALIDATE", "1") == "1"
+RESULT_CROSS_VALIDATE_N = int(os.getenv("RESULT_CROSS_VALIDATE_N", "2"))
 # 确定性编译命中的查询是否跳过 LLM 复查（Critic + Evaluator）。
 # 默认 1（跳过）：编译 SQL 的口径由指标注册表保证，让 LLM 再审一遍口径、甚至在它
 # 判定"不对"时改写，反而会让结果偏离注册口径，与「确定性编译为主」的约定冲突；

@@ -1,16 +1,23 @@
 <template>
   <div ref="askRootEl" class="flex gap-4 min-h-0 overflow-hidden" style="height: calc(100vh - 96px)">
-    <!-- ====== 左侧：历史记录面板 ====== -->
-    <div class="w-64 flex-shrink-0 border border-gray-200 rounded-xl overflow-hidden flex flex-col bg-white">
+    <!-- ====== 左侧：历史记录面板（可收纳，收起后右侧聊天区更宽） ====== -->
+    <div v-if="!historyCollapsed" class="w-64 flex-shrink-0 border border-gray-200 rounded-xl overflow-hidden flex flex-col bg-white">
       <!-- 头部 -->
       <div class="bg-gray-50 px-3 py-2 border-b border-gray-200 flex items-center justify-between">
         <span class="text-xs font-medium text-gray-600">智能问数</span>
-        <button
-          @click="createNewChat"
-          class="text-xs text-primary hover:text-primary-dark font-medium transition"
-        >
-          + 新建对话
-        </button>
+        <div class="flex items-center gap-2">
+          <button
+            @click="createNewChat"
+            class="text-xs text-primary hover:text-primary-dark font-medium transition"
+          >
+            + 新建对话
+          </button>
+          <button
+            @click="historyCollapsed = true"
+            class="text-xs text-gray-400 hover:text-gray-600 transition flex items-center"
+            title="收起历史记录"
+          ><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <path d="m15 18-6-6 6-6" /> </svg></span></button>
+        </div>
       </div>
 
       <!-- 搜索框 + 搜索按钮 -->
@@ -74,6 +81,19 @@
         <span v-if="searchKeyword" class="ml-2">(筛选后 {{ filteredHistory.length }} 条)</span>
       </div>
     </div>
+
+    <!-- 收起态：一条窄的展开按钮，贴在左侧，点击恢复历史面板 -->
+    <button
+      v-else
+      @click="historyCollapsed = false"
+      class="flex-shrink-0 w-9 border border-gray-200 rounded-xl overflow-hidden flex flex-col items-center justify-start bg-white hover:bg-gray-50 transition"
+      title="展开历史记录"
+    >
+      <span class="w-full py-2 flex items-center justify-center text-gray-400 hover:text-gray-600">
+        <span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <path d="m9 18 6-6-6-6" /> </svg></span>
+      </span>
+      <span class="pb-2 px-1 text-[10px] text-gray-400" style="writing-mode: vertical-rl; letter-spacing: 0.2em">历史记录</span>
+    </button>
 
     <!-- ====== 右侧：聊天区域 ====== -->
     <div class="flex-1 min-w-0 border border-gray-200 rounded-xl overflow-hidden flex flex-col bg-white">
@@ -159,16 +179,16 @@
               {{ msg.content }}
             </div>
             <!-- ===== 结果回答（最显眼：用户第一眼看到结论，溯源类内容在下方默认折叠）===== -->
-            <div v-if="msg.result" class="mt-2 rounded-lg border border-blue-200 bg-white overflow-hidden shadow-sm">
-              <div class="flex items-center gap-2 px-3 py-2 bg-blue-50/70 border-b border-blue-100">
-                <span class="text-[12.5px] font-semibold text-blue-800 flex items-center gap-1.5">
-                  <span class="inline-block w-1.5 h-1.5 rounded-full bg-blue-500"></span>
+            <div v-if="msg.result" class="ask-result-card">
+              <div class="ask-result-head">
+                <span class="ask-result-title">
+                  <span class="ask-result-title-dot"></span>
                   <span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <line x1="18" x2="18" y1="20" y2="10" /> <line x1="12" x2="12" y1="20" y2="4" /> <line x1="6" x2="6" y1="20" y2="14" /> </svg></span> 结果回答
                 </span>
-                <span v-if="msg.thinkingStreaming" class="text-[10.5px] text-gray-400">● 生成中</span>
-                <span v-else class="text-[10.5px] text-blue-600">● 已生成</span>
+                <span v-if="msg.thinkingStreaming" class="ask-result-status">生成中</span>
+                <span v-else class="ask-result-status ask-result-status-done">已生成</span>
               </div>
-              <div v-html="msg.result" class="px-3.5 py-3 text-[13.5px] leading-relaxed text-gray-800" @click="onResultClick"></div>
+              <div v-html="msg.result" class="ask-result-body" @click="onResultClick"></div>
             </div>
 
             <!-- 报告卡片：这份回答的产出就是一份报告，卡片常驻在回答下面。
@@ -199,43 +219,40 @@
             </div>
 
             <!-- 思考过程（流式；生成中自动展开，完成后默认折叠——溯源内容不抢结果版面） -->
-            <div v-if="msg.thinking" class="mt-2 bg-gray-100/70 rounded-lg border border-gray-200 overflow-hidden">
-              <div class="flex items-center gap-1.5 px-3 py-1.5 bg-gray-50 border-b border-gray-200 cursor-pointer select-none" @click="msg.thinkingOpen = !msg.thinkingOpen">
-                <span v-if="msg.thinkingStreaming" class="inline-block w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse"></span>
-                <span class="text-[11px] text-gray-500 font-medium">AI 思考过程</span>
-                <span class="text-[10px] text-gray-400">{{ msg.thinkingStreaming ? '生成中...' : (msg.thinkingOpen === true ? '收起' : '展开') }}</span>
+            <div v-if="msg.thinking" class="ask-collapse">
+              <div class="ask-collapse-head" @click="msg.thinkingOpen = !msg.thinkingOpen">
+                <span class="ask-collapse-mark"><span v-if="msg.thinkingStreaming" class="inline-block w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse"></span><span v-else class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <path d="M12 2a10 10 0 1 0 10 10" /> </svg></span></span>
+                <span class="ask-collapse-name">AI 思考过程</span>
+                <span class="ask-collapse-state">{{ msg.thinkingStreaming ? '生成中' : (msg.thinkingOpen === true ? '收起' : '展开') }}</span>
               </div>
-              <div v-show="msg.thinkingStreaming || msg.thinkingOpen === true" class="p-3 text-[11px] leading-relaxed max-h-64 overflow-y-auto tk-panel" v-html="formatThinking(msg.thinking)"></div>
+              <div v-show="msg.thinkingStreaming || msg.thinkingOpen === true" class="ask-collapse-body tk-panel" v-html="formatThinking(msg.thinking)"></div>
             </div>
             <!-- SQL 语句：独立深色卡片；默认折叠（溯源类不抢结果版面），点击表头展开 -->
-            <div v-if="msg.sql" class="mt-2 rounded-lg overflow-hidden border border-slate-700 bg-slate-900">
-              <div class="flex items-center justify-between px-3 py-1.5 bg-slate-800 border-b border-slate-700 cursor-pointer select-none" @click="msg.sqlOpen = !msg.sqlOpen">
-                <span class="text-[11px] text-slate-200 font-medium flex items-center gap-1.5">
-                  <span class="inline-block w-1.5 h-1.5 rounded-full bg-blue-400"></span>
+            <div v-if="msg.sql" class="ask-sql-card">
+              <div class="ask-sql-head" @click="msg.sqlOpen = !msg.sqlOpen">
+                <span class="ask-sql-title">
+                  <span class="ask-sql-dot"></span>
                   SQL 查询语句
-                  <span class="text-[10px] text-slate-400">{{ msg.sqlOpen === true ? '收起' : '展开' }}</span>
+                  <span class="ask-sql-state">{{ msg.sqlOpen === true ? '收起' : '展开' }}</span>
                 </span>
                 <button
                   @click.stop="copySql(msg)"
-                  class="text-[11px] px-2 py-0.5 rounded text-slate-300 hover:text-white hover:bg-slate-700 transition"
+                  class="ask-sql-copy"
                   :title="'复制 SQL'"
                 ><span v-if="msg.copiedSql"><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <polyline points="20 6 9 17 4 12" /> </svg></span></span><span v-else><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <rect width="14" height="14" x="8" y="8" rx="2" ry="2" /> <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" /> </svg></span></span>{{ msg.copiedSql ? ' 已复制' : ' 复制' }}</button>
               </div>
-              <pre v-show="msg.sqlOpen === true" class="sql-code px-3 py-2.5 text-[11.5px] leading-relaxed text-slate-100 overflow-x-auto">{{ msg.sql }}</pre>
+              <pre v-show="msg.sqlOpen === true" class="sql-code">{{ msg.sql }}</pre>
             </div>
 
             <!-- 结果溯源（血缘）：标注每个数字来自哪张表哪个字段（确定性解析，非 LLM 现编） -->
             <div v-if="msg.lineage && msg.lineage.columns && msg.lineage.columns.length"
-                 class="mt-2 rounded-lg border border-gray-200 bg-white overflow-hidden">
-              <div class="flex items-center justify-between px-3 py-1.5 bg-gray-50 border-b border-gray-200 cursor-pointer select-none"
-                   @click="msg.lineageOpen = !msg.lineageOpen">
-                <span class="text-[11px] text-gray-500 font-medium flex items-center gap-1.5">
-                  <span class="inline-block w-1.5 h-1.5 rounded-full bg-blue-500"></span>
-                  数据溯源（血缘）
-                </span>
-                <span class="text-[10px] text-gray-400">{{ msg.lineageOpen === true ? '收起' : '展开' }}</span>
+                 class="ask-collapse">
+              <div class="ask-collapse-head" @click="msg.lineageOpen = !msg.lineageOpen">
+                <span class="ask-collapse-mark"><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <path d="M3 3v16a2 2 0 0 0 2 2h16" /> <path d="M18 17V9" /> <path d="M13 17V5" /> <path d="M8 17v-3" /> </svg></span></span>
+                <span class="ask-collapse-name">数据溯源（血缘）</span>
+                <span class="ask-collapse-state">{{ msg.lineageOpen === true ? '收起' : '展开' }}</span>
               </div>
-              <div v-show="msg.lineageOpen === true" class="p-2.5 text-[11.5px]">
+              <div v-show="msg.lineageOpen === true" class="ask-collapse-body">
                 <div v-if="msg.lineage.tables && msg.lineage.tables.length" class="mb-2 flex flex-wrap gap-1.5">
                   <span v-for="(t, ti) in msg.lineage.tables" :key="'lg-t-' + ti"
                         class="px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-100">
@@ -272,17 +289,13 @@
             <!-- 推理过程 Show Work（P1-5，对标 ThoughtSpot Show Work）：
                  不仅展示"做了什么"，还展示每一步的输入/产出/依据，回答"为什么查这张表、
                  为什么这么算"。默认折叠，避免长流程占版面。 -->
-            <div v-if="(msg.steps || []).length" class="mt-2 border border-slate-200 rounded-xl overflow-hidden">
-              <button
-                @click="msg.stepsOpen = !msg.stepsOpen"
-                class="w-full px-3 py-2 bg-slate-50 flex items-center justify-between gap-2 text-left hover:bg-slate-100 transition"
-              >
-                <span class="text-[11.5px] font-medium text-slate-700">推理过程（Show Work）</span>
-                <span class="text-[10px] text-slate-400 whitespace-nowrap">
-                  {{ (msg.steps || []).length }} 步 · {{ msg.stepsOpen === true ? '收起' : '展开' }}
-                </span>
-              </button>
-              <div v-show="msg.stepsOpen === true" class="px-3 py-1 divide-y divide-slate-100">
+            <div v-if="(msg.steps || []).length" class="ask-collapse">
+              <div class="ask-collapse-head" @click="msg.stepsOpen = !msg.stepsOpen">
+                <span class="ask-collapse-mark"><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2" /> <rect x="9" y="3" width="6" height="4" rx="2" /> <path d="m9 14 2 2 4-4" /> </svg></span></span>
+                <span class="ask-collapse-name">推理过程（Show Work）</span>
+                <span class="ask-collapse-state">{{ (msg.steps || []).length }} 步 · {{ msg.stepsOpen === true ? '收起' : '展开' }}</span>
+              </div>
+              <div v-show="msg.stepsOpen === true" class="ask-collapse-body">
                 <div v-for="(st, si) in msg.steps" :key="si" class="py-1.5">
                   <div class="flex items-baseline gap-2 flex-wrap">
                     <span class="text-[10px] text-slate-400 w-3 shrink-0">{{ st.step || si + 1 }}</span>
@@ -337,15 +350,15 @@
             </div>
 
             <!-- 引用文档（P0-A 混合问答，对标 Spotter 3）：[n] 可点开核实原文 -->
-            <div v-if="msg.citedDocs && msg.citedDocs.length" class="mt-2 rounded-lg border border-slate-200 overflow-hidden">
-              <button class="w-full flex items-center justify-between px-3 py-2 bg-slate-50 hover:bg-slate-100 text-[11.5px] text-slate-600"
-                      @click="msg.citedDocsOpen = !msg.citedDocsOpen">
-                <span class="font-medium">引用文档（{{ msg.citedDocs.length }}）</span>
-                <span class="text-[10px] text-gray-400">{{ msg.citedDocsOpen === false ? '展开' : '收起' }}</span>
-              </button>
-              <div v-show="msg.citedDocsOpen !== false" class="p-2.5 space-y-1.5">
+            <div v-if="msg.citedDocs && msg.citedDocs.length" class="ask-collapse">
+              <div class="ask-collapse-head" @click="msg.citedDocsOpen = !msg.citedDocsOpen">
+                <span class="ask-collapse-mark"><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /> <polyline points="14 2 14 8 20 8" /> </svg></span></span>
+                <span class="ask-collapse-name">引用文档（{{ msg.citedDocs.length }}）</span>
+                <span class="ask-collapse-state">{{ msg.citedDocsOpen === false ? '展开' : '收起' }}</span>
+              </div>
+              <div v-show="msg.citedDocsOpen !== false" class="ask-collapse-body">
                 <div v-for="d in msg.citedDocs" :key="'cd-' + d.index"
-                     class="text-[11.5px] text-slate-600 leading-relaxed">
+                     class="text-[11.5px] text-slate-600 leading-relaxed py-0.5">
                   <span class="inline-block mr-1 px-1 rounded bg-blue-50 text-blue-600 text-[10px] font-mono">[{{ d.index }}]</span>
                   {{ d.content }}
                 </div>
@@ -386,16 +399,16 @@
 
             <!-- 回答操作栏：复制回答 / 重新回答 / 反馈闭环 -->
             <div v-if="msg.role === 'assistant' && !(msg.thinkingStreaming && isLoading)"
-                 class="mt-2 flex items-center gap-2 flex-wrap">
+                 class="ask-actions">
               <button
                 @click="copyAnswer(msg)"
-                class="text-xs px-2.5 py-1 border border-gray-200 text-gray-500 rounded-md hover:bg-gray-100 hover:text-gray-700 transition"
+                class="ask-action-btn"
                 title="复制本条回答（含 SQL 与分析文本）"
               ><span v-if="msg.copiedAnswer"><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <polyline points="20 6 9 17 4 12" /> </svg></span></span><span v-else><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <rect width="14" height="14" x="8" y="8" rx="2" ry="2" /> <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" /> </svg></span></span>{{ msg.copiedAnswer ? ' 已复制' : ' 复制' }}</button>
               <button
                 @click="regenerate(idx)"
                 :disabled="isLoading"
-                class="text-xs px-2.5 py-1 border border-gray-200 text-gray-500 rounded-md hover:bg-gray-100 hover:text-gray-700 transition disabled:opacity-40 disabled:cursor-not-allowed"
+                class="ask-action-btn"
                 title="重新生成本轮回答（将清除本轮之后的对话）"
               >↻ 重新回答</button>
 
@@ -404,39 +417,39 @@
               <button
                 v-if="msg.queryType === 'report' && (msg.reportHtml || msg.reportId)"
                 @click="openReport(msg)"
-                class="text-xs px-3 py-1 text-white rounded-full transition hover:opacity-90"
-                style="background: linear-gradient(135deg,#2E7CF0,#1F66D6);"
+                class="ask-action-btn ask-action-btn-primary"
                 title="再打开这份报告（含 Word / PDF 下载）"
               ><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <line x1="18" x2="18" y1="20" y2="10" /> <line x1="12" x2="12" y1="20" y2="4" /> <line x1="6" x2="6" y1="20" y2="14" /> </svg></span> 打开报告</button>
 
               <!-- 数据查询反馈闭环：正确 SQL 沉淀为记忆，错误标记不学习 -->
               <template v-if="msg.queryType === 'data_query' && msg.sql">
-                <span class="w-px h-3.5 bg-gray-200 mx-0.5"></span>
-                <span class="text-xs text-gray-400">结果是否有帮助？</span>
+                <span class="ask-actions-sep"></span>
+                <span class="ask-actions-label">结果是否有帮助？</span>
                 <button
                   v-if="!msg.feedbackGiven"
                   @click="sendFeedback(msg, true)"
-                  class="text-xs px-3 py-1 bg-blue-50 text-blue-600 rounded-full hover:bg-blue-100 transition"
+                  class="ask-action-btn ask-action-btn-good"
                 ><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <path d="M7 10v12" /> <path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2a3.13 3.13 0 0 1 3 3.88Z" /> </svg></span> 结果正确</button>
                 <button
                   v-if="!msg.feedbackGiven"
                   @click="sendFeedback(msg, false)"
-                  class="text-xs px-3 py-1 bg-red-50 text-red-600 rounded-full hover:bg-red-100 transition"
+                  class="ask-action-btn ask-action-btn-bad"
                 ><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <path d="M17 14V2" /> <path d="M9 18.12 10 14H4.17a2 2 0 0 1-1.92-2.56l2.33-8A2 2 0 0 1 6.5 2H20a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-2.76a2 2 0 0 0-1.79 1.11L12 22a3.13 3.13 0 0 1-3-3.88Z" /> </svg></span> 结果有误</button>
                 <button
                   @click="openFeedbackDialog(msg)"
-                  class="text-xs px-3 py-1 bg-amber-50 text-amber-700 rounded-full hover:bg-amber-100 transition"
+                  class="ask-action-btn ask-action-btn-warn"
                 ><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z" /> <path d="M12 9v4" /> <path d="M12 17h.01" /> </svg></span> 纠错反馈</button>
                 <!-- P0-3 答案导出：Markdown（表格+结论+SQL）/ PNG（图表） -->
+                <span class="ask-actions-sep"></span>
                 <button
                   @click="exportMarkdown(msg)"
-                  class="text-xs px-3 py-1 bg-gray-50 text-gray-600 rounded-full border border-gray-200 hover:bg-gray-100 transition"
+                  class="ask-action-btn ask-action-btn-ghost"
                   title="导出 Markdown（问题+SQL+数据表格+分析结论）"
                 ><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z" /> <polyline points="14 2 14 8 20 8" /> <line x1="16" x2="8" y1="13" y2="13" /> <line x1="16" x2="8" y1="17" y2="17" /> <line x1="10" x2="8" y1="9" y2="9" /> </svg></span> MD</button>
                 <button
                   v-if="msg.chartSvg"
                   @click="exportPng(msg)"
-                  class="text-xs px-3 py-1 bg-gray-50 text-gray-600 rounded-full border border-gray-200 hover:bg-gray-100 transition"
+                  class="ask-action-btn ask-action-btn-ghost"
                   title="导出图表为 PNG 图片"
                 ><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <rect width="18" height="18" x="3" y="3" rx="2" ry="2" /> <circle cx="9" cy="9" r="2" /> <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" /> </svg></span> PNG</button>
                 <!-- 报告消息不走这块数据查询操作栏（报告没有 SQL 结果行），
@@ -446,13 +459,13 @@
                   v-if="hasChartData(msg)"
                   :value="msg.chartTypeOverride || msg.chartType || ''"
                   @change="switchChartType(msg, ($event.target as HTMLSelectElement).value)"
-                  class="text-[11px] px-2 py-1 border border-gray-300 rounded-md bg-white text-gray-500 focus:outline-none focus:border-violet-300"
+                  class="ask-chart-select"
                   title="切换图表类型（不重新查询数据）"
                 >
                   <option value="" disabled>切换图型…</option>
                   <option v-for="t in chartTypeOptions" :key="t.v" :value="t.v">{{ t.label }}</option>
                 </select>
-                <span v-if="msg.feedbackGiven" class="text-xs text-gray-400">{{ msg.feedbackText }}</span>
+                <span v-if="msg.feedbackGiven" class="ask-feedback-done">{{ msg.feedbackText }}</span>
               </template>
             </div>
           </div>
@@ -993,6 +1006,7 @@ function fillQuestion(q: string) {
 const streamingStep = ref('')    // 流式期间实时显示 AI 当前正在做的事
 const searchInput = ref('')      // 输入框的值
 const searchKeyword = ref('')    // 实际搜索的关键词
+const historyCollapsed = ref(false)  // 左侧历史记录面板是否收纳（收起后右侧聊天区更宽）
 const chatContainer = ref<HTMLElement | null>(null)
 const askRootEl = ref<HTMLElement | null>(null)
 
@@ -1265,21 +1279,21 @@ const headerText = (name: string, labels?: Record<string, string>): string => {
 // 渲染数据表格（labels：结果列中文名映射，可选）
 const renderTable = (columns: string[], rows: any[], labels?: Record<string, string>): string => {
   if (!columns || !rows || rows.length === 0) return ''
-  let html = '<div class="overflow-x-auto"><table class="min-w-full text-xs border-collapse">'
+  let html = '<div class="anl-table-wrap"><table class="anl-table">'
   html += '<thead><tr>'
   columns.forEach(c => {
     const label = labels && labels[c]
     const title = label ? ` title="${esc(c)}（${esc(label)}）"` : ''
-    html += `<th class="border border-gray-300 bg-gray-100 px-2 py-1 text-left font-medium"${title}>${esc(headerText(c, labels))}</th>`
+    html += `<th${title}>${esc(headerText(c, labels))}</th>`
   })
   html += '</tr></thead><tbody>'
   rows.slice(0, 20).forEach(r => {
     html += '<tr>'
-    columns.forEach(c => { html += `<td class="border border-gray-200 px-2 py-1">${esc(r[c] ?? '')}</td>` })
+    columns.forEach(c => { html += `<td>${esc(r[c] ?? '')}</td>` })
     html += '</tr>'
   })
   if (rows.length > 20) {
-    html += `<tr><td colspan="${columns.length}" class="border border-gray-200 px-2 py-1 text-center text-gray-400">... 共 ${rows.length} 行</td></tr>`
+    html += `<tr><td colspan="${columns.length}" class="anl-table-more">… 共 ${rows.length} 行</td></tr>`
   }
   html += '</tbody></table></div>'
   return html
@@ -1288,21 +1302,26 @@ const renderTable = (columns: string[], rows: any[], labels?: Record<string, str
 // 分析结论渲染：后端返回的是分段文本（【小标题】+「· / 1.」列表项），
 // 这里转成结构化 HTML——先 esc 再识别标记，杜绝 XSS。
 // 目的是让「结论」成为整条回复中最显眼的一块，而不是淹没在灰色小字里。
+//
+// 视觉策略（2026-09-29 信息分层重构）：
+//  - 【小标题】→ 左竖线 + 小标题，形成清晰的"结论分区"，取代原先扁平的小字标题；
+//  - 「· / 1.」列表项 → 圆点引导 + 悬挂缩进，读起来像专业的分析要点而非代码列表；
+//  - **加粗** → 关键结论加粗高亮（主色），让数字/判断第一眼跳出来。
 const renderAnalysis = (text: any): string => {
   if (!text) return ''
   let out = ''
   for (const raw of String(text).split('\n')) {
     const line = esc(raw)
-    if (!line.trim()) { out += '<div class="h-2"></div>'; continue }
+    if (!line.trim()) { out += '<div class="h-2.5"></div>'; continue }
     const head = line.match(/^\s*【(.+?)】\s*$/)
     if (head) {
-      out += `<div class="mt-2.5 mb-1 text-[13px] font-medium text-gray-900">${head[1]}</div>`
+      out += `<div class="anl-head"><span class="anl-head-bar"></span>${head[1]}</div>`
       continue
     }
-    const body = line.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
+    const body = line.replace(/\*\*(.+?)\*\*/g, '<b class="anl-strong">$1</b>')
     out += /^\s*(·|•|-|\d+[.、)])\s*/.test(line)
-      ? `<div class="pl-3 text-gray-700">${body}</div>`
-      : `<div class="text-gray-700">${body}</div>`
+      ? `<div class="anl-li"><span class="anl-dot"></span><span>${body}</span></div>`
+      : `<div class="anl-li anl-li-plain"><span>${body}</span></div>`
   }
   return out
 }
@@ -1412,53 +1431,58 @@ const renderAgentResult = (data: any, msg?: any): string => {
     if (data.compiled && data.mql) {
       const m = data.mql
       const dimTxt = (m.dimensions && m.dimensions.length) ? `按「${m.dimensions.join('、')}」拆分` : ''
-      html += `<div class="mt-2 mb-2 px-3 py-1.5 bg-blue-50 border border-blue-200 rounded-lg text-xs text-blue-700 leading-relaxed">
-        <span class="inline-block w-1.5 h-1.5 rounded-full bg-blue-500 mr-1.5"></span>统计口径：<b class="text-blue-800">${esc(fmtCaliber(m.metric_definition, m.metric, m.unit))}</b>${dimTxt ? `<span class="ml-1 text-blue-600">· ${esc(dimTxt)}</span>` : ''}
+      html += `<div class="anl-caliber">
+        <span class="anl-caliber-dot"></span>
+        <span class="anl-caliber-text">统计口径：<b>${esc(fmtCaliber(m.metric_definition, m.metric, m.unit))}</b>${dimTxt ? `<span class="anl-caliber-dim">· ${esc(dimTxt)}</span>` : ''}</span>
       </div>`
     } else if (data.metric_hint && data.metric_hint.kind === 'single') {
       // LLM 兜底：命中 1 个注册指标 → 报口径 + AI 生成徽标
       caliberAI = true
       caliberName = String(data.metric_hint.metric || '')
       const m = data.metric_hint
-      html += `<div class="mt-2 mb-2 px-3 py-1.5 bg-blue-50 border border-blue-200 rounded-lg text-xs text-blue-700 leading-relaxed">
-        <span class="inline-block w-1.5 h-1.5 rounded-full bg-blue-500 mr-1.5"></span>统计口径：<b class="text-blue-800">${esc(fmtCaliber(m.metric_definition, m.metric, m.unit))}</b>
-        <span class="ml-1 px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-600 align-middle">AI 生成</span>
+      html += `<div class="anl-caliber anl-caliber-warn">
+        <span class="anl-caliber-dot"></span>
+        <span class="anl-caliber-text">统计口径：<b>${esc(fmtCaliber(m.metric_definition, m.metric, m.unit))}</b>
+        <span class="anl-caliber-badge">AI 生成</span></span>
       </div>`
     } else if (data.metric_hint && data.metric_hint.kind === 'multi') {
       // LLM 兜底：命中多个注册指标 → 列出涉及指标名 + AI 徽标
       caliberAI = true
       caliberName = String((data.metric_hint.metrics || [])[0] || '')
       const names = (data.metric_hint.metrics || []).join('、')
-      html += `<div class="mt-2 mb-2 px-3 py-1.5 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-700 leading-relaxed">
-        <span class="inline-block w-1.5 h-1.5 rounded-full bg-amber-500 mr-1.5"></span>统计口径：<b class="text-amber-800">${esc(names)}</b>
-        <span class="ml-1 px-1.5 py-0.5 rounded bg-amber-100 text-amber-600 align-middle">AI 生成</span>
+      html += `<div class="anl-caliber anl-caliber-warn">
+        <span class="anl-caliber-dot"></span>
+        <span class="anl-caliber-text">统计口径：<b>${esc(names)}</b>
+        <span class="anl-caliber-badge">AI 生成</span></span>
       </div>`
     } else {
       // 未命中任何注册指标 → 诚实标注，但用业务语言
       caliberAI = true
-      html += `<div class="mt-2 mb-2 px-3 py-1.5 bg-gray-50 border border-gray-200 rounded-lg text-xs text-gray-500 leading-relaxed">
-        <span class="inline-block w-1.5 h-1.5 rounded-full bg-gray-400 mr-1.5"></span>未匹配到已登记的统计口径，结果由 AI 生成，请核对后再使用
+      html += `<div class="anl-caliber anl-caliber-muted">
+        <span class="anl-caliber-dot"></span>
+        <span class="anl-caliber-text">未匹配到已登记的统计口径，结果由 AI 生成，请核对后再使用</span>
       </div>`
     }
     // LLM 生成的结果：提供「登记口径」入口 —— 登记后同问法将命中确定性编译，秒查且不再标 AI
     if (caliberAI) {
       const _q = esc(data.query || (msg && msg.query) || '')
       const _n = esc(caliberName)
-      html += `<div class="mb-2 mt-1.5 text-[11px] text-gray-400">这个结果由 AI 生成，口径可能不准。<span class="text-indigo-500 cursor-pointer hover:underline ml-0.5" data-define-name="${_n}" data-define-query="${_q}">去登记正确口径，以后自动按它算 →</span></div>`
+      html += `<div class="anl-caliber-hint">这个结果由 AI 生成，口径可能不准。<span class="anl-caliber-link" data-define-name="${_n}" data-define-query="${_q}">去登记正确口径，以后自动按它算 →</span></div>`
     }
 
     // 注意：SQL 不在此渲染 —— 已由消息上方的独立「SQL 查询语句」深色卡片承担，
     // 避免与分析结果混在一起，也便于单独复制。
 
-    // 结论先行：分析结论是整条回复里用户最该看的部分，用主色左边框卡片突出；
-    // 图表/表格降为「数据明细」放在其后作为依据，避免结论被淹没在灰色小字里。
+    // 结论先行：分析结论是整条回复里用户最该看的部分。
+    // 用「无边框 + 柔和底 + 品牌竖标」的结论区承载，弱化描边、强化留白，
+    // 让结论成为视觉重心，图表/表格降级为「数据依据」放在其后。
     if (data.analysis) {
-      html += `<div class="mt-2 mb-3 rounded-lg bg-white px-4 py-3" style="border:1px solid #bfdbfe;border-left:3px solid #2563eb">
-        <div class="mb-1.5 flex items-center gap-1.5">
-          <span class="inline-block w-1.5 h-1.5 rounded-full" style="background:#2563eb"></span>
-          <span class="text-xs font-medium" style="color:#2563eb">分析结论</span>
+      html += `<div class="anl-conclusion">
+        <div class="anl-conclusion-title">
+          <span class="anl-conclusion-dot"></span>
+          分析结论
         </div>
-        <div style="font-size:14px;line-height:1.95;color:#374151">${renderAnalysis(data.analysis)}</div>
+        <div class="anl-conclusion-body">${renderAnalysis(data.analysis)}</div>
       </div>`
     }
 
@@ -1472,16 +1496,16 @@ const renderAgentResult = (data: any, msg?: any): string => {
     if (result.rows && result.rows.length > 0) {
       if (hasChart) {
         // 优先图表：ECharts 交互图渲染（可缩放/悬浮提示）；数据异常时回退后端 SVG
-        html += '<div class="text-xs text-gray-400 mb-1"><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <line x1="18" x2="18" y1="20" y2="10" /> <line x1="12" x2="12" y1="20" y2="4" /> <line x1="6" x2="6" y1="20" y2="14" /> </svg></span> 图表结果</div>'
+        html += '<div class="anl-section-title"><span class="anl-section-icon"><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <line x1="18" x2="18" y1="20" y2="10" /> <line x1="12" x2="12" y1="20" y2="4" /> <line x1="6" x2="6" y1="20" y2="14" /> </svg></span></span>数据概览</div>'
         const colsJson = esc(JSON.stringify(result.columns || []))
         const rowsJson = esc(JSON.stringify(result.rows || []))
         const fbSvg = esc(sanitizeSvg(chartSvg))
         // P0-4：drillable 层级钻取信息（点击分类可下钻到下一级，如 车间→产线）
         const drillJson = esc(JSON.stringify(data.drillable || null))
-        html += `<div class="mt-1 echart" style="height:320px" data-type="${esc(chartType)}" data-cols="${colsJson}" data-rows="${rowsJson}" data-fallback="${fbSvg}" data-drill="${drillJson}"></div>`
+        html += `<div class="anl-chart echart" style="height:320px" data-type="${esc(chartType)}" data-cols="${colsJson}" data-rows="${rowsJson}" data-fallback="${fbSvg}" data-drill="${drillJson}"></div>`
       } else {
         // 无法生成图表（纯文本列表 / 单行聚合 / 无数值列）→ 表格兜底展示
-        html += '<div class="text-xs text-gray-400 mb-1"><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <line x1="18" x2="18" y1="20" y2="10" /> <line x1="12" x2="12" y1="20" y2="4" /> <line x1="6" x2="6" y1="20" y2="14" /> </svg></span> 查询结果</div>'
+        html += '<div class="anl-section-title"><span class="anl-section-icon"><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <line x1="18" x2="18" y1="20" y2="10" /> <line x1="12" x2="12" y1="20" y2="4" /> <line x1="6" x2="6" y1="20" y2="14" /> </svg></span></span>数据明细</div>'
         // 表头带中文翻译：rework_qty（返工数量），翻译来自后端血缘 lineage.columns[].cn
         html += renderTable(result.columns || [], result.rows, columnLabelsOf(data, msg))
       }
@@ -1493,21 +1517,22 @@ const renderAgentResult = (data: any, msg?: any): string => {
     }
 
     if (data.attribution) {
-      html += `<div class="mt-3 text-xs bg-red-50 border border-red-100 rounded-lg p-2.5 text-red-700 leading-relaxed">${esc(data.attribution)}</div>`
-    }
-
-    if (data.recommended && data.recommended.length > 0) {
-      html += '<div class="mt-3 text-xs text-gray-500">你可能还想问：</div>'
-      html += '<div class="flex flex-wrap gap-2 mt-1">'
-      data.recommended.forEach((q: string) => {
-        html += `<span class="text-xs px-3 py-1 bg-blue-50 text-blue-600 rounded-full cursor-pointer hover:bg-blue-100 transition" data-ask="${esc(q)}">${esc(q)}</span>`
-      })
-      html += '</div>'
+      html += `<div class="anl-attribution">${esc(data.attribution)}</div>`
     }
 
     if (data.prediction && data.prediction.length > 0 && data.prediction[0]) {
-      html += '<div class="mt-3 text-xs text-gray-400"><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <path d="M3 3v18h18" /> <path d="m19 9-5 5-4-4-3 3" /> </svg></span> 趋势预测</div>'
+      html += '<div class="anl-section-title"><span class="anl-section-icon"><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <path d="M3 3v18h18" /> <path d="m19 9-5 5-4-4-3 3" /> </svg></span></span>趋势预测</div>'
       html += renderTable(Object.keys(data.prediction[0]), data.prediction.slice(0, 10))
+    }
+
+    if (data.recommended && data.recommended.length > 0) {
+      html += '<div class="anl-recommend">'
+      html += '<div class="anl-recommend-label">你可能还想问</div>'
+      html += '<div class="anl-recommend-list">'
+      data.recommended.forEach((q: string) => {
+        html += `<span class="anl-recommend-chip" data-ask="${esc(q)}">${esc(q)}</span>`
+      })
+      html += '</div></div>'
     }
     return html
   }
@@ -1587,13 +1612,31 @@ const renderECharts = async () => {
     }
   }))
   // 尺寸自适应：所有图表渲染完成后统一挂 observer（G2Plot 是异步的，需等渲染完再观察）
+  //
+  // 2026-09-28 修复（与 DataChartCard 同一根因）：observer 一挂上浏览器就回调一次「初始尺寸」，
+  // 那次 resize 会让 ECharts 以 0 时长整图重绘（resize 的 update payload 里写死 animation.duration=0），
+  // 刚起跑的入场动画当场被掐断——仪表盘指针直接落在终值、柱线图没有长出来的过程。
+  // 所以按容器记下上次尺寸，只在尺寸真的变了才 resize；同时改用 entries（谁变给谁 resize），
+  // 不再一有风吹草动就把页面里所有图表都重画一遍。
+  const chartSizes = new WeakMap<HTMLElement, { w: number; h: number }>()
   if (!chartResizeObserver) {
-    chartResizeObserver = new ResizeObserver(() => {
-      document.querySelectorAll<HTMLElement>('.echart').forEach((node) => resizeChart(node))
+    chartResizeObserver = new ResizeObserver((entries) => {
+      entries.forEach((entry) => {
+        const node = entry.target as HTMLElement
+        const prev = chartSizes.get(node)
+        const w = node.clientWidth
+        const h = node.clientHeight
+        if (prev && prev.w === w && prev.h === h) return
+        chartSizes.set(node, { w, h })
+        resizeChart(node)
+      })
     })
   }
   nodes.forEach((el) => {
-    if (el.dataset.engine !== 'svg') chartResizeObserver!.observe(el)
+    if (el.dataset.engine !== 'svg') {
+      chartSizes.set(el, { w: el.clientWidth, h: el.clientHeight })
+      chartResizeObserver!.observe(el)
+    }
   })
 }
 
@@ -3080,5 +3123,213 @@ watch(() => props.initialQuestion, (question) => {
   display: flex;
   align-items: center;
   gap: 5px;
+}
+
+/* ===== 结果回答卡（2026-09-29 信息分层重构）：去蓝色描边、柔白底 + 品牌头部，
+   与结论区同属「柔白 + 品牌蓝点缀」一套语言，弱化边框强化留白 ===== */
+.ask-result-card {
+  margin-top: 10px;
+  border-radius: 14px;
+  background: #ffffff;
+  border: 1px solid var(--line-200);
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+}
+.ask-result-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 11px 16px;
+  border-bottom: 1px solid var(--line-100);
+  background: linear-gradient(180deg, #FAFCFF 0%, #FFFFFF 100%);
+}
+.ask-result-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-900);
+}
+.ask-result-title-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 9999px;
+  background: linear-gradient(135deg, var(--brand-400), var(--brand-600));
+  box-shadow: 0 1px 4px rgba(46, 124, 240, .4);
+}
+.ask-result-status {
+  font-size: 11px;
+  color: var(--ink-400);
+  letter-spacing: .02em;
+}
+.ask-result-status-done { color: var(--brand-600); }
+.ask-result-body {
+  padding: 16px 18px 18px;
+  font-size: 13.5px;
+  line-height: 1.7;
+  color: var(--ink-700);
+}
+
+/* ===== 折叠卡统一语言（思考过程 / 溯源 / Show Work / 引用文档）=====
+   一套「浅灰底 + 统一表头（图标 + 名称 + 状态）」的折叠卡，替代原先深浅不一的散卡 */
+.ask-collapse {
+  margin-top: 10px;
+  border-radius: 10px;
+  border: 1px solid var(--line-200);
+  background: #FBFCFE;
+  overflow: hidden;
+}
+.ask-collapse-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 14px;
+  cursor: pointer;
+  user-select: none;
+  transition: background .15s ease;
+}
+.ask-collapse-head:hover { background: #F4F7FB; }
+.ask-collapse-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  background: var(--brand-100);
+  color: var(--brand-600);
+  flex: none;
+}
+.ask-collapse-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-700);
+}
+.ask-collapse-state {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--ink-400);
+}
+.ask-collapse-body {
+  padding: 12px 14px;
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: var(--ink-700);
+  border-top: 1px solid var(--line-100);
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+/* ===== SQL 深色卡（代码块保持深色，与浅色结论区形成明确区分）===== */
+.ask-sql-card {
+  margin-top: 10px;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid #1E293B;
+  background: #0F172A;
+}
+.ask-sql-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 14px;
+  background: #1E293B;
+  cursor: pointer;
+  user-select: none;
+}
+.ask-sql-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #E2E8F0;
+}
+.ask-sql-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  background: #60A5FA;
+}
+.ask-sql-state {
+  font-size: 10.5px;
+  color: #94A3B8;
+  font-weight: 400;
+}
+.ask-sql-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 4px 9px;
+  border-radius: 6px;
+  font-size: 11px;
+  color: #CBD5E1;
+  transition: all .15s ease;
+}
+.ask-sql-copy:hover { color: #fff; background: #334155; }
+
+/* ===== 回答操作栏（2026-09-29 收敛）：统一胶囊按钮，主操作在前、
+   反馈/导出用分隔线分组，减少视觉噪音 ===== */
+.ask-actions {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.ask-action-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 11px;
+  border-radius: 9999px;
+  border: 1px solid var(--line-200);
+  background: #fff;
+  color: var(--ink-500);
+  font-size: 12px;
+  line-height: 1.4;
+  transition: all .15s ease;
+}
+.ask-action-btn:hover:not(:disabled) {
+  border-color: var(--brand-300);
+  color: var(--brand-600);
+  background: var(--brand-050);
+}
+.ask-action-btn:disabled { opacity: .4; cursor: not-allowed; }
+.ask-action-btn-primary {
+  border: none;
+  color: #fff;
+  background: linear-gradient(135deg, #2E7CF0, #1F66D6);
+}
+.ask-action-btn-primary:hover:not(:disabled) { color: #fff; background: linear-gradient(135deg, #1F66D6, #1852B0); }
+.ask-action-btn-good { color: #2563EB; }
+.ask-action-btn-bad { color: #DC2626; }
+.ask-action-btn-warn { color: #B45309; }
+.ask-action-btn-ghost { color: var(--ink-500); }
+.ask-actions-sep {
+  width: 1px;
+  height: 14px;
+  background: var(--line-200);
+  margin: 0 4px;
+}
+.ask-actions-label {
+  font-size: 12px;
+  color: var(--ink-400);
+}
+.ask-chart-select {
+  padding: 4px 10px;
+  border-radius: 9999px;
+  border: 1px solid var(--line-200);
+  background: #fff;
+  color: var(--ink-500);
+  font-size: 12px;
+  outline: none;
+  cursor: pointer;
+}
+.ask-chart-select:hover { border-color: var(--brand-300); }
+.ask-feedback-done {
+  font-size: 12px;
+  color: var(--ink-400);
 }
 </style>

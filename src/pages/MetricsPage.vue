@@ -78,7 +78,10 @@
                 <span class="text-[10px] text-gray-400 whitespace-nowrap">命中 {{ c.hit_count }} 次</span>
               </div>
               <div class="mt-1">
-                <code class="inline-block font-mono text-[11px] text-blue-700 bg-[#F0F7FF] border border-[#E1F0FF] rounded-md px-1.5 py-0.5">{{ c.expr }}</code>
+                <!-- max-w-full + break-all：inline-block 默认不折行，长表达式（如
+                     SUM(mes_process_output.good_qty + mes_process_output.rework_qty)）在 1280 窄屏下
+                     会顶出卡片右边界约 29px。限宽后可折行，短表达式仍紧贴内容。 -->
+                <code class="inline-block max-w-full break-all font-mono text-[11px] text-blue-700 bg-[#F0F7FF] border border-[#E1F0FF] rounded-md px-1.5 py-0.5">{{ c.expr }}</code>
               </div>
               <div class="text-[11px] text-gray-500 mt-0.5">
                 源表：{{ (c.tables || []).join('、') || '—' }}

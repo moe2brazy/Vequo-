@@ -3,12 +3,13 @@
 import re
 import time
 import asyncio
+import logging
 import hmac as _hmac          # API Token 网关用（原先是请求内 import，每次请求都执行）
 import json as json_mod
 import os as _os
 from fastapi import FastAPI, HTTPException, Request, Header, Depends, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from routers import tables, knowledge, config, visualize, permission, mcp
@@ -35,6 +36,21 @@ from ml.trainer import (
 import uvicorn
 
 app = FastAPI(title="Vequo 维阔 NL2SQL Agent", version="2.0.0")
+
+
+@app.exception_handler(ValueError)
+async def _value_error_to_400(request: Request, exc: ValueError):
+    """业务层的输入校验异常映射为 400，而不是冒泡成 500。
+
+    业务函数（knowledge_user_data、metrics、permission 等）统一用
+    `raise ValueError("术语名称不能为空")` 这类写法表达"输入不合法"。此前没有全局映射，
+    这些异常一路冒泡到 FastAPI 变成 500 Internal Server Error，前端只能弹出
+    「服务器内部错误」，真正的可读原因（"术语名称不能为空"）被丢掉了。
+    这里统一转成 400 并保留原文；同时留 warning 日志，便于区分"用户输入有误"
+    和"代码真的抛了 ValueError"（后者需要看日志里的路径定位）。
+    """
+    logging.getLogger("api").warning("ValueError -> 400 | %s | %s", request.url.path, exc)
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 
 _cors_origins = [origin.strip() for origin in (_os.getenv("CORS_ORIGINS") or "http://localhost:5173,http://127.0.0.1:5173").split(",") if origin.strip()]
@@ -259,8 +275,16 @@ def save_llm_config_api(req: LLMConfigRequest):
     ok, msg = test_llm_connection()
     cfg = get_llm_config()
     return {
-        "success": True,
-        "message": f"配置已保存。{'测试成功: ' + msg if ok else '测试失败: ' + msg}",
+        # ⚠️ 这里必须如实返回测试结果。此前恒为 True，而前端按 `success !== false`
+        # 决定提示颜色 → 不管 Key 通不通都显示蓝色的"配置已保存"，用户以为配好了，
+        # 实际已经把可用配置换成了调不通的（2026-09-28 实测：在「切换模型」里保存了一个
+        # 无效 Key，之后所有问数都报"AI 未能生成 SQL"，而配置页始终显示保存成功）。
+        "success": bool(ok),
+        "saved": True,
+        "message": (f"配置已保存，连接测试通过：{msg}" if ok else
+                    f"配置已保存，但连接测试未通过：{msg}。当前配置不可用，"
+                    f"所有问数都会失败——请核对 API Key 与接口地址是否匹配，"
+                    f"或点「恢复默认」换回系统内置配置。"),
         "config": {
             "model": cfg["model"],
             "api_key": "",
@@ -279,8 +303,13 @@ def restore_llm_default_api():
     ok, msg = test_llm_connection()
     cfg = get_llm_config()
     return {
-        "success": True,
-        "message": f"已恢复为系统默认（{cfg['model']}）。{'测试成功: ' + msg if ok else '测试失败: ' + msg}",
+        # 同 /api/llm/config：恢复默认若仍测不通（默认 Key 欠费/被吊销），
+        # 必须让前端显示为失败，而不是一句蓝色的"已恢复默认"。
+        "success": bool(ok),
+        "restored": True,
+        "message": (f"已恢复为系统默认（{cfg['model']}），连接测试通过：{msg}" if ok else
+                    f"已恢复为系统默认（{cfg['model']}），但连接测试未通过：{msg}。"
+                    f"系统内置 Key 也可能已失效或欠费，请联系管理员更新。"),
         "config": {
             "model": cfg["model"],
             "api_key": "",
@@ -477,8 +506,15 @@ class FeedbackRequest(BaseModel):
 
 # ── 数据库连接（当前项目 pg8000/SQLAlchemy 体系）────────────
 
-@app.get("/api/database/config")
+@app.get("/api/database/config", dependencies=[Depends(require_roles("admin"))])
 def database_config():
+    """当前活动数据源的连接参数（host/port/user/database）。
+
+    权限修复（P1）：原端点无鉴权，返回内容含内网主机名、端口与库用户名，
+    等价于把「后端连的是哪台机、哪个库」直接交给任何调用方（含开放模式下的匿名访客），
+    配合 /api/database/test 可攒出内网拓扑。前端仅「系统设置」页（管理员）用它，
+    因此直接收紧到 admin。
+    """
     return get_database_config()
 
 
@@ -593,9 +629,14 @@ def _refresh_db_side_effects():
         pass
 
 
-@app.get("/api/database/sources")
+@app.get("/api/database/sources", dependencies=[Depends(require_roles("admin"))])
 def list_database_sources_api():
-    """已注册数据源列表（不含密码，含活动标记）。"""
+    """已注册数据源列表（不含密码，含活动标记）。
+
+    权限修复（P1）：同族写接口（新增/删除/激活）本来就限 admin，读接口却敞着，
+    列表里含每个源的 host/port/user/database —— 普通员工能据此推出还有哪些库、
+    分别在哪台机。收紧到 admin，与写接口口径一致。
+    """
     from database import get_database_sources
     return {"success": True, "sources": get_database_sources()}
 
@@ -633,11 +674,15 @@ def activate_database_source_api(source_id: str):
     return {"success": True, "message": "数据源已激活", "config": get_database_config()}
 
 
-@app.get("/api/database/sources/search")
+@app.get("/api/database/sources/search", dependencies=[Depends(require_roles("admin"))])
 def search_database_sources_api(q: str = "", limit: int = 8):
     """跨数据源搜索表（只读各非活动源元数据，不切换连接）。
 
     活动源内部搜索没命中时，这里能发现「表在哪个源」→ 前端展示建议切换。
+
+    权限修复（P1）：原端点无鉴权，虽然只返回元数据，但会把**非活动源**的表名
+    一并暴露（员工本不该知道自己没被授权的库里有什么表）。前端只有系统设置页用，
+    收紧到 admin。
     """
     from database import search_across_sources
     return {"success": True, "results": search_across_sources(q, limit=limit)}
@@ -2796,13 +2841,18 @@ def delete_report_asset_api(rid: str, authorization: str = Header(None)):
 @app.post("/api/overview/report-html")
 def overview_report_html(authorization: str = Header(None)):
     """生成单文件 HTML 数据总览报告（标签页 + 流程图 + 颜色高亮），直接返回 HTML 内容。
+
+    权限：需角色策略开通 export 操作权限（admin 全放行，其余 fail-close）。
+          与同族的 /overview/report-export、/overview/report-download 必须同口径——
+          这条端点此前只校验了登录（get_current_user），漏掉 export 校验，
+          未被授予导出权限的角色、以及开放模式下的 guest，都能直接 POST 拿到整份总览报告。
     内容按当前用户数据权限过滤（表级 allowed_tables + 行级 row_filters）；
     缓存 key 含 ACL 指纹，不同权限用户不共享缓存（防越权复用）。
     前端拿到后用 Blob URL 在新标签页打开，无需静态服务。
     走 10 分钟 TTL 缓存：LLM 生成总结约 30-80s，重复生成秒回；切库自动失效。
     """
     from security.enforcer import build_acl_context, acl_fingerprint
-    u = get_current_user(authorization)
+    u = _require_action(authorization, "export")
     acl = build_acl_context(u)
     fp = acl_fingerprint(acl)
     from database import get_db
@@ -2899,9 +2949,15 @@ def overview_report_download(authorization: str = Header(None), format: str = "d
 # ═══════════════════════════════════════════════════════════════
 
 def _qreport_acl(authorization: str):
-    """取当前用户的 ACL 上下文（表级 + 行级）。"""
+    """取当前用户的 ACL 上下文（表级 + 行级），并强制校验 export 操作权限。
+
+    这个函数只服务于 /api/ask/report（生成提问分析报告）一个端点，所以把 export 校验
+    一并放在这里：报告是「把数据带出去」的动作，生成与导出必须同口径。
+    此前这里只调 get_current_user 取身份，没做操作权限校验——上方注释明写
+    「生成与导出都要求 export 权限」，实现却对不上，未开通导出权限的账号能直接拿到含数据的报告 HTML。
+    """
     from security.enforcer import build_acl_context
-    u = get_current_user(authorization)
+    u = _require_action(authorization, "export")
     return u, build_acl_context(u)
 
 
@@ -3278,6 +3334,24 @@ def _warmup_knowledge_cache():
                 _warm_key("overview", _build_overview)
                 _warm_key("relationships", _build_relationships)
                 _warm_key("terms", _build_terms)
+                # ── 问数链路冷启动预热（2026-09-29）：消除「第一个问数请求」背的
+                # information_schema 全库查询 / 指标 RAG 向量索引懒重建 / embedding
+                # 模型加载 三项开销。这三项都是懒加载：表结构 60s TTL 缓存、
+                # metric_memory 首用懒 rebuild、bge 模型首次 get_embedding_fn 才加载。
+                # 未预热时，启动后第一条问数（尤其走 LLM 路径）会把这 1~3s 摊在用户
+                # 请求上。纯前置加载，不改任何取数/编译/路由逻辑，失败静默不影响启动。
+                try:
+                    _t0 = _t.time()
+                    from agent.llm_service import _all_table_columns
+                    _ncols = len(_all_table_columns() or {})
+                    from agent.metric_memory import get_metric_memory
+                    _r = get_metric_memory().rebuild()
+                    from agent.embeddings import get_embedding_fn, get_embedding_mode
+                    get_embedding_fn()
+                    print(f"[预热] 问数链路就绪：表结构 {_ncols} 表 / 指标向量 {_r.get('rebuilt', 0)} 条 / "
+                          f"embedding={get_embedding_mode()}（{_t.time()-_t0:.1f}s）")
+                except Exception as _e4:
+                    print(f"[预热] 问数链路预热失败（不影响启动）: {_e4}")
             finally:
                 try:
                     _db.close()
@@ -3306,6 +3380,18 @@ def root():
     return {"message": "ok"}
 
 
+def _port_in_use(host: str, port: int, timeout: float = 0.5) -> bool:
+    """探测端口是否已被监听。
+
+    用 connect 而不是 bind：Windows 上 SO_REUSEADDR 语义允许「抢占式绑定」，
+    bind 探测会失效（明明占了也说没占），connect 才是可靠判断。
+    """
+    import socket as _socket
+    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        return s.connect_ex((host, port)) == 0
+
+
 if __name__ == "__main__":
     # 并发说明：默认单进程（workers=1）。本项目支持运行时动态切换数据库
     # （switch_database 修改进程内全局 engine），多 worker 下切库后各进程连接会
@@ -3313,4 +3399,20 @@ if __name__ == "__main__":
     # 场景才通过 WORKERS 环境变量开启多进程（每进程会各自建立数据库连接池）。
     # 单进程内的 LLM 并发上限由 agent/llm_service.py 的 LLM_MAX_CONCURRENCY 控制。
     workers = int(_os.getenv("WORKERS", "1"))
+
+    # 端口占用预检：uvicorn 在 bind 失败时只会打印
+    # "ERROR: [Errno 10048] error while attempting to bind on address ('0.0.0.0', 8010)"
+    # 且此前 startup 事件已经跑完（日志里先出现 "Application startup complete." 再报错），
+    # 很容易被误读成「后端崩了/起不来」——实际上绝大多数情况是上一个实例还在运行。
+    # 这里提前给出可操作的中文提示，避免重复启动时的误判。
+    if _port_in_use("127.0.0.1", 8010):
+        print(
+            "[启动失败] 端口 8010 已被占用：后端多半已经在运行了，无需重复启动。\n"
+            "  1) 确认是否已在服务：  浏览器打开 http://127.0.0.1:8010/  （正常返回 {\"message\":\"ok\"}）\n"
+            "  2) 查看占用进程 PID：  Get-NetTCPConnection -LocalPort 8010 -State Listen | Select-Object OwningProcess\n"
+            "  3) 需要重启时先停旧实例：Stop-Process -Id <上面的PID>\n"
+            "  4) 再启动：           cd backend; .\\.venv\\Scripts\\python.exe main.py"
+        )
+        raise SystemExit(1)
+
     uvicorn.run(app, host="0.0.0.0", port=8010, workers=workers)

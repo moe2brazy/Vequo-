@@ -1,5 +1,7 @@
 <template>
-  <div class="space-y-5">
+  <!-- 根元素显式接管 attrs（defineOptions 里关了自动继承）：attrs 含父级传来的 class="h-full"，
+       显式绑定保证「页面撑满内容区高度」这件事一定落在根元素上，不受其他结构调整影响。 -->
+  <div class="space-y-5" v-bind="$attrs">
     <!-- 头部（page-hero：统一页面 Hero 横幅） -->
     <div class="page-hero flex flex-wrap items-start justify-between gap-3">
       <div>
@@ -63,6 +65,20 @@
             </span>
           </div>
           <p class="text-xs text-gray-500 mt-1.5 min-h-[2rem]">{{ r.description || '暂无描述' }}</p>
+          <!-- 这个身份下有哪些人：名字直接列出来，别只给一个数 -->
+          <div class="flex flex-wrap items-center gap-1 mt-2 text-[11px]">
+            <span style="color:#a9aeb8">成员</span>
+            <template v-if="roleMembers(r.key).length">
+              <span
+                v-for="n in roleMembers(r.key).slice(0, 3)"
+                :key="n"
+                class="px-1.5 py-px rounded"
+                style="background:#f2f3f5;color:#4e5969"
+              >{{ n }}</span>
+              <span v-if="roleMembers(r.key).length > 3" style="color:#a9aeb8">等 {{ roleMembers(r.key).length }} 人</span>
+            </template>
+            <span v-else style="color:#c9cdd4">暂无成员</span>
+          </div>
           <div class="flex flex-wrap gap-1.5 mt-2 text-[10px] text-gray-500">
             <span class="px-1.5 py-0.5 bg-gray-50 border border-gray-100 rounded">表 {{ policyCount(r.key).tables }}</span>
             <span class="px-1.5 py-0.5 bg-gray-50 border border-gray-100 rounded">用户 {{ roleUserCount(r.key) }}</span>
@@ -102,6 +118,16 @@
           <input v-model="newUser.password" type="password" placeholder="初始密码（必填）" class="px-2.5 py-1.5 border rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-200" style="border-color:#c9cdd4" />
           <select v-model="newUser.role" class="px-2.5 py-1.5 border rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-200" style="border-color:#c9cdd4">
             <option v-for="r in allRoles" :key="r.key" :value="r.key">{{ r.name }}</option>
+            <option :value="NEW_ROLE">＋ 新建角色…</option>
+          </select>
+        </div>
+        <!-- 选了「＋ 新建角色…」：就地建角色，不用来回切分区 -->
+        <div v-if="newUser.role === NEW_ROLE" class="grid grid-cols-1 md:grid-cols-3 gap-2.5">
+          <input v-model="newUser.newRoleKey" placeholder="新身份标识（字母数字下划线，如 qc_leader）" class="px-2.5 py-1.5 border rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-200" style="border-color:#c9cdd4" />
+          <input v-model="newUser.newRoleName" placeholder="新身份名称（如 质量主管）" class="px-2.5 py-1.5 border rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-200" style="border-color:#c9cdd4" />
+          <select v-model="newUser.newRoleTemplate" class="px-2.5 py-1.5 border rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-200" style="border-color:#c9cdd4">
+            <option value="">不套用模板（建好后再配权限）</option>
+            <option v-for="tpl in roleTemplates" :key="tpl.key" :value="tpl.key">套用模板：{{ tpl.name }}</option>
           </select>
         </div>
         <div class="flex items-center gap-2">
@@ -1282,79 +1308,87 @@
         </div>
       </div>
     </div>
-  </div>
 
-  <!-- ═══════════ 员工数据授权（per-user 表/字段白名单）═══════════ -->
-  <div v-if="activeTab === 'emp_grants'" class="space-y-4">
-    <div class="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-800 leading-relaxed">
-      <strong><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z" /> <path d="M12 9v4" /> <path d="M12 17h.01" /> </svg></span> 例外场景，常规请用「角色 + 用户属性」。</strong>
-      本页为某位员工单独指定可查看的<strong>表</strong>与<strong>字段</strong>，适用于无法用角色覆盖的少数例外。
-      常规做法：先建角色（可在「角色管理」套用模板）→ 把员工加入角色 → 配用户属性（如 region=华东），行级权限按属性自动过滤。
-      提交后进入审计留痕（敏感变更走审批流）。
-    </div>
-
-    <div class="grid grid-cols-1 lg:grid-cols-[260px_1fr] gap-4">
-      <!-- 左：员工列表 -->
-      <div class="border border-gray-200 rounded-xl p-3">
-        <div class="text-xs font-semibold text-gray-600 mb-2">选择员工</div>
-        <div class="space-y-1 max-h-[60vh] overflow-auto">
-          <button v-for="u in empUsers" :key="u.username"
-            class="w-full text-left px-2.5 py-2 rounded-lg text-sm flex items-center justify-between gap-2"
-            :class="empSelected === u.username ? 'bg-blue-600 text-white' : 'hover:bg-gray-100 text-gray-700'"
-            @click="selectEmp(u.username)">
-            <span class="truncate">
-              <span class="font-medium">{{ u.display_name || u.username }}</span>
-              <span class="text-[11px] opacity-70">@{{ u.username }}</span>
-            </span>
-            <span v-if="empGrantState[u.username]" class="shrink-0 text-[10px] px-1.5 py-0.5 rounded bg-blue-100 text-blue-700">已授权</span>
-          </button>
-          <div v-if="!empUsers.length" class="text-xs text-gray-400 p-2">暂无员工账号</div>
-        </div>
+    <!-- ═══════════ 员工数据授权（per-user 表/字段白名单）═══════════
+         必须留在本根 div 内（不能当第二个根元素）：组件一旦是多根，父级传来的 class="h-full"
+         只会落到第一个根上，而「例外授权」的正文在第二个根里 —— 打开该 tab 时第一个根
+         （只有 Hero + Tab 导航）被拉满整屏高度，正文就被顶到首屏之下，
+         现象就是「上面一大片空白、内容跑到页面很下面」。 -->
+    <div v-if="activeTab === 'emp_grants'" class="space-y-4">
+      <div class="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-800 leading-relaxed">
+        <strong><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z" /> <path d="M12 9v4" /> <path d="M12 17h.01" /> </svg></span> 例外场景，常规请用「角色 + 用户属性」。</strong>
+        本页为某位员工单独指定可查看的<strong>表</strong>与<strong>字段</strong>，适用于无法用角色覆盖的少数例外。
+        常规做法：先建角色（可在「角色管理」套用模板）→ 把员工加入角色 → 配用户属性（如 region=华东），行级权限按属性自动过滤。
+        提交后进入审计留痕（敏感变更走审批流）。
       </div>
 
-      <!-- 右：授权编辑 -->
-      <div class="border border-gray-200 rounded-xl p-3" v-if="empSelected">
-        <div class="flex items-center justify-between mb-3 gap-2 flex-wrap">
-          <div>
-            <div class="text-sm font-semibold text-gray-800">为 {{ empSelectedName }} 配置数据访问</div>
-            <div class="text-[11px] text-gray-400">勾选表 → 勾选字段；支持按表快速全选</div>
-          </div>
-          <div class="flex gap-2">
-            <button class="px-3 py-1.5 text-xs bg-gray-100 hover:bg-gray-200 rounded-lg" @click="empSelectAllTables">全选表</button>
-            <button class="px-3 py-1.5 text-xs bg-blue-600 text-white hover:bg-blue-700 rounded-lg disabled:opacity-40"
-              :disabled="empSaving" @click="saveEmpGrants">{{ empSaving ? '保存中…' : '保存授权' }}</button>
+      <div class="grid grid-cols-1 lg:grid-cols-[260px_1fr] gap-4">
+        <!-- 左：员工列表 -->
+        <div class="border border-gray-200 rounded-xl p-3">
+          <div class="text-xs font-semibold text-gray-600 mb-2">选择员工</div>
+          <div class="space-y-1 max-h-[60vh] overflow-auto">
+            <button v-for="u in empUsers" :key="u.username"
+              class="w-full text-left px-2.5 py-2 rounded-lg text-sm flex items-center justify-between gap-2"
+              :class="empSelected === u.username ? 'bg-blue-600 text-white' : 'hover:bg-gray-100 text-gray-700'"
+              @click="selectEmp(u.username)">
+              <span class="truncate">
+                <span class="font-medium">{{ u.display_name || u.username }}</span>
+                <span class="text-[11px] opacity-70">@{{ u.username }}</span>
+              </span>
+              <span v-if="empGrantState[u.username]" class="shrink-0 text-[10px] px-1.5 py-0.5 rounded bg-blue-100 text-blue-700">已授权</span>
+            </button>
+            <div v-if="!empUsers.length" class="text-xs text-gray-400 p-2">暂无员工账号</div>
           </div>
         </div>
 
-        <div v-if="empLoading" class="text-xs text-gray-400 py-6 text-center">加载中…</div>
-        <div v-else class="space-y-2 max-h-[58vh] overflow-auto pr-1">
-          <div v-for="t in empSchema" :key="t.table_name"
-            class="border border-gray-100 rounded-lg p-2.5 transition"
-            :class="empGrants[t.table_name] ? 'bg-blue-50/50 border-blue-200' : ''">
-            <label class="flex items-center gap-2 cursor-pointer">
-              <input type="checkbox" :checked="!!empGrants[t.table_name]" @change="toggleEmpTable(t)" class="accent-blue-600" />
-              <span class="font-medium text-sm text-gray-800">{{ t.table_name }}</span>
-              <span v-if="t.chinese_name" class="text-[11px] text-gray-400">（{{ t.chinese_name }}）</span>
-              <span class="text-[11px] text-gray-400">· {{ (t.columns || []).length }} 字段</span>
-            </label>
-            <div v-if="empGrants[t.table_name]" class="mt-2 pl-6 flex flex-wrap gap-1.5">
-              <button v-for="c in t.columns" :key="c.name"
-                class="text-[11px] px-2 py-1 rounded-full border transition"
-                :class="empGrants[t.table_name].includes(c.name) ? 'bg-blue-600 border-blue-600 text-white' : 'bg-white border-gray-200 text-gray-500 hover:border-blue-300'"
-                @click="toggleEmpCol(t.table_name, c.name)">{{ c.name }}</button>
+        <!-- 右：授权编辑 -->
+        <div class="border border-gray-200 rounded-xl p-3" v-if="empSelected">
+          <div class="flex items-center justify-between mb-3 gap-2 flex-wrap">
+            <div>
+              <div class="text-sm font-semibold text-gray-800">为 {{ empSelectedName }} 配置数据访问</div>
+              <div class="text-[11px] text-gray-400">勾选表 → 勾选字段；支持按表快速全选</div>
+            </div>
+            <div class="flex gap-2">
+              <button class="px-3 py-1.5 text-xs bg-gray-100 hover:bg-gray-200 rounded-lg" @click="empSelectAllTables">全选表</button>
+              <button class="px-3 py-1.5 text-xs bg-blue-600 text-white hover:bg-blue-700 rounded-lg disabled:opacity-40"
+                :disabled="empSaving" @click="saveEmpGrants">{{ empSaving ? '保存中…' : '保存授权' }}</button>
             </div>
           </div>
-          <div v-if="!empSchema.length" class="text-xs text-gray-400 py-6 text-center">数据库暂无表</div>
+
+          <div v-if="empLoading" class="text-xs text-gray-400 py-6 text-center">加载中…</div>
+          <div v-else class="space-y-2 max-h-[58vh] overflow-auto pr-1">
+            <div v-for="t in empSchema" :key="t.table_name"
+              class="border border-gray-100 rounded-lg p-2.5 transition"
+              :class="empGrants[t.table_name] ? 'bg-blue-50/50 border-blue-200' : ''">
+              <label class="flex items-center gap-2 cursor-pointer">
+                <input type="checkbox" :checked="!!empGrants[t.table_name]" @change="toggleEmpTable(t)" class="accent-blue-600" />
+                <span class="font-medium text-sm text-gray-800">{{ t.table_name }}</span>
+                <span v-if="t.chinese_name" class="text-[11px] text-gray-400">（{{ t.chinese_name }}）</span>
+                <span class="text-[11px] text-gray-400">· {{ (t.columns || []).length }} 字段</span>
+              </label>
+              <div v-if="empGrants[t.table_name]" class="mt-2 pl-6 flex flex-wrap gap-1.5">
+                <button v-for="c in t.columns" :key="c.name"
+                  class="text-[11px] px-2 py-1 rounded-full border transition"
+                  :class="empGrants[t.table_name].includes(c.name) ? 'bg-blue-600 border-blue-600 text-white' : 'bg-white border-gray-200 text-gray-500 hover:border-blue-300'"
+                  @click="toggleEmpCol(t.table_name, c.name)">{{ c.name }}</button>
+              </div>
+            </div>
+            <div v-if="!empSchema.length" class="text-xs text-gray-400 py-6 text-center">数据库暂无表</div>
+          </div>
         </div>
-      </div>
-      <div v-else class="border border-dashed border-gray-200 rounded-xl p-10 text-center text-sm text-gray-400">
-        请从左侧选择一名员工进行授权
+        <div v-else class="border border-dashed border-gray-200 rounded-xl p-10 text-center text-sm text-gray-400">
+          请从左侧选择一名员工进行授权
+        </div>
       </div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
+// 单根组件（例外授权区块已并入根 div）：关闭自动继承，改由根元素显式 v-bind="$attrs"，
+// 避免父级 class 与应用内其他 attrs 被重复绑定。
+defineOptions({ inheritAttrs: false })
+
 import { ref, reactive, computed, onMounted, nextTick } from 'vue'
 import { isAdmin } from '../auth'
 
@@ -1504,7 +1538,14 @@ const users = ref<any[]>([])
  * 这里补上建号入口，角色直接用 model.roles，一次建对。
  */
 const showNewUser = ref(false)
-const newUser = reactive({ username: '', password: '', display_name: '', role: '', saving: false, msg: '', ok: false })
+const newUser = reactive({
+  username: '', password: '', display_name: '', role: '', saving: false, msg: '', ok: false,
+  // 身份下拉选「＋ 新建角色…」时就地建角色用。此前角色不在下拉里，管理员只能先切到
+  // 「角色」区建好、再回「成员」区建人，两个分区来回切；这里把两步收进同一个表单。
+  newRoleKey: '', newRoleName: '', newRoleTemplate: '',
+})
+/** 身份下拉里「新建角色」的哨兵值（不会是真实角色 key） */
+const NEW_ROLE = '__new_role__'
 
 /**
  * 账号维护弹窗（编辑资料 / 重置密码）。
@@ -1693,7 +1734,12 @@ function openWizard() {
   wizardStep.value = 1
   wizardTargetMode.value = 'role'
   wizardUsers.value = []
-  wizardRole.value = (wizardTargets.value[0] as any)?.key || ''
+  // 默认身份不能落在「普通员工 viewer」上：它是兜底身份（不挑人的只读账号），
+  // 排在非超管身份第一位。管理员想建的多半是岗位身份，默认给了 viewer，
+  // 新人就挂在最宽的身份下，回头到对应岗位身份里根本看不到他。
+  // 所以优先取一个真实岗位身份，实在没有才退回第一个。
+  const _pool = wizardTargets.value.filter((r: any) => r.key !== 'viewer')
+  wizardRole.value = ((_pool[0] || wizardTargets.value[0]) as any)?.key || ''
   wizardDatasets.value = []
   wizardTemplates.value = []
   newEmp.open = false
@@ -1956,20 +2002,49 @@ async function createMember() {
     newUser.ok = false; newUser.msg = '请选择身份'; return
   }
   newUser.saving = true
+  // 身份下拉选了「＋ 新建角色…」：先把角色建出来，再拿它的 key 建账号。
+  // 顺序不能反——后端 /api/auth/users 会校验角色是否存在（不存在报 400「角色不存在」）。
+  let role = newUser.role
+  let roleLabel = ''
   try {
+    if (role === NEW_ROLE) {
+      const key = newUser.newRoleKey.trim()
+      const name = newUser.newRoleName.trim()
+      if (!key || !name) {
+        newUser.ok = false; newUser.msg = '新身份的标识和名称都要填'; newUser.saving = false; return
+      }
+      if (!/^[A-Za-z0-9_]+$/.test(key)) {
+        newUser.ok = false; newUser.msg = '身份标识只能用字母、数字、下划线'; newUser.saving = false; return
+      }
+      if (newUser.newRoleTemplate) {
+        // 套模板：后端一次落地（建角色 + 套策略），名称由模板提供
+        await api('/api/permission/templates/apply', {
+          method: 'POST', body: JSON.stringify({ role: key, template: newUser.newRoleTemplate }),
+        })
+      } else {
+        await api('/api/permission/roles', {
+          method: 'POST', body: JSON.stringify({ key, name, description: '', priority: 30 }),
+        })
+      }
+      role = key
+      roleLabel = name
+    }
     await api('/api/auth/users', {
       method: 'POST',
       body: JSON.stringify({
         username,
         password: newUser.password,
         display_name: (newUser.display_name || '').trim() || username,
-        role: newUser.role,
+        role,
       }),
     })
     newUser.ok = true
-    newUser.msg = `已创建「${username}」，身份为「${roleName(newUser.role)}」`
+    newUser.msg = `已创建「${username}」，身份为「${roleLabel || roleName(role)}」`
     newUser.username = ''; newUser.password = ''; newUser.display_name = ''
+    newUser.newRoleKey = ''; newUser.newRoleName = ''; newUser.newRoleTemplate = ''
     await loadAll()
+    // 身份下拉回落到刚建好的角色，避免停留在「＋ 新建角色…」、内联行还张着
+    newUser.role = role
     setTimeout(() => { showNewUser.value = false; newUser.msg = '' }, 1500)
   } catch (e: any) {
     newUser.ok = false
@@ -1981,6 +2056,7 @@ async function createMember() {
 /** 打开新建成员表单：默认身份取第一个非管理员角色，避免手滑建成管理员 */
 function openNewUser() {
   newUser.username = ''; newUser.password = ''; newUser.display_name = ''
+  newUser.newRoleKey = ''; newUser.newRoleName = ''; newUser.newRoleTemplate = ''
   newUser.msg = ''; newUser.ok = false
   const first = (model.roles || []).find((r: any) => r.key !== 'admin')
   newUser.role = first?.key || ''
@@ -2127,8 +2203,18 @@ const policyCount = (roleKey: string) => {
     mets: Object.keys(p.metrics || {}).length,
   }
 }
+// 注意写法：`u.roles || [u.role]` 在 roles 是**空数组**时会漏掉 u.role（[] 是 truthy），
+// 于是该成员不计入任何角色。这里把两个来源都摊平再判，避免这类「人建了却数不到」。
 const roleUserCount = (roleKey: string) =>
-  (users.value || []).filter((u: any) => (u.roles || [u.role]).includes(roleKey)).length
+  (users.value || [])
+    .filter((u: any) => [...((u.roles || []).length ? u.roles : []), u.role].includes(roleKey))
+    .length
+// 角色卡上要能看见「这个身份下到底有谁」。只给一个数字时，管理员建完人
+// 跑到别的身份下面找，找不到就以为建失败了 —— 名字摆出来才有对照。
+const roleMembers = (roleKey: string) =>
+  (users.value || [])
+    .filter((u: any) => [...((u.roles || []).length ? u.roles : []), u.role].includes(roleKey))
+    .map((u: any) => u.display_name || u.username)
 // 成员「能看什么」摘要：合并其所有角色的数据域，用大白话呈现；有例外授权则例外优先
 const userScope = (u: any) => {
   if (u.has_grants && (u.grant_tables || []).length) {
@@ -2372,14 +2458,25 @@ async function toggleUserRole(u: any, roleKey: string) {
   u.roles = roles
 }
 async function saveUser(u: any) {
+  // pending 是「待授权」哨兵（自助注册账号的初始值），不是真实角色：后端只接受
+  // auth_permissions.json 里注册过的角色 key，把它原样回传会让新注册账号保存时
+  // 报「角色不存在：pending」。这里统一剔除后再提交。
+  const realRoles = (u.roles || []).filter((r: string) => r && r !== 'pending')
+  if (!realRoles.length && !u.unassigned) {
+    if (!window.confirm(`未勾选任何角色，「${u.display_name || u.username}」保存后将回到「待授权」状态（看不到任何数据）。确定继续吗？`)) return
+  }
   try {
     const attrsRaw = attrsDraft[u.username]
     let attrs = u.attributes || {}
     if (attrsRaw !== undefined) {
       try { attrs = JSON.parse(attrsRaw || '{}') } catch { return toast('属性 JSON 格式错误', false) }
     }
-    await api('/api/permission/users/roles', { method: 'POST', body: JSON.stringify({ username: u.username, roles: u.roles || [] }) })
+    await api('/api/permission/users/roles', { method: 'POST', body: JSON.stringify({ username: u.username, roles: realRoles }) })
     await api('/api/permission/users/attributes', { method: 'POST', body: JSON.stringify({ username: u.username, attributes: attrs }) })
+    // 本地同步：roles 只保留真实角色（无真实角色时回落 pending 哨兵），状态列据此显示「待授权」
+    u.roles = realRoles.length ? realRoles : ['pending']
+    u.role = realRoles.includes('admin') ? 'admin' : (realRoles[0] || 'pending')
+    u.unassigned = realRoles.length === 0
     u.attributes = attrs
     toast(`用户「${u.username}」已保存`)
   } catch (e: any) { toast(e.message, false) }

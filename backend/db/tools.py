@@ -1,11 +1,24 @@
 """数据库工具 — 元数据查询 & 关键词匹配表 & 动态扫表"""
 
 import os
+import re
 import time
 import threading
 
 from .metadata import TABLES, find_table_by_name, search_tables
 from database import get_db_type
+
+# ── 标识符白名单 ────────────────────────────────────────
+# 下面几处 information_schema 查询是把 schema/表名拼进 SQL 的（execute_sql 只接收 SQL 文本、
+# 不支持参数绑定），所以表名、schema 必须在拼串之前过一遍严格白名单。
+# 原实现是 `name.replace("_", "").isalnum()`：该判断对 Unicode 字母（中文、全角字符）同样返回 True，
+# 校验的是「字符类别」而不是「标识符」，语义偏软——一旦将来放宽成允许 '.'、'-' 就直接成为注入点。
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _is_safe_ident(name: str | None) -> bool:
+    """标识符是否安全（ASCII 字母/数字/下划线，且不以数字开头）。"""
+    return bool(name) and bool(_IDENT_RE.match(name))
 
 # ── 表列表 TTL 缓存 ─────────────────────────────────────
 # get_real_tables 在问析主链路里被反复调用（每请求至少 1 次），每次都查
@@ -169,10 +182,10 @@ def _get_real_fields(table_name: str) -> list[dict] | None:
     try:
         from .executor import execute_sql
         schema, table = _split_table_ref(table_name)
-        # 仅允许安全的表名/schema（字母数字下划线），杜绝注入
-        if not table.replace("_", "").isalnum():
+        # 仅允许安全的表名/schema（ASCII 字母数字下划线），杜绝注入
+        if not _is_safe_ident(table):
             return None
-        if schema and not schema.replace("_", "").isalnum():
+        if schema and not _is_safe_ident(schema):
             return None
         if get_db_type() == "mysql":
             result = execute_sql(
@@ -293,7 +306,9 @@ def get_dynamic_table_detail(table_name: str) -> dict | None:
     # 标识符白名单校验：table_name 可能来自 LLM/外部输入，含单引号会污染下方 information_schema 查询；
     # 拆出 schema/table 后各自校验，与 _get_real_fields 同口径（防 SQL 注入）。
     schema, tbl = _split_table_ref(table_name or "")
-    if not tbl.replace("_", "").isalnum() or (schema != "public" and not schema.replace("_", "").isalnum()):
+    if not _is_safe_ident(tbl):
+        return None
+    if schema and schema != "public" and not _is_safe_ident(schema):
         return None
     try:
         from .executor import execute_sql

@@ -10,8 +10,8 @@
   "eqp_downtime_record": 3,
   "dim_equipment": 4,
   "qms_defect_detail": 6,
-  "dim_process": 1,
+  "dim_process": 2,
   "dim_production_line": 2,
   "mes_process_output": 3,
-  "dim_product": 1
+  "dim_product": 2
 }

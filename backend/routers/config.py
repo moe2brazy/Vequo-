@@ -26,7 +26,9 @@ class DBConfigRequest(BaseModel):
     port: int = 5432
     name: str = "postgres"
     user: str = "postgres"
-    password: str = "root"
+    # 不留硬编码默认口令（原先默认 "root"）：客户端没传就是空串，
+    # 让连接按真实配置失败，而不是悄悄拿一个猜测的弱口令去连库。
+    password: str = ""
     test_connection: bool = True
 
 

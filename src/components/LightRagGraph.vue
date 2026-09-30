@@ -36,6 +36,12 @@ const emit = defineEmits<{ (e: 'node-click', id: string): void }>()
 const containerRef = ref<HTMLDivElement | null>(null)
 const error = ref('')
 let network: any = null
+// 卸载/重入守卫：draw() 里有两处 await（fetch + 动态 import），等待期间组件完全可能被卸载。
+// 卸载时 onBeforeUnmount 只能销毁「当时已存在」的实例（此刻还是 null），
+// await 结束后若继续 new Network，就会造出一个永远不会被 destroy 的孤儿实例——
+// canvas、事件绑定、barnesHut 物理模拟循环全部常驻内存，进出该页几次就累积几个。
+let disposed = false
+let abortCtrl: AbortController | null = null
 
 // 与 knowledge_graph.html 中完全一致的 vis-network options
 const buildOptions = () => ({
@@ -65,34 +71,53 @@ const buildOptions = () => ({
 
 const draw = async () => {
   if (!containerRef.value) return
+  // 取消上一次仍在途的加载（组件重建 / 手动重绘时）
+  abortCtrl?.abort()
+  const ac = new AbortController()
+  abortCtrl = ac
   try {
-    const res = await fetch(props.src)
+    const res = await fetch(props.src, { signal: ac.signal })
     if (!res.ok) throw new Error(`加载 ${props.src} 失败（HTTP ${res.status}）`)
     const data = await res.json()
     const rawNodes: any[] = data.nodes || []
     const rawEdges: any[] = data.edges || []
     if (!rawNodes.length) throw new Error('图谱数据为空')
 
+    // 【守卫】两处 await 之后、动手建图之前：卸载了 / 本次加载已被更新的加载取代 / 容器没了，
+    // 三种情况都直接放弃，绝不在失效容器上创建 Network。
+    if (disposed || ac !== abortCtrl || !containerRef.value) return
+
     // 动态加载 vis-network（与 KnowledgeGraph.vue 相同的方式，避免主包体积膨胀）
     const { Network } = await import('vis-network')
     const { DataSet } = await import('vis-data')
+
+    if (disposed || ac !== abortCtrl || !containerRef.value) return
 
     // 直接使用 LightRAG 导出的原始字段（color/label/title/shape/size/width），
     // 保证与 knowledge_graph.html 的渲染效果完全一致
     const nodes = new DataSet(rawNodes)
     const edges = new DataSet(rawEdges)
 
-    network = new Network(containerRef.value, { nodes, edges } as any, buildOptions() as any)
+    const inst = new Network(containerRef.value, { nodes, edges } as any, buildOptions() as any)
+    // 极端情况：import 完成后才被卸载 → 立刻销毁刚建好的实例，不留孤儿
+    if (disposed) {
+      try { inst.destroy() } catch { /* ignore */ }
+      return
+    }
+    network = inst
 
     network.on('click', (params: any) => {
+      if (disposed) return
       if (params.nodes && params.nodes.length > 0) emit('node-click', String(params.nodes[0]))
     })
 
     // 物理布局稳定后统一「适配 + 放大」（stabilization.fit 已关闭，这里就是初始视图的唯一入口）
     network.once('stabilizationIterationsDone', () => {
+      if (disposed) return
       applyFit({ duration: 500, easingFunction: 'easeOutQuad' })
     })
   } catch (e: any) {
+    if (e?.name === 'AbortError' || disposed) return
     error.value = e?.message || '知识图谱加载失败'
     console.error('[LightRagGraph] 加载失败:', e)
   }
@@ -156,6 +181,9 @@ defineExpose({ fitView, relayout, downloadPng })
 
 onMounted(draw)
 onBeforeUnmount(() => {
+  disposed = true
+  try { abortCtrl?.abort() } catch { /* ignore */ }
+  abortCtrl = null
   try { network?.destroy() } catch { /* ignore */ }
   network = null
 })

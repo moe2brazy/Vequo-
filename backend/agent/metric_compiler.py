@@ -52,6 +52,14 @@ _FACT_META = {
     "qms_inspection": {
         "time_col": "inspection_date",
         "dims": {
+            # via = 桥接表（两跳 join）：抽检表没有 line_id，需经 mes_work_order 才能到产线。
+            # 实测 1376 行全部 join 上、零 NULL、零丢失（多对一，不会放大行数）。
+            "产线": {"fact_col": "work_order_id",
+                    "via": ("mes_work_order", "work_order_id", "line_id"),
+                    "join": ("dim_production_line", "line_id", "line_name")},
+            "车间": {"fact_col": "work_order_id",
+                    "via": ("mes_work_order", "work_order_id", "line_id"),
+                    "join": ("dim_production_line", "line_id", ["workshop_name", "workshop"])},
             "产品": {"fact_col": "product_id", "join": ("dim_product", "product_id", "product_name")},
             "工序": {"fact_col": "process_id", "join": ("dim_process", "process_id", "process_name")},
             "结果": {"fact_col": ["inspection_result", "result"], "join": None},
@@ -289,7 +297,75 @@ def _resolve_dim_def(fact: str, dim_def: dict) -> dict:
     if dd.get("join"):
         dt, dk, disp = dd["join"]
         dd["join"] = (dt, dk, _resolve_col(dt, disp))
+    if dd.get("via"):
+        vt, von, vkey = dd["via"]
+        # 桥接列的候选解析在**桥接表**上做（不是事实表）
+        dd["via"] = (vt, _resolve_col(vt, von), _resolve_col(vt, vkey))
     return dd
+
+
+def dimension_mismatch_hint(query: str) -> str | None:
+    """问句点名了系统里注册过的分组维度 X，但命中指标所在的事实表**根本不支持** X
+    （既没有对应外键列，也没配 via 桥接）→ 返回一句给用户核对的提示。
+
+    用途：这类题会被编译链守卫放行给 LLM，而 LLM 实测会编出答非所问的分组
+    （「各产线库存量」→ `GROUP BY snapshot_id`；库存表压根不关联产线）。
+    提示里带上该数据**实际支持的维度**，让用户有可核对的东西。
+    """
+    try:
+        from agent.metric_registry import find_metrics
+        hits = find_metrics(query) or []
+    except Exception:
+        return None
+    facts: list[str] = []
+    for h in hits:
+        for t in (h.get("tables") or []):
+            if t in _FACT_META and t not in facts:
+                facts.append(t)
+    if not facts:
+        return None
+    all_dims: set[str] = set()
+    for _m in _FACT_META.values():
+        all_dims.update((_m.get("dims") or {}).keys())
+    x = None
+    for dn in sorted(all_dims, key=len, reverse=True):
+        if re.search(rf"(?:各|按|每个|每|分|哪些|哪个){re.escape(dn)}", query):
+            x = dn
+            break
+    if not x:
+        return None
+    supported: list[str] = []
+    for fact in facts:
+        cols = _table_cols(fact)
+        for dn, dd in (_FACT_META[fact].get("dims") or {}).items():
+            if dd.get("via"):
+                supported.append(dn)
+                continue
+            fc = dd.get("fact_col")
+            cands = fc if isinstance(fc, list) else [fc]
+            if not cols or any(c in cols for c in cands):
+                supported.append(dn)
+        if x in supported:
+            return None   # 该表支持这个维度，编译失败是别的原因，不是维度不通
+    seen = list(dict.fromkeys(supported))[:4]
+    tail = f"（这份数据可按 {'、'.join(seen)} 分组）" if seen else "（这份数据没有可直接关联的分组字段）"
+    return f"问句里的「{x}」在这份数据里没有对应的分组依据{tail}，下面的分组由 AI 推断，请核对。"
+
+
+def _dim_join_clause(dim_def: dict, alias: str) -> tuple[str, str]:
+    """维度 join 子句 + 与维表 key 比较的列表达式。
+
+    普通维度（一跳）：("", "f.<fact_col>")。
+    via 维度（两跳）：(" JOIN <桥接表> <alias>v ON f.<fact_col> = <alias>v.<on列>",
+                      "<alias>v.<外键列>")
+    —— 事实表没有该维度外键时（如 qms_inspection 无 line_id）经桥接表过渡。
+    """
+    via = dim_def.get("via")
+    if via:
+        vt, von, vkey = via
+        return (f" JOIN {vt} {alias}v ON f.{dim_def['fact_col']} = {alias}v.{von}",
+                f"{alias}v.{vkey}")
+    return "", f"f.{dim_def['fact_col']}"
 
 
 # 派生视图（向后兼容旧调用方）
@@ -365,6 +441,17 @@ def _detect_dim(query: str, fact_table: str) -> list[str]:
         _cands = _fc if isinstance(_fc, list) else [_fc]
         if tcols and not any(c in tcols for c in _cands):
             continue
+        # via 维度额外保护：事实表列存在还不够，桥接表及其两个列都必须真实存在。
+        # via 的三元组约定为 str（不做候选列解析），否则跳过该维度回退 LLM ——
+        # 宁可不编，也不能生成连不上的 JOIN。
+        _via = _dd.get("via")
+        if _via and isinstance(_via, (tuple, list)) and len(_via) == 3:
+            _vt, _von, _vkey = _via
+            if not (isinstance(_von, str) and isinstance(_vkey, str)):
+                continue
+            _vcols = _table_cols(_vt)
+            if _vcols and (_von not in _vcols or _vkey not in _vcols):
+                continue
         # 「整个X/全部X/全X/总的X」= 范围限定（总量），非分组维度（P0-4 注册车间维度后暴露的回归；
         # 「总的工序数」→ 总量单值，不能 GROUP BY 工序）
         if re.search(rf"整个{cn}|全部{cn}|全{cn}|总的{cn}", query):
@@ -379,7 +466,7 @@ def _detect_dim(query: str, fact_table: str) -> list[str]:
             rf"|前\s*\d+\s*(?:个|条|名|张|批|道|台|种|家|项|位|次)?\s*{cn}"
         )
         if re.search(rf"各{cn}|按{cn}|每个{cn}|每{cn}|分{cn}|TOP\s*\d+\s*{cn}|{_rank_pat}|的{cn}(?!(?:总库存|库存|库存量|总量))|{cn}的|{cn}最高|{cn}最低|最高的{cn}|最低的{cn}|最多的{cn}|最少的{cn}|最大的{cn}|最小的{cn}|{cn}分析|{cn}分布|{cn}排行|{cn}排名"
-                     rf"|哪台{cn}|哪些{cn}|哪个{cn}|几台{cn}|哪条{cn}|哪几个{cn}|这几个{cn}|这些{cn}|{cn}分别|分别{cn}", query, re.IGNORECASE):
+                     rf"|哪[个台条道张批家座间种类位名次笔项]{cn}|[一这那某几\d]+[个台条道张批家座间种类位名次笔项]{cn}|哪些{cn}|几台{cn}|哪几个{cn}|这几个{cn}|这些{cn}|{cn}分别|分别{cn}", query, re.IGNORECASE):
             found.append(cn)
     return found
 
@@ -450,7 +537,208 @@ def _drill_value(query: str) -> str | None:
     if re.search(r"看看|帮我|给我|查一下|麻烦|请问|我想知道|有没有|统计|分析|汇总|查看|看看|浏览|对比|比较"
                  r"|计算|算一算|跑一下|梳理|拆解|研究|评估|解读|输出|列出|展示|显示|给我|我们|所有|全部|目前|现在|一下", val):
         return None
+    # ── 2026-09-28 加：值必须真实存在于某张维表（确定性校验 + 长短语否决）──
+    # 病根示例（实测）：「传感器这个产品类别下各产线的产量」被切成
+    # val='传感器这个产品类别下' → 生成 `WHERE d.workshop_name = '传感器这个产品类别下'`
+    # → SQL 跑通、0 行、静默返回（用户看到「没数据」，比报错更难排查）。
+    # 「一车间各产线的产量」的 val='一车间' 之所以对，是因为它**恰是真实取值**；
+    # 而 '传感器这个产品类别下' 在任何维表列里都不存在 —— 这条件本身就能把两类分开。
+    # 数据来源：llm_service 已维护的「枚举值 → 表.列」倒排索引（按库落盘缓存 1h），
+    # 零额外 DB 成本；索引不可用时**退回原行为**（只做长度否决），不改变既有语义。
+    # 长短语（>8 字）几乎必然是"用户自己的说法"而非列取值（真实枚举值都很短：
+    # 一车间/传感器/L04/设备故障），先按长度否决，省一次索引查询。
+    if len(val) > 8:
+        return None
+    if not _drill_value_exists(val):
+        return None
     return val[:14]
+
+
+def _explicit_value_filters(query: str, fact: str) -> list[str]:
+    """问句里**点名**了维表枚举值 → 返回 EXISTS 形式的 WHERE 子句（可为空列表）。
+
+    场景与边界（2026-09-28 新增，配套 _drill_value 的真实值校验）：
+      「传感器这个产品类别下各产线的产量」
+        → 传感器 是 dim_product.product_category 的真实取值 → 加
+          EXISTS (SELECT 1 FROM dim_product p WHERE p.product_id = f.product_id
+                  AND p.product_category = '传感器')
+      「一车间各产线的良率」
+        → **不生成**：一车间是层级父级值，由 _drill_value 的下钻通道处理
+          （两条通道都开会产生重复条件）。
+
+    规则（全部确定性，不引入任何猜测）：
+      ① 值必须**逐字**出现在库内某低基数文本列（来自倒排索引）；
+      ② 该值所在的列必须能被本次事实表 JOIN 到（同名 `X_id` 关联）——否则宁可
+         不加（例如值在另一张无关表里）；
+      ③ 该列不能是**本次分组的维度列**（那是分组语义，不是过滤语义）；
+      ④ 该列不能是时间列；
+      ⑤ 层级父级值交给 _drill_value，本函数跳过（见上）。
+    """
+    out: list[str] = []
+    q = str(query or "")
+    if not q or not fact:
+        return out
+    try:
+        from agent.llm_service import (_literal_table_index, _all_table_columns,
+                                       _safe_ident)
+    except Exception:
+        return out
+    try:
+        idx = _literal_table_index() or {}
+    except Exception:
+        return out
+    if not idx:
+        return out
+    try:
+        cm = _all_table_columns() or {}
+    except Exception:
+        cm = {}
+    # 事实表的列（用于确认 JOIN 键存在）
+    fact_cols: set[str] = set()
+    for k, v in (cm or {}).items():
+        if str(k).split(".")[-1].lower() == fact:
+            fact_cols = {str(c).lower() for c in (v or [])}
+            break
+    if not fact_cols:
+        return out
+    meta = _FACT_META.get(fact, {})
+    # 本次问题命中/可能分组的维度列名（这些列是分组语义，不当过滤用）
+    dim_cols: set[str] = set()
+    for _lb, _cfg in (meta.get("dims") or {}).items():
+        if isinstance(_cfg, dict):
+            jo = _cfg.get("join")
+            if jo:
+                dim_cols.add(str(jo[0]).lower())
+            if _cfg.get("fact_col"):
+                dim_cols.add(str(_cfg["fact_col"]).lower())
+    time_col = str(meta.get("time_col") or "").lower()
+    seen_vals: set[str] = set()
+    # 本次问句里是否**显式出现分组信号**（各/每/分别/按…）。
+    # 用于区分「值过滤」与「值分组」：同一列同一取值，两种语义的产物完全不同 ——
+    #   「贴片机设备一共有多少台」→ WHERE equipment_type='贴片机'（过滤，答案 6）
+    #   「各设备类型的设备数」   → GROUP BY equipment_type（分组，答案 8 行 ×6）
+    # 判据取「该取值在问句中出现的**上下文**」：若紧邻其左侧是分组词（各/每/按/分别），
+    # 则该取值属分组语义，不做值过滤；否则视为点名过滤。
+    # 2026-09-29 新增：此前无条件跳过 dim_cols 导致「贴片机设备一共有多少台」编译成
+    # `COUNT(*) FROM dim_equipment`（48 台，真值 6 台）——高置信度错答。
+    _GROUP_SIG = ("各", "每", "按", "分别", "每个", "所有", "全部", "各个")
+
+    def _is_group_context(val: str) -> bool:
+        _i = q.find(val)
+        if _i < 0:
+            return False
+        _left = q[max(0, _i - 2):_i]
+        return any(_left.endswith(_g) for _g in _GROUP_SIG)
+
+    for val, ents in sorted(idx.items(), key=lambda x: -len(str(x[0]))):
+        if len(val) < 2 or val in seen_vals:
+            continue
+        if val not in q:
+            continue
+        for ent in (ents or []):
+            try:
+                tab, col = str(ent[0]).lower(), str(ent[1]).lower()
+            except Exception:
+                continue
+            # ③④ 维度列 / 时间列不做值过滤（但见上方说明：处于非分组上下文时例外）
+            if col in dim_cols and tab == fact and _is_group_context(val):
+                continue
+            if col == time_col:
+                continue
+            # ② 事实表要能 JOIN 到该表：同名 X_id（表名去掉 dim_ 前缀后 + _id）
+            if tab == fact:
+                # 同表列：直接等值
+                if col in fact_cols and _safe_ident(col):
+                    cond = f"f.{col} = '{_esc_sql_literal(val)}'"
+                    if cond not in out:
+                        out.append(cond)
+                        seen_vals.add(val)
+                break
+            base = tab[4:] if tab.startswith("dim_") else tab
+            jkey = f"{base}_id"
+            if jkey in fact_cols and _safe_ident(col) and _safe_ident(tab) and _safe_ident(jkey):
+                cond = (f"EXISTS (SELECT 1 FROM {tab} _v WHERE _v.{jkey} = f.{jkey} "
+                        f"AND _v.{col} = '{_esc_sql_literal(val)}')")
+                if cond not in out:
+                    out.append(cond)
+                    seen_vals.add(val)
+            break
+        if len(out) >= 2:   # 最多两个点名值，避免 prompt/SQL 膨胀
+            break
+    return out
+
+
+def _esc_sql_literal(v: str) -> str:
+    """SQL 字符串字面量转义（单引号翻倍）。值来自库内真实枚举，此处只做防御。"""
+    return str(v or "").replace("'", "''")
+
+
+def _drill_value_exists(val: str) -> bool:
+    """val 是否是「库内某张表某个低基数文本列」的真实取值（倒排索引判定）。
+
+    索引不可用/为空时返回 True（放宽，保持旧行为）——这道校验只做**否决**，
+    绝不引入新的下钻值，因此放宽不会产生新的错误过滤，只会退回旧表现。
+    """
+    if not val:
+        return False
+    try:
+        from agent.llm_service import _literal_table_index
+        idx = _literal_table_index() or {}
+    except Exception:
+        return True
+    if not idx:
+        return True
+    try:
+        return val in idx
+    except Exception:
+        return True
+
+
+def _drill_value_belongs(val: str, meta: dict, parent_level: str) -> bool:
+    """val 是否**属于父级维度那一列**的真实取值（比 _drill_value_exists 更严）。
+
+    父级维度的候选列 = 该维度注册的展示列（含 JOIN 目标表的列）。
+    例：「产线」的父级是「车间」，其展示列为 dim_production_line.workshop_name，
+    取值 {一车间/二车间/三车间}；`设备故障` 不在此集合内 → 拒绝下钻。
+
+    取不到注册信息时返回 True（放宽）；索引不可用时同样放宽。
+    """
+    if not val:
+        return False
+    try:
+        cfg = (meta.get("dims") or {}).get(parent_level) or {}
+        if not isinstance(cfg, dict):
+            return True
+        cols: list[str] = []
+        join = cfg.get("join")
+        if join and len(join) >= 3:
+            disp = join[2]
+            if isinstance(disp, str):
+                cols.append(disp)
+            elif isinstance(disp, (list, tuple)):
+                cols.extend([str(x) for x in disp if x])
+        elif cfg.get("fact_col"):
+            cols.append(str(cfg["fact_col"]))
+        if not cols:
+            return True
+        try:
+            from agent.llm_service import _literal_table_index
+            idx = _literal_table_index() or {}
+        except Exception:
+            return True
+        if not idx:
+            return True
+        ents = idx.get(val) or []
+        for _ent in ents:
+            try:
+                col = str(_ent[1])
+            except Exception:
+                continue
+            if col in cols:
+                return True
+        return False
+    except Exception:
+        return True
 
 
 def _auto_rank_dim(query: str, meta: dict, time_col: str | None) -> str | None:
@@ -497,7 +785,13 @@ def _resolve_drill(query: str, metric: dict, fact: str, dims: list[str]) -> tupl
         # 值过滤下钻：命中子级且问句带父级值 → 该值限定在父级展示列（WHERE d.parent_col = 值）
         if idx > 0:
             val = _drill_value(query)
-            if val:
+            # 2026-09-28 加：值必须属于**本层级父级维度**那一列的真实取值。
+            # 只校验"值存在"不够——「设备故障各产线的停机时长」里 `设备故障` 是
+            # eqp_downtime_record.downtime_reason 的真实取值，但它不是"产线"的父级
+            # （产线的父级是车间），若放行会生成把停机原因当车间用的错误过滤。
+            # 这里按父级维度的注册列（含 JOIN 展示列）做精确匹配，两张都不匹配就放弃下钻，
+            # 退回普通聚合（宁可少做一层下钻，不可生成语义错误的 WHERE）。
+            if val and _drill_value_belongs(val, meta, hierarchy[idx - 1]):
                 return dim, {"filter_value": val, "parent_level": hierarchy[idx - 1]}
         # 下钻词：切到下一级（「各产线的产量，下钻到设备」等）
         if _DRILL_DOWN_RE.search(query) and idx + 1 < len(hierarchy):
@@ -529,8 +823,14 @@ def _build_time_filter(fact_table: str, fact_col: str, query: str) -> str | None
 
     锚点语义区分：
     - 相对区间（近N天/近N个月）：锚点用 `MAX(事实列)`，静态/滞后数据集下仍能命中数据；
-    - 绝对日历周期（本月/今年/上月/去年/本季度）：锚点用 `CURRENT_DATE`，符合「本月=当前日历月」
-      的语义（滞后数据下"本月"无数据即返回 0/NULL，与评测口径一致）。
+    - 绝对日历周期（今年/去年/本季度/上季度）：锚点用 `CURRENT_DATE`，符合日历语义；
+    - **月级**日历周期（本月/上月）：锚点同样用 `MAX(事实列)`，不再用 `CURRENT_DATE`。
+
+    2026-09-29 规则审计实测（34 条真实 SQL 回放）：`CURRENT_DATE` 锚点在滞后数据集上
+    恒为空——库内数据最新到 2026-07-15、今天是 09-29，「本月」「上月」条件必然 0 行，
+    此前只能等 LLM 链路下游的改写规则事后救（实测救回 2 次）。
+    移到编译期做：同一问句永远同一条 SQL，不必靠改写链反推事实表与时间列。
+    口径变化（"本月"实际查的是最新有数据的那个月）由 llm_service 补发说明。
     """
     anchor = f"(SELECT MAX({fact_col}) FROM {fact_table})"
     # 绝对年份/月份「2026年」「2026年6月」（字面日期区间，静态历史库仍命中）
@@ -567,9 +867,10 @@ def _build_time_filter(fact_table: str, fact_col: str, query: str) -> str | None
     if m:
         return f"{fact_col} >= {anchor} - INTERVAL '{m.group(1)} months'"
     if "上月" in query or "上个月" in query:
-        return f"{fact_col} >= date_trunc('month', CURRENT_DATE) - INTERVAL '1 month' AND {fact_col} < date_trunc('month', CURRENT_DATE)"
+        return (f"{fact_col} >= date_trunc('month', {anchor}) - INTERVAL '1 month' "
+                f"AND {fact_col} < date_trunc('month', {anchor})")
     if "本月" in query or "这个月" in query:
-        return f"{fact_col} >= date_trunc('month', CURRENT_DATE)"
+        return f"{fact_col} >= date_trunc('month', {anchor})"
     if "本季度" in query or "本季" in query or "季初至今" in query or "本季至今" in query:
         return f"{fact_col} >= date_trunc('quarter', CURRENT_DATE)"   # QTD：本季度至今
     if "上季度" in query or "上季" in query:
@@ -646,7 +947,9 @@ def compile_cumulative(query: str) -> dict | None:
         where = f"{time_col} >= date_trunc('quarter', CURRENT_DATE)"
         fmt, window, period_label = "YYYY-MM", "本季至今(QTD)", "月份"
     elif _CUMULATIVE_MTD_RE.search(query):
-        where = f"{time_col} >= date_trunc('month', CURRENT_DATE)"
+        # 与 `_build_time_filter` 的「本月」保持一致：锚到库内最新数据月，
+        # 否则滞后数据集下 MTD 恒为 0 行（YTD/QTD 仍用日历锚点，语义是"今年/本季"）。
+        where = f"{time_col} >= date_trunc('month', {anchor})"
         fmt, window, period_label = "YYYY-MM-DD", "本月至今(MTD)", "日期"
     else:
         return None
@@ -797,6 +1100,9 @@ def compile_window_rank(query: str) -> dict | None:
         ddef = _dim_def(dim)
         if not ddef:
             return None
+        # via（两跳 join）维度：硬编码一跳 JOIN 会拼错 → 拒编回退 LLM（与 compile_period_* 一致）。
+        if ddef.get("via"):
+            return None
         rank = f"RANK() OVER (ORDER BY {expr} {_dir()})"
         if ddef.get("join"):
             dt, dk, ddisp = ddef["join"]
@@ -841,6 +1147,9 @@ def compile_window_rank(query: str) -> dict | None:
         return None
     odef, idef = _dim_def(outer), _dim_def(inner)
     if not odef or not idef:
+        return None
+    # via（两跳 join）维度：硬编码一跳 JOIN 会拼错（f.work_order_id = d.line_id 之类）→ 拒编回退。
+    if odef.get("via") or idef.get("via"):
         return None
     # 排序方向 + rn（第N高/低）
     order_dir = _dir()
@@ -990,6 +1299,9 @@ def compile_period_diff(query: str) -> dict | None:
     ddef = _resolve_dim_def(fact, meta["dims"][dim])
     if not ddef:
         return None
+    # via（两跳 join）维度：同 compile_period_compare_grouped，硬编码一跳 JOIN 会拼错 → 拒编。
+    if ddef.get("via"):
+        return None
 
     cur_agg = f"SUM(CASE WHEN EXTRACT(MONTH FROM {time_col}) = {cur_m} THEN {inner} ELSE 0 END)"
     prev_agg = f"SUM(CASE WHEN EXTRACT(MONTH FROM {time_col}) = {prev_m} THEN {inner} ELSE 0 END)"
@@ -1110,6 +1422,178 @@ def compile_period_compare(query: str) -> dict | None:
         "sql": sql, "title": f"{name}{kind}", "metric": name,
         "metrics": [name], "unit": unit, "tables": [fact],
         "compiled": True, "mql": mql,
+    }
+
+
+# ── 分组两期对比（「哪些产线本月产量超过上个月」）确定性编译 ────────────
+# 2026-09-29 实测背景：这类问法此前一律掉 LLM，LLM 四次生成四种 SQL 形态
+# （两个恒等 SUM / 单聚合跨两月 / DATE_TRUNC 自比较 HAVING X>X / CTE 里两期起止同值），
+# 稳定率极低；换措辞还可能被**普通编译静默降级**成单期聚合（0.1s 高置信错答，
+# 实测「各产线本月产量比上月高」被编译成「上月产量按产线排序」，比较语义整个丢掉）。
+# 与既有 compile_period_compare 的关系：那个只做**总体**对比（有维度即放弃），
+# 本函数补上**分组**对比；两者互不改动，各自失败都返回 None 回退 LLM。
+_CMP_CUR_RE = re.compile(r"本月|这个月|当月|本季度|本季|今年|本年|近\s*\d+\s*(?:天|周|个月)")
+_CMP_PREV_RE = re.compile(r"上个月|上月|上季度|上季|去年|去年同期|前\s*\d+\s*(?:天|周|个月)")
+_CMP_PRED_RE = re.compile(r"超过|高于|大于|跑赢|优于|低于|少于|小于|不如|不及|落后|"
+                          r"增长|下降|提升|减少|变化|增幅|增速|环比|同比|相对|相比|对比|比|较")
+_CMP_UP_RE = re.compile(r"超过|高于|大于|跑赢|优于|增长|提升|高过|比[^。？，]{0,8}?(?:高|多)")
+_CMP_DOWN_RE = re.compile(r"低于|少于|小于|不如|不及|落后|下降|减少|比[^。？，]{0,8}?(?:低|少)")
+_CMP_FILTER_RE = re.compile(r"哪些|哪条|哪几|哪个|哪台|哪道|列出|找出|有哪些")
+
+
+def _has_grouped_compare_intent(query: str) -> bool:
+    """「本期词 + 上期词 + 比较谓词」三段式对比意图。
+
+    本期词只认**相对时间词**（本月/本季/今年/近N天）；显式双月（「7月相对6月」）
+    不在此列，由 compile_period_diff 接管，避免两者抢题。
+    """
+    return bool(_CMP_CUR_RE.search(query) and _CMP_PREV_RE.search(query)
+                and _CMP_PRED_RE.search(query))
+
+
+def _grouped_compare_ranges(query: str):
+    """两期区间（用 CTE 里的 b.mx / b.p0 表达）→ (period_fn, cur_lo, cur_hi, prev_lo, prev_hi, 本期标签, 上期标签)。
+
+    期长对齐（关键）：上期上界 = 数据上限往前推一个周期，而不是「上一个完整自然月」。
+    实测数据只到 7-15，若上期取 6 月整月（30 天）对本期 15 天，所有分组都显示下降 → 0 行；
+    取到 6-15 才是同口径对比（7-01~07-15 vs 06-01~06-15）。
+    """
+    nd = re.search(r"近\s*(\d+)\s*天", query)
+    if nd and re.search(r"前\s*\d+\s*天", query):
+        n = int(nd.group(1))
+        return ("", f"b.mx - INTERVAL '{max(0, n - 1)} days'", "b.mx",
+                f"b.mx - INTERVAL '{2 * n - 1} days'", f"b.mx - INTERVAL '{n} days'",
+                f"近{n}天", f"前{n}天")
+    if re.search(r"本季度|本季", query):
+        return ("quarter", "b.p0", "b.mx", "b.p0 - INTERVAL '3 months'", "b.mx - INTERVAL '3 months'",
+                "本季度", "上季度")
+    if re.search(r"今年|本年", query):
+        return ("year", "b.p0", "b.mx", "b.p0 - INTERVAL '1 year'", "b.mx - INTERVAL '1 year'",
+                "今年", "去年")
+    return ("month", "b.p0", "b.mx", "b.p0 - INTERVAL '1 month'", "b.mx - INTERVAL '1 month'",
+            "本月", "上月")
+
+
+def compile_period_compare_grouped(query: str) -> dict | None:
+    """确定性编译「分组两期对比」：本期 vs 上期，按维度分组，可选筛选（本期>上期）。
+
+    仅支持：单指标（简单 SUM 形态）+ 单事实表（有时间列）+ 恰好 1 个分组维度 + PG。
+    失败返回 None（回退 LLM，绝不硬凑）。
+    """
+    if get_db_type() == "mysql":
+        return None
+    if not _has_grouped_compare_intent(query):
+        return None
+    from agent.metric_registry import find_metrics
+    hits = find_metrics(query)
+    if len(hits) != 1:
+        return None
+    m = hits[0]
+    tables = m.get("tables") or []
+    if len(tables) != 1 or tables[0] not in _FACT_TIME_COL:
+        return None
+    fact = tables[0]
+    time_col = _FACT_TIME_COL[fact]
+    raw = (m.get("sql_expression") or "").strip()
+    sm = re.fullmatch(r"SUM\((.*)\)", raw, re.S)   # 只支持简单 SUM(inner)；比率指标回退
+    if not sm:
+        return None
+    inner = _resolve_expr(sm.group(1).strip(), fact)
+    if not inner or not _safe_metric_expr(inner):
+        return None
+
+    dims = _detect_dim(query, fact)
+    if not dims:
+        # 「哪些产线本月产量超过上个月」没有「各X/按X」分组信号 → 维度名直接出现即算，
+        # 但仍要求该维度的 fact_col 在当前库真实存在（列缺失则跳过，避免编出坏 SQL）。
+        for cn in sorted(_FACT_META[fact].get("dims", {}), key=len, reverse=True):
+            if cn not in query:
+                continue
+            try:
+                _dd = _resolve_dim_def(fact, _FACT_META[fact]["dims"][cn])
+            except Exception:
+                continue
+            _fc = _dd.get("fact_col")
+            _c = _fc if isinstance(_fc, str) else (_fc[0] if _fc else "")
+            if _c and _c in _table_cols(fact):
+                dims = [cn]
+                break
+    if len(dims) != 1:
+        return None
+    dim = dims[0]
+    try:
+        ddef = _resolve_dim_def(fact, _FACT_META[fact]["dims"][dim])
+    except Exception:
+        return None
+    if not ddef:
+        return None
+
+    name = m["name"].split("(")[0].strip()
+    unit = m.get("unit", "")
+    # via（两跳 join）维度在 from_clause 拼接处被硬编码一跳 JOIN 覆盖（1527），
+    # 会拼出错的 ON 条件（如 ON f.work_order_id = d.line_id，把工单ID 当产线ID join）。
+    # 暂不在此编译器里支持两跳 join → 显式拒编，回退 LLM，避免静默写出答非所问 SQL。
+    if ddef.get("via"):
+        return None
+    if ddef.get("join"):
+        dt, dk, ddisp = ddef["join"]
+        dim_col = f"d.{ddisp}"
+        from_clause = f"{fact} f JOIN {dt} d ON f.{ddef['fact_col']} = d.{dk}"
+        group = f"d.{ddisp}"
+    else:
+        c = ddef["fact_col"] if isinstance(ddef["fact_col"], str) else ddef["fact_col"][0]
+        dim_col = f"f.{c}"
+        from_clause = f"{fact} f"
+        group = f"f.{c}"
+
+    pfn, cur_lo, cur_hi, prev_lo, prev_hi, cur_label, prev_label = _grouped_compare_ranges(query)
+    p0_expr = "mx" if not pfn else f"date_trunc('{pfn}', mx)"
+    cur_c = f"f.{time_col} >= {cur_lo} AND f.{time_col} <= {cur_hi}"
+    prev_c = f"f.{time_col} >= {prev_lo} AND f.{time_col} <= {prev_hi}"
+    span = f"f.{time_col} >= {prev_lo} AND f.{time_col} <= {cur_hi}"
+
+    # 筛选型（「哪些产线本月产量超过上个月」→ 只留本期>上期的分组）
+    # vs 展示型（「各产线本月产量环比上月」→ 全量分组 + 差值 + 变化率）
+    up, down = bool(_CMP_UP_RE.search(query)), bool(_CMP_DOWN_RE.search(query))
+    if up and down:
+        return None  # 方向矛盾（又高又低）→ 回退 LLM
+    if up or down or _CMP_FILTER_RE.search(query):
+        op = ">" if up else "<" if down else ">"
+        sql = (
+            f"WITH a AS (SELECT MAX({time_col}) AS mx FROM {fact}), "
+            f"b AS (SELECT mx, {p0_expr} AS p0 FROM a), "
+            f'm AS (SELECT {dim_col} AS "{dim}", '
+            f"SUM(CASE WHEN {cur_c} THEN {inner} ELSE 0 END) AS m_cur, "
+            f"SUM(CASE WHEN {prev_c} THEN {inner} ELSE 0 END) AS m_prev "
+            f"FROM {from_clause} CROSS JOIN b WHERE {span} GROUP BY {group}) "
+            f'SELECT "{dim}", m_cur AS "{cur_label}{name}", m_prev AS "{prev_label}{name}", '
+            f'm_cur - m_prev AS "差值" FROM m WHERE m_cur {op} m_prev '
+            f'ORDER BY "差值" DESC LIMIT 200'
+        )
+        title = f"{name}{cur_label}高于{prev_label}的{dim}"
+    else:
+        sql = (
+            f"WITH a AS (SELECT MAX({time_col}) AS mx FROM {fact}), "
+            f"b AS (SELECT mx, {p0_expr} AS p0 FROM a), "
+            f'm AS (SELECT {dim_col} AS "{dim}", '
+            f"SUM(CASE WHEN {cur_c} THEN {inner} ELSE 0 END) AS m_cur, "
+            f"SUM(CASE WHEN {prev_c} THEN {inner} ELSE 0 END) AS m_prev "
+            f"FROM {from_clause} CROSS JOIN b WHERE {span} GROUP BY {group}) "
+            f'SELECT "{dim}", m_cur AS "{cur_label}{name}", m_prev AS "{prev_label}{name}", '
+            f'm_cur - m_prev AS "差值", '
+            f'ROUND((m_cur - m_prev) * 100.0 / NULLIF(m_prev, 0), 2) AS "变化率%" '
+            f'FROM m ORDER BY "差值" DESC LIMIT 200'
+        )
+        title = f"{dim}{name}{prev_label}→{cur_label}对比"
+    return {
+        "sql": sql, "title": title, "metric": name, "metrics": [name],
+        "unit": unit, "tables": [fact] + ([ddef["join"][0]] if ddef.get("join") else []),
+        "compiled": True,
+        "mql": {"metric": name, "metric_key": m.get("name"),
+                "metric_expression": m.get("sql_expression"),
+                "dimensions": [dim], "compiled_by": "period_compare_grouped",
+                "compare": f"{prev_label} vs {cur_label}",
+                "period_align": "same_length_to_data_max"},
     }
 
 
@@ -1269,8 +1753,8 @@ def compile_multi_fact_bridge(query: str) -> dict | None:
 # 秒回一个与问题无关的单指标聚合（答非所问）。检测到 ≥2 个不同已注册指标 + 关系/对比/影响意图时，
 # 禁止确定性编译，交回二次确认弹窗 → LLM 推断双指标方案（保证结果真的"在分析"）。
 _MULTI_ANALYSIS_INTENT_RE = re.compile(
-    r"相关|关系|关联|对比|比较|差异|影响|是不是|是否.*(有关|相关)|有没有.*(关系|影响|关联)"
-    r"|谁高|谁低|哪个.*(高|低)|越长|越短|越多|越少|越高|越低|成正比|反比")
+    r"相关|关系|关联|对比|比较|差异|差别|影响|是不是|是否.*(有关|相关)|有没有.*(关系|影响|关联)"
+    r"|谁高|谁低|哪个[^。；，、！？]{0,20}(?<!最)(高|低|大|小)|越长|越短|越多|越少|越高|越低|成正比|反比")
 
 
 def _suppress_multi_metric_compile(query: str) -> bool:
@@ -1280,18 +1764,171 @@ def _suppress_multi_metric_compile(query: str) -> bool:
     try:
         from agent.metric_registry import get_effective_metrics
         named: set[str] = set()
+        # 命中指标词 + 词长，用于「否定前缀去重」：中文指标名常互为子串（「良率」⊂「不良率」），
+        # 直接 `w in query` 会把「不良率」里的「良率」也当成一个独立命中，把单指标极值问句
+        # （「哪个工序的不良率最低」）误判成双指标对比。规则：短词若**只**以「否定前缀 + 短词」
+        # （不/无/未/非 + 短词，即某个更长指标名的后缀）的形式出现、没有独立/并列出现
+        # （句首或「和/与/、」之后），才判定它是长词的一部分而跳过；否则（如「良率和不良率
+        # 哪个高」里句首的「良率」）保留为独立指标。
+        _matched: list[tuple[int, str, str]] = []
         for m in get_effective_metrics():
             words = [str(m.get("name") or "")] + [str(a) for a in (m.get("aliases") or [])]
             for w in words:
                 w = re.sub(r"\(.*?\)", "", w).strip()
                 if len(w) >= 2 and w in query:
-                    named.add(str(m.get("name") or ""))
+                    _matched.append((len(w), w, str(m.get("name") or "")))
                     break
-            if len(named) >= 2:
+        _matched.sort(reverse=True)
+        _selected: dict[str, str] = {}
+        for _ln, _w, _mn in _matched:
+            _only_neg_suffix = True
+            for _p in (m.start() for m in re.finditer(re.escape(_w), query)):
+                if _p > 0 and query[_p - 1] in "不无未非":
+                    continue  # 该处是「否定前缀+短词」，属更长指标名后缀
+                _only_neg_suffix = False
                 break
+            if _only_neg_suffix and any(_w in _prev for _prev in _selected.values()):
+                continue
+            _selected[_mn] = _w
+        named = set(_selected.keys())
         return len(named) >= 2
     except Exception:
         return False
+
+
+def compile_intersection_list(query: str) -> dict | None:
+    """「既满足 A 又满足 B 的<维度>有哪些」→ 确定性交集 SQL（2026-09-29 新增）。
+
+    为什么单独开一条通道：这类问法里**没有任何注册指标词**（答案对象是维度值清单，
+    不是聚合数字），所以 find_metrics 返回空，走不到普通编译的值过滤逻辑，
+    整体回退 LLM。实测后果很糟 ——「既使用过传感器又使用过控制器的产线有哪些」
+    被 LLM 答成 `SELECT dim_production_line.* FROM dim_production_line LIMIT 20`
+    （**全表无过滤**，6 行，真值 5 行），行数看着接近、用户完全看不出错。
+    而本文件早已具备产出正确形态的能力：_explicit_value_filters 对这句话
+    返回的就是恰好两条 EXISTS 子句（也就是正确答案）。
+
+    产物形态：从某个事实表筛出满足全部条件的维度值，返回维度明细行。
+      SELECT <维度展示列> FROM <事实表> f
+      WHERE EXISTS(...条件1...) AND EXISTS(...条件2...)
+      GROUP BY <维度展示列> ORDER BY ... LIMIT ...
+
+    生效前提（全部确定性，不满足即返回 None 回退 LLM）：
+      ① 问句含交集信号词（既…又… / 同时 / 并且 / 都…过…）；
+      ② _explicit_value_filters 能识别出 **≥2 个**真实枚举值条件 —— 少于 2 个不叫交集；
+      ③ 能推断出要返回哪个维度（由 _detect_dim 给出，且只能 1 个）。
+    """
+    q = str(query or "")
+    if not q:
+        return None
+    # ① 交集信号词。注意「和/与」太泛（并列问句常用），不单列，必须有「既/又/同时」类强信号。
+    if not re.search(r"既.{1,20}又|又.{1,20}既|同时.{0,6}(?:满|具|有|用过|生产过)|"
+                     r"并且|且都|都.{0,4}(?:用过|生产过|出现过)", q):
+        return None
+    # ③ 先定维度与事实表：交集对象得先有归属
+    try:
+        from agent.metric_registry import get_effective_metrics
+        _ = get_effective_metrics()
+    except Exception:
+        return None
+    best: tuple[str, str, list[str]] | None = None
+    # 事实表**优先序**（2026-09-29）：_COMPILABLE_TABLES 是 set，遍历顺序不确定，
+    # 实测「既使用过传感器又使用过控制器」曾被选到 mes_work_order（工单表）——虽然那里
+    # 也有 product_id，但"用过某类产品"的业务事实记录在**产出表**里，工单表只是个"计划"。
+    # 且工单表无对应列时产物会直接执行失败（rows=None）。
+    # 排序原则：产出/停机/质检这类**事实发生记录**优先，主数据与工单次之。
+    _FACT_PRIORITY = ["mes_process_output", "eqp_downtime_record", "qms_inspection",
+                      "qms_defect_detail", "inv_inventory_snapshot", "mes_work_order"]
+    _ordered = ([t for t in _FACT_PRIORITY if t in _COMPILABLE_TABLES]
+                + sorted(t for t in _COMPILABLE_TABLES if t not in _FACT_PRIORITY))
+    for fact in _ordered:
+        try:
+            conds = _explicit_value_filters(q, fact)
+        except Exception:
+            conds = []
+        if len(conds) < 2:      # ② 至少两个条件才是交集
+            continue
+        # 值条件里的关联列必须真的存在于该事实表 —— 否则产物会执行失败。
+        # _explicit_value_filters 已按 _all_table_columns 校验过列存在性，这里只需确认
+        # 生成的子句确实引用了本事实表别名 f.（同表列分支）或 f.X_id（跨表分支）。
+        if not all((" f." in c or "= f." in c) for c in conds):
+            continue
+        try:
+            dims = _detect_dim(q, fact)
+        except Exception:
+            dims = []
+        if len(dims) != 1:      # ③ 维度必须唯一可定
+            continue
+        best = (fact, dims[0], conds)
+        break
+    if not best:
+        return None
+    fact, dim, conds = best
+    try:
+        from agent.llm_service import _safe_ident as _si
+    except Exception:
+        return None
+    meta = _FACT_META.get(fact, {})
+    cfg = (meta.get("dims") or {}).get(dim) or {}
+    if not isinstance(cfg, dict):
+        return None
+    # 维度在事实表上的关联列（如 产线→line_id），作为「按维度分组的半连接」的键
+    dim_key = cfg.get("fact_col")
+    dim_key = dim_key[0] if isinstance(dim_key, (list, tuple)) else dim_key
+    if not _si(str(dim_key)):
+        return None
+    join = cfg.get("join")
+
+    # ── 关键：把「明细行条件」改造成「按维度分组的半连接」条件 ──
+    # 为什么必须改（2026-09-29 实测的静默错答）：
+    #   _explicit_value_filters 产出的是 **明细行级** EXISTS——
+    #   `EXISTS (... _v.product_id = f.product_id AND _v.product_category='传感器')`，
+    #   它要求**同一行明细**同时满足两个类别。但 product_id 一个产品只归一个类别
+    #   （dim_product 里 P001=控制器、P002=传感器，互斥），同一行永远不可能既是传感器
+    #   又是控制器 → 交集恒为 0 行。实测该 SQL「执行成功、0 行」，页面显示
+    #   「当前数据范围内没有匹配的记录」，看着像"库里真没有"，实则是编译逻辑错 ——
+    #   比回退 LLM 更危险。
+    #   业务语义是**维度粒度**的：「一条产线既生产过传感器、也生产过控制器」，
+    #   所以条件要挂在 line_id 上：该产线的产出里存在传感器，也存在控制器。
+    # 实现：每个条件改成 `f.<dim_key> IN (SELECT <dim_key> FROM <事实表> f2
+    #   JOIN/JOIN... WHERE <原条件换成 f2 前缀>)` —— 即"存在某个满足该条件的
+    #   同维度取值"。多个条件 AND 起来即是维度的交集。
+    dim_conds: list[str] = []
+    for c in conds:
+        c2 = c.replace("f.", "f2.")
+        cond = (f"f.{dim_key} IN (SELECT DISTINCT f2.{dim_key} FROM {fact} f2 "
+                f"WHERE {c2})")
+        if cond not in dim_conds:
+            dim_conds.append(cond)
+    if len(dim_conds) < 2:
+        return None
+    where = " AND ".join(dim_conds)
+
+    if join:
+        # 维度在关联维表上：JOIN 进来展示
+        try:
+            tab, key, show = join[0], join[1], join[2]
+        except Exception:
+            return None
+        show_col = show[0] if isinstance(show, (list, tuple)) else show
+        if not (_si(tab) and _si(key) and _si(str(show_col))):
+            return None
+        sql = (f"SELECT d.{show_col} AS \"{dim}\" FROM {fact} f "
+               f"JOIN {tab} d ON f.{key} = d.{key} "
+               f"WHERE {where} GROUP BY d.{show_col} ORDER BY d.{show_col} LIMIT 100")
+    else:
+        col = dim_key
+        sql = (f"SELECT f.{col} AS \"{dim}\" FROM {fact} f "
+               f"WHERE {where} GROUP BY f.{col} ORDER BY f.{col} LIMIT 100")
+    return {
+        "sql": sql,
+        "title": f"{dim}清单（多条件交集）",
+        "metric": f"{dim}清单",
+        "unit": "",
+        "tables": [fact] + ([join[0]] if join else []),
+        "compiled": True,
+        "mql": {"metric": f"{dim}清单", "dimensions": [dim],
+                "filters": dim_conds, "intersection": True},
+    }
 
 
 def try_compile_metric(query: str) -> dict | None:
@@ -1303,6 +1940,46 @@ def try_compile_metric(query: str) -> dict | None:
     """
     if not query:
         return None
+    # ── 多条件交集清单（「既满足 A 又满足 B 的<维度>有哪些」）→ 确定性编译 ──
+    # 放在最前：这类问法没有注册指标词，普通编译路径到不了，必须单独接管。
+    # 详见 compile_intersection_list 的说明（实测 LLM 会答成全表无过滤的错答案）。
+    _inter = compile_intersection_list(query)
+    if _inter:
+        return _inter
+    # ── 占比 / 比例 / 构成类语义：编译器**没有**任何占比表达力，必须回退 LLM ──
+    # 2026-09-29 修复（实测发现的高置信度错答）：本文件的编译产物只有「分组聚合绝对值」，
+    # 一旦问句含占比语义，编译会把问题**静默降级**成绝对值：
+    #   「设备故障造成的停机时长占全部停机时长的比例是多少」
+    #     → `SELECT SUM(downtime_minutes) FROM eqp_downtime_record
+    #        WHERE downtime_reason='设备故障' LIMIT 1`（只有分子，没有分母、没有除法）
+    #   「各停机原因的停机时长占比」
+    #     → 分组绝对值 + ORDER BY DESC（完全丢掉"占全部的比例"这一列）
+    # 危险点在于它 0.1s 速出、零 LLM、看起来有数有列，用户拿到一行「停机时长 1234」
+    # 以为答完了 —— 比回退 LLM 慢几秒更糟。占比的正确产物要么是窗口占比
+    # （SUM(x)/SUM(SUM(x)) OVER ()），要么是分子分母同名过滤后相除，两者都在
+    # 直生路径（见 llm_service._build_agg_hint 的占比 hint）里已支持。
+    # 判据取「占比/比例/百分比/比重/构成/组成/份额/结构 + 占…的(比例|百分比)」；
+    # 注意「率」字不在此列（良率/不良率/完成率是注册指标，有确定分子分母，编译正确）。
+    #
+    # 2026-09-29 修复（实测「非计划停机占比/严重缺陷占比」等注册口径被本闸门误杀）：
+    # 注册口径名本身就含「占比」的（非计划停机占比/严重缺陷占比/设备故障停机占比 等），
+    # 其 sql_expression 已正确表达「分子/分母相除」，编译只是原样执行注册算式，
+    # 根本不存在「降级成绝对值」的风险 —— 之前一刀切 return None 把它们也打回 LLM 直生。
+    # 修正：只有「未命中『名字/别名含占比』的注册口径」时，才说明是未注册的占比问法
+    # （如「各停机原因占全部停机时长的比例」），才回退 LLM。
+    if re.search(r"占比|比例|百分比|比重|份额|构成|组成|占比是多少|占.{0,8}的(?:比例|百分比)", query):
+        try:
+            from agent.metric_registry import find_metrics
+            _ratio_hits = find_metrics(query)
+        except Exception:
+            _ratio_hits = []
+        _hit_is_ratio = any(
+            re.search(r"占比|比例|百分比", str(h.get("name") or ""))
+            or any(re.search(r"占比|比例|百分比", a) for a in (h.get("aliases") or []))
+            for h in _ratio_hits
+        )
+        if not _hit_is_ratio:
+            return None
     # P0-修复（2026-09-03）：双指标相关性/对比问法禁止被压成单指标编译（见 _suppress_multi_metric_compile）
     if _suppress_multi_metric_compile(query):
         return None
@@ -1313,7 +1990,11 @@ def try_compile_metric(query: str) -> dict | None:
         return None
     # 同比/环比意图 → 走专用编译（避免被当成普通时间过滤错误编译出「本期值」）
     if _has_compare_intent(query):
-        return compile_period_compare(query)
+        _pc = compile_period_compare(query)
+        if _pc:
+            return _pc
+        # 2026-09-29：总体对比编译器接不住的（它内部有「有维度即放弃」守卫，
+        # 如「各产线本月产量环比上月」）不再直接返回 None，继续往下交给分组对比编译器。
     # 相邻两次间隔（「各设备相邻两次停机的间隔天数」）→ 确定性编译
     _iv = compile_interval(query)
     if _iv:
@@ -1322,6 +2003,15 @@ def try_compile_metric(query: str) -> dict | None:
     _pd = compile_period_diff(query)
     if _pd:
         return _pd
+    # 分组两期对比（「哪些产线本月产量超过上个月」）→ 确定性编译
+    _gpc = compile_period_compare_grouped(query)
+    if _gpc:
+        return _gpc
+    # 有三段式对比意图但编译器没接住 → 禁止落到普通编译：普通编译只有单期 WHERE，
+    # 会把「本月 vs 上月」压成「上月的分组聚合」（实测「各产线本月产量比上月高」产出
+    # WHERE 上月区间 + GROUP BY 产线，比较语义整个丢掉 —— 0.1s 静默错答，比走 LLM 更糟）。
+    if _has_grouped_compare_intent(query):
+        return None
     # 显式双时间点**并列对比**（「各车间6月与7月的产量各是多少」）→ 回退 LLM。
     # 非环比/同比词，但出现 ≥2 个不同时间点 + 并列语义（与/和/分别/各是多少/对比）——
     # 编译器不支持「按时间点条件聚合分列」，实测「各车间6月与7月产量」被误编译成
@@ -1408,7 +2098,17 @@ def try_compile_metric(query: str) -> dict | None:
     # 值过滤：支持简单数值比较（聚合后 HAVING 过滤）；其他谓词回退 LLM（防注入）
     value_filter = _parse_value_filter(query)
     if value_filter is None and re.search(r"[<>]=?|大于|小于|超过|低于|高于|不少于|不低于|至少", query):
-        return None
+        # 2026-09-29 修复：值过滤词若落在命中口径词（name/别名）内部，是口径语义而非值过滤——
+        # 典型「低于安全库存」是「库存缺口量」的别名，「低于」不是 HAVING 比较词；「库存缺口量」
+        # 别名「低于安全库存的产品」同理。把这些口径词从 query 遮蔽后再判，避免误回退 LLM。
+        _vfq = query
+        for _m in hits:
+            for _w in ([str(_m.get("name") or "")] + [str(a) for a in (_m.get("aliases") or [])]):
+                _w = str(_w).strip()
+                if _w and _w in _vfq:
+                    _vfq = _vfq.replace(_w, " " * len(_w))
+        if re.search(r"[<>]=?|大于|小于|超过|低于|高于|不少于|不低于|至少", _vfq):
+            return None
 
     # 收集指标信息：全部必须落在同一可编译事实表
     metrics_info: list[dict] = []
@@ -1449,6 +2149,40 @@ def try_compile_metric(query: str) -> dict | None:
 
     # 维度：支持 0~2 个维度分组（二维分组：各A各B的X；超过 2 个 → LLM）
     dims = _detect_dim(query, fact)
+    # 口径词污染剔除（2026-09-29 实测修复）：_detect_dim 在用户 query 里找维度词，
+    # 但 query 里的某个维度词可能**不是分组信号、而是命中口径名/别名的一部分**——
+    # 典型「各产线的设备故障停机占比」：query 里的「设备」来自指标名「设备故障停机占比」，
+    # 被误当成分组维度 → 编出「设备×产线」二维分组；「各产品的设备故障停机占比」更糟：
+    # eqp_downtime_record 无「产品」维度，只剩指标名里的「设备」污染词，静默按设备分组。
+    # 判据用**位置区间**：维度词在 query 中的出现位置若落在某命中口径词（name/别名）
+    # 的区间内，说明它是口径词的一部分而非分组信号 → 剔除；反之（如「各产品的库存缺口量」
+    # 里「产品」位于「各产品」、不在「库存缺口量」区间内）保留，避免误伤正常分组。
+    if dims:
+        _spans: list[tuple[int, int]] = []
+        for _m in hits:
+            for _w in ([str(_m.get("name") or "")] + [str(a) for a in (_m.get("aliases") or [])]):
+                _w = str(_w).strip()
+                if not _w:
+                    continue
+                _i = query.find(_w)
+                if _i >= 0:
+                    _spans.append((_i, _i + len(_w)))
+        _keep = []
+        for _d in dims:
+            _di = query.find(_d)
+            # 维度词出现位置落在口径词区间内 → 判定为口径词的一部分，剔除
+            if any(_di >= s and _di < e for s, e in _spans):
+                # 2026-09-29 修复：但若维度词前紧邻分组信号（各/按/每/分/哪个/哪些/几个），
+                # 说明它是用户的明确分组意图，而非口径词的一部分——典型「各产线的不良」：
+                # 别名「各产线的不良」把分组维度「产线」也包了进来，按区间判断会把「产线」
+                # 误剔导致维度清空 → 回退 LLM。而真正要防的「各产品的设备故障停机占比」里
+                # 「设备」前是「的」（无分组信号），仍应剔除。故仅当维度词前**无**分组信号
+                # 时才按「口径词一部分」剔除。
+                _before = query[:_di]
+                if not re.search(r"(各|按|每|分|哪个|哪些|几个|这几个|每个|各个)$", _before):
+                    continue
+            _keep.append(_d)
+        dims = _keep
     if len(dims) > 2:
         return None
     # 排行/最高级意图但没写维度词（「列出抽检数最高的 TOP10」「抽检数排行」）：
@@ -1460,9 +2194,20 @@ def try_compile_metric(query: str) -> dict | None:
     # 防静默降级：查询含「各X/按X/每个X/分X」等分组信号，但 X 无法解析到任何已注册维度
     # （如"各班次的产量"中 shift_code 未注册）→ 必须回退 LLM，禁止按"无维度总量"编译（答非所问）。
     # （「排行/排名」意图已由上面自动补维兜底，不再回退。）
-    if not dims and not _want_date(query) and re.search(
-            r"各[\u4e00-\u9fa5]{1,6}|按[\u4e00-\u9fa5]{1,6}(?!\s*(天|日|月|周|季度|年))|每个[\u4e00-\u9fa5]{1,6}|每(?!次|天|日|月|周|季度|年)[\u4e00-\u9fa5]{1,6}(?!\s*(天|日|月|周|季度|年))|分[\u4e00-\u9fa5]{1,6}", query):
-        return None
+    if not dims and not _want_date(query):
+        # 2026-09-29 修复：分组信号若落在命中口径词内部，是口径语义而非分组意图——
+        # 典型「停机分钟」别名里「分」匹配「分钟」、「平均每单计划量」里「每单」是
+        # 指标语义（每张工单的平均），都不是「按X分组」。遮蔽口径词后再判分组信号，
+        # 避免把单指标总量问法误回退 LLM。
+        _gq = query
+        for _m in hits:
+            for _w in ([str(_m.get("name") or "")] + [str(a) for a in (_m.get("aliases") or [])]):
+                _w = str(_w).strip()
+                if _w and _w in _gq:
+                    _gq = _gq.replace(_w, " " * len(_w))
+        if re.search(
+                r"各[\u4e00-\u9fa5]{1,6}|按[\u4e00-\u9fa5]{1,6}(?!\s*(天|日|月|周|季度|年))|每个[\u4e00-\u9fa5]{1,6}|每(?!次|天|日|月|周|季度|年)[\u4e00-\u9fa5]{1,6}(?!\s*(天|日|月|周|季度|年))|分[\u4e00-\u9fa5]{1,6}", _gq):
+            return None
     dim = dims[0] if dims else None
     want_date = _want_date(query) if time_col else False
     # P0-4 钻取解析：层级维度 + 下钻词 + 父级值过滤（「一车间各产线的产量」→ 定位一车间下钻）
@@ -1535,6 +2280,35 @@ def try_compile_metric(query: str) -> dict | None:
         else:
             time_desc = "自定义时间范围"
     where = f" WHERE {time_filter}" if time_filter else ""
+    # ── 点名枚举值过滤（2026-09-28 新增）──────────────────────────────────
+    # 场景：「传感器这个产品类别下各产线的产量」——问句里点名了维表取值
+    # （传感器 = dim_product.product_category 的真实取值），但既不是时间过滤、
+    # 也不是父子层级下钻。改造前这类问句要么被 `_drill_value` 误当成父级值
+    # （生成 `workshop_name='传感器这个产品类别下'` → 0 行静默失败），要么被
+    # 忽略掉条件（结果偏大但不报错）。
+    # 实现用 EXISTS 子查询而不是新增 JOIN：FROM/GROUP BY 的拼装逻辑在下方多个
+    # 分支里各自分支（趋势/单维/双维/多维），逐个加 JOIN 要改 4 处且容易漏；
+    # EXISTS 只往 WHERE 追加一个自包含子句，与所有分支正交，零副作用。
+    # 只认倒排索引里**逐字存在**的值（不猜、不模糊匹配）；索引不可用时不生效。
+    if not drill_filter:
+        try:
+            # 口径词遮蔽（2026-09-29 实测修复）：命中口径名/别名里含有的枚举值词会被
+            # _explicit_value_filters 误当成「点名值过滤」——典型「各产线的设备故障停机占比」
+            # 里「设备故障」是 downtime_reason 真实枚举值，被加 `WHERE downtime_reason='设备故障'`，
+            # 导致分子分母同时被限死在子集里，占比全变 100%（语义全错）；「换线调机时长」等同理。
+            # 处理：把 query 里命中口径词（name/别名）的区间替换成空格后再交给值过滤，
+            # 口径词内的枚举值不再被当过滤值；口径词外的真实点名值（如「传感器这个产品类别下…」）不受影响。
+            _vf_query = query
+            for _m in hits:
+                for _w in ([str(_m.get("name") or "")] + [str(a) for a in (_m.get("aliases") or [])]):
+                    _w = str(_w).strip()
+                    if _w and _w in _vf_query:
+                        _vf_query = _vf_query.replace(_w, " " * len(_w))
+            _enum_conds = _explicit_value_filters(_vf_query, fact)
+            for _c in _enum_conds:
+                where = f" WHERE {_c}" if not where else f"{where} AND {_c}"
+        except Exception:
+            pass
     # P0-4 钻取值过滤：维度层级父级列 = 值（「一车间各产线的产量」→ d.workshop='一车间'）。
     # 仅 JOIN 型层级出现（值来自维度表展示列），用 d. 前缀避免与事实表同名列歧义。
     if drill_filter:
@@ -1607,9 +2381,12 @@ def try_compile_metric(query: str) -> dict | None:
         if dim_def.get("join"):
             dtable, dkey, ddisplay = dim_def["join"]
             involved_tables.append(dtable)
+            _vjoin, _oncol = _dim_join_clause(dim_def, "d")
+            if dim_def.get("via"):
+                involved_tables.append(dim_def["via"][0])
             sql = (
                 f'SELECT d.{ddisplay} AS "{dim}", {date_expr} AS "日期", {proj} '
-                f'FROM {fact} f JOIN {dtable} d ON f.{dim_def["fact_col"]} = d.{dkey}'
+                f'FROM {fact} f{_vjoin} JOIN {dtable} d ON {_oncol} = d.{dkey}'
                 f'{where} GROUP BY d.{ddisplay}, {date_expr}{having} '
                 f'ORDER BY "日期", "{dim}" LIMIT {trend_limit}'
             )
@@ -1632,6 +2409,10 @@ def try_compile_metric(query: str) -> dict | None:
         d1, d2 = dims[0], dims[1]
         def1 = _resolve_dim_def(fact, meta["dims"][d1])
         def2 = _resolve_dim_def(fact, meta["dims"][d2])
+        # via（两跳 join）维度在双维度分支下需要两个互不冲突的桥接表别名，此处不支持
+        # → 回退 LLM。宁可不编，也不能拼出连不上的 JOIN（双维度场景罕见，不值得为此冒险）。
+        if def1.get("via") or def2.get("via"):
+            return None
         # 含 JOIN 维度时**仅在问句有显式分组信号**（各/按/每个/每X）才编译，否则回退 LLM。
         # 反例（yans 回归实测）：「良率最低的工序在哪些产线上执行」同时命中「工序」「产线」
         # 两个维度，但语义是"先筛出良率最低的工序、再列出执行它的产线"，**不是**二维分组；
@@ -1678,9 +2459,12 @@ def try_compile_metric(query: str) -> dict | None:
         if dim_def.get("join"):
             dtable, dkey, ddisplay = dim_def["join"]
             involved_tables.append(dtable)
+            _vjoin, _oncol = _dim_join_clause(dim_def, "d")
+            if dim_def.get("via"):
+                involved_tables.append(dim_def["via"][0])
             sql = (
                 f'SELECT d.{ddisplay} AS "{dim}", {proj} '
-                f'FROM {fact} f JOIN {dtable} d ON f.{dim_def["fact_col"]} = d.{dkey}'
+                f'FROM {fact} f{_vjoin} JOIN {dtable} d ON {_oncol} = d.{dkey}'
                 f'{where} GROUP BY d.{ddisplay}{having} ORDER BY "{name}" {order_dir} LIMIT {limit}'
             )
         else:

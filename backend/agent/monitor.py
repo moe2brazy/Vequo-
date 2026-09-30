@@ -68,7 +68,19 @@ def _save() -> None:
 # ── 检测核心 ────────────────────────────────────────────
 
 def _safe_execute(sql: str) -> dict:
-    """只读校验 + LIMIT + 执行（与主流程同级别护栏）。"""
+    """只读校验 + 行/列级 ACL 改写 + 执行（与主流程同级别护栏）。
+
+    【权限修复】原先这里只做只读校验就直接执行，漏掉了 enforcer.rewrite_sql 这一步。
+    影响面比表面大：monitor 的规则检测、insight_scan 的异常扫描（scan_table /
+    scan_top_tables）、data_charts 的各路图表取数，最终都汇聚到这个函数，
+    于是行级过滤与列级脱敏在这三条链路上全部不生效——表级白名单是各自另做的，
+    所以表现为「该看的表拦住了，但只看本车间的账号仍能扫到全厂口径、
+    被隐藏/脱敏的列仍会出现在洞察与图表结果里」。
+
+    ACL 从 security.context 的 ContextVar 读（API 端点在请求内 set_acl）。
+    后台线程（监控规则定时巡检）拿不到 ACL → acl 为 None → 原样执行，
+    与 investigator._safe_execute 的既有口径一致。
+    """
     if not sql or not sql.strip():
         return {"success": False, "error": "SQL 为空"}
     try:
@@ -77,6 +89,19 @@ def _safe_execute(sql: str) -> dict:
         ok, err, cleaned = validate_sql_safety(sql)
         if not ok:
             return {"success": False, "error": f"安全校验未通过：{err}"}
+        # 权限改写（行过滤 / 列隐藏 / 列脱敏）：与 investigator / 主流程同一套
+        try:
+            from security.context import get_acl
+            from security.enforcer import rewrite_sql
+            acl = get_acl()
+            if acl is not None:
+                eff, acl_err, _applied = rewrite_sql(cleaned, acl)
+                if acl_err:
+                    # 改写失败一律 fail-close：宁可这条规则/扫描报错，也不能拿未过滤的结果
+                    return {"success": False, "error": f"权限校验未通过：{acl_err}"}
+                cleaned = eff
+        except ImportError:
+            pass  # ACL 模块不可用（离线脚本/评测环境）时退化为只读校验
         return execute_sql(cleaned)
     except Exception as e:
         return {"success": False, "error": str(e)[:200]}

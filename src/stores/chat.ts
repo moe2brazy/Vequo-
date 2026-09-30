@@ -141,13 +141,41 @@ function load(): ChatData {
 
 const data = ref<ChatData>(load())
 
+// 落盘合并（性能修复）：data 是整个消息中心——两个会话 + 全部消息 + 各身份的已读进度。
+// 原实现是 deep watch 里直接 JSON.stringify 全量写 localStorage，任一字段变化都触发一次，
+// 而且 AI 流式作答期间 AiAssistantFab 的 onStep 每个步骤都在改 placeholder.text，
+// 于是每步都要序列化「全部历史」，消息越多越卡。
+// 改为 300ms 合并写入：连续变更只写最后一次；再用 pagehide / 页面转入后台做兜底 flush，
+// 保证最后 300ms 内的消息不会因为用户直接关页而丢。
+let persistTimer: ReturnType<typeof setTimeout> | null = null
+
+/** 立即把内存中的消息中心写入本地存储（取消挂起的合并写入） */
+export function flushChatPersist(): void {
+  if (persistTimer) {
+    clearTimeout(persistTimer)
+    persistTimer = null
+  }
+  safeSetItem(STORAGE_KEY, JSON.stringify(data.value))
+}
+
 watch(
   data,
-  (v) => {
-    safeSetItem(STORAGE_KEY, JSON.stringify(v))
+  () => {
+    if (persistTimer) clearTimeout(persistTimer)
+    persistTimer = setTimeout(() => {
+      persistTimer = null
+      safeSetItem(STORAGE_KEY, JSON.stringify(data.value))
+    }, 300)
   },
   { deep: true },
 )
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('pagehide', flushChatPersist)
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flushChatPersist()
+  })
+}
 
 export const conversations = computed<Conversation[]>(() =>
   [...data.value.convs].sort((a, b) => {

@@ -125,7 +125,14 @@ button { color: inherit; }
 .login-note span { font: 600 7px Rajdhani, sans-serif; letter-spacing: .16em; }
 .login-note b { font-size: 11px; font-weight: 500; }
 
-.login-panel { position: relative; padding: 34px 36px 30px; border: 1px solid rgba(29, 33, 41, .23); border-radius: 32px; background: rgba(247, 248, 250, .66); box-shadow: 0 35px 90px rgba(29, 33, 41, .1); backdrop-filter: blur(18px); }
+.login-panel { position: relative; 
+  padding: 34px 36px 30px;
+   border: 1px solid rgba(29, 33, 41, .23);
+   border-radius: 32px;
+   background: rgba(247, 248, 250, .66);
+   box-shadow: 0 35px 90px rgba(29, 33, 41, .1);
+  backdrop-filter: blur(18px);
+   }
 .panel-heading { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 8px; padding-bottom: 17px; border-bottom: 1px solid rgba(29, 33, 41, .16); }
 .panel-heading span { font: 600 11px Rajdhani, sans-serif; letter-spacing: .16em; }
 .panel-heading small { color: #86909c; font-size: 11px; }

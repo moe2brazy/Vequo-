@@ -3228,5 +3228,79 @@
     "reviewer": "admin",
     "reviewed_at": "2026-09-28T13:59:47.297015+00:00",
     "review_comment": "管理员直接变更（自动留痕）"
+  },
+  {
+    "id": "92f9e7648847",
+    "created_at": "2026-09-30T13:48:22.111698+00:00",
+    "requester": "admin",
+    "kind": "role_grant",
+    "kind_label": "用户角色授权",
+    "target": "viewer",
+    "payload": {
+      "username": "viewer",
+      "roles": [
+        "prod_staff"
+      ],
+      "action": "set_user_roles"
+    },
+    "reason": "调整用户「viewer」角色",
+    "status": "auto_approved",
+    "reviewer": "admin",
+    "reviewed_at": "2026-09-30T13:48:22.111698+00:00",
+    "review_comment": "管理员直接变更（自动留痕）"
+  },
+  {
+    "id": "5213f6255d75",
+    "created_at": "2026-09-30T14:00:38.870088+00:00",
+    "requester": "admin",
+    "kind": "role_grant",
+    "kind_label": "用户角色授权",
+    "target": "123456",
+    "payload": {
+      "username": "123456",
+      "roles": [],
+      "action": "set_user_roles"
+    },
+    "reason": "调整用户「123456」角色",
+    "status": "auto_approved",
+    "reviewer": "admin",
+    "reviewed_at": "2026-09-30T14:00:38.870088+00:00",
+    "review_comment": "管理员直接变更（自动留痕）"
+  },
+  {
+    "id": "975fc3f01805",
+    "created_at": "2026-09-30T14:02:19.005295+00:00",
+    "requester": "admin",
+    "kind": "role_grant",
+    "kind_label": "用户角色授权",
+    "target": "mask_8989@qq.com",
+    "payload": {
+      "username": "mask_8989@qq.com",
+      "roles": [],
+      "action": "set_user_roles"
+    },
+    "reason": "调整用户「mask_8989@qq.com」角色",
+    "status": "auto_approved",
+    "reviewer": "admin",
+    "reviewed_at": "2026-09-30T14:02:19.005295+00:00",
+    "review_comment": "管理员直接变更（自动留痕）"
+  },
+  {
+    "id": "38a3b5f4f3f7",
+    "created_at": "2026-09-30T14:08:35.277896+00:00",
+    "requester": "admin",
+    "kind": "role_grant",
+    "kind_label": "用户角色授权",
+    "target": "mask_8989@qq.com",
+    "payload": {
+      "username": "mask_8989@qq.com",
+      "roles": [],
+      "action": "set_user_roles"
+    },
+    "reason": "调整用户「mask_8989@qq.com」角色",
+    "status": "auto_approved",
+    "reviewer": "admin",
+    "reviewed_at": "2026-09-30T14:08:35.277896+00:00",
+    "review_comment": "管理员直接变更（自动留痕）"
   }
 ]

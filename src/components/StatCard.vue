@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { PropType } from 'vue'
+import { computed, type PropType } from 'vue'
 
 export interface StatItem {
   label: string
@@ -15,7 +15,10 @@ const props = defineProps({
   },
 })
 
-const isPositive = props.stat.change >= 0
+// 用 computed 而不是 setup 期算一次的普通常量：原来写成
+// `const isPositive = props.stat.change >= 0`，只在组件初始化时求值一次，
+// 之后父组件换一份 stat（切换时间范围 / 重新拉数）时方向箭头和配色都不会跟着变。
+const isPositive = computed(() => props.stat.change >= 0)
 </script>
 
 <template>

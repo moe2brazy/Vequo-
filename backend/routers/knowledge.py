@@ -692,11 +692,36 @@ def _metric_value(db: Session, expr: str, table_name: str) -> dict:
         return {"ok": False, "value": None}
 
 
-def build_scene_snapshot(db: Session, scene_key: str) -> Dict:
+def _snapshot_allowed_tables(user: dict):
+    """当前用户可见表的裸名小写集合；None 表示不受限（guest / 超级管理员 / 未配置授权）。"""
+    if not user or user.get("role") == "guest":
+        return None
+    from security.enforcer import build_acl_context
+    ctx = build_acl_context(user)
+    if ctx.superuser:
+        return None
+    allowed = ctx.allowed_tables
+    return None if allowed is None else {t.split(".")[-1].lower() for t in allowed}
+
+
+def _snapshot_scope_key(allowed) -> str:
+    """缓存作用域标识：不同角色可见表不同，不能共用同一条快照缓存。"""
+    if allowed is None:
+        return "all"
+    import hashlib
+    return "t" + hashlib.md5(",".join(sorted(allowed)).encode()).hexdigest()[:10]
+
+
+def build_scene_snapshot(db: Session, scene_key: str, allowed_tables=None) -> Dict:
     """按场景表集合匹配注册口径，逐条确定性执行聚合取当前值，按主表分组。
 
     组/顺序与知识页「指标全览」对应；列占位解析 + 单条异常兜底，
     保证任一指标失败不拖垮整组（前后端互通的关键）。
+
+    权限：`allowed_tables` 为该用户可见表裸名集合（None = 不受限）。被挡在授权外的
+    事实表，其指标整体不参与计算 —— 原先这里直接对全库表跑聚合，任何角色都能拿到
+    自己无权域的指标现值（如质量人员能读到设备停机总时长）。缓存 key 由调用方按
+    作用域隔离，避免 A 角色算出的裁剪结果被 B 角色读到。
     """
     try:
         inspector = inspect(db.get_bind())
@@ -725,6 +750,8 @@ def build_scene_snapshot(db: Session, scene_key: str) -> Dict:
                 continue
             primary = m_tables[0]
             if primary not in scene_names:
+                continue
+            if allowed_tables is not None and primary.split(".")[-1].lower() not in allowed_tables:
                 continue
             if primary not in _GROUP_LABEL:
                 # 维表档案计数（产线数/工序数…）不进指标全览，避免与业务事实组混杂
@@ -758,12 +785,22 @@ def build_scene_snapshot(db: Session, scene_key: str) -> Dict:
 
 
 @router.get("/scene-snapshot/{scene_key}")
-def get_scene_snapshot(scene_key: str, db: Session = Depends(get_db)):
-    """GET /api/knowledge/scene-snapshot/{scene} → 该场景全部注册口径的实时聚合值（按主表分组）"""
+def get_scene_snapshot(scene_key: str, authorization: str = Header(None),
+                       db: Session = Depends(get_db)):
+    """GET /api/knowledge/scene-snapshot/{scene} → 该场景全部注册口径的实时聚合值（按主表分组）
+
+    权限修复（P1）：原实现不接 Authorization，缓存 key 又只有 `snapshot:{场景}`，
+    于是 ① 任何访问者（含开放模式匿名）都能拿到全部场景的指标现值；② 谁先访问谁
+    把结果写进缓存，后续角色读到的是同一个对象 —— 跨角色串数据的典型形态。
+    现按用户可见表裁剪 + 缓存按授权集合隔离。
+    """
     key = scene_key.strip().lower()
     if not key or not key.replace("_", "").isalnum():
         raise HTTPException(status_code=400, detail="无效场景")
-    return _cached(f"snapshot:{key}", build_scene_snapshot, db, key)
+    from auth import get_current_user
+    allowed = _snapshot_allowed_tables(get_current_user(authorization))
+    scope = _snapshot_scope_key(allowed)
+    return _cached(f"snapshot:{scope}:{key}", build_scene_snapshot, db, key, allowed)
 
 
 # ========== 获取术语词典 ==========

@@ -43,7 +43,9 @@ BUILTIN_METRICS: list[dict] = [
     # ── 生产域（mes_process_output：投入=合格+不良+损耗，逐工序良率链）──
     {
         "name": "产量",
-        "aliases": ["产出量", "总产量", "产出", "产出数量", "产量最多", "产量占比", "实际产量"],
+        # 2026-09-29 摘除别名「产量占比」：本口径是绝对值（SUM good+defect），
+        # 「占比」是除法语义，挂在这里会让「X产量占比」命中后把占比静默降级成绝对值。
+        "aliases": ["产出量", "总产量", "产出", "产出数量", "产量最多", "实际产量"],
         "unit": "件",
         "tables": ["mes_process_output"],
         # 企业口径（2026-09-09 数据介绍.md）：产量 = 合格 + 不良（总产出，不含损耗）
@@ -107,12 +109,17 @@ BUILTIN_METRICS: list[dict] = [
         "tables": ["mes_process_output"],
         "sql_expression": "SUM(good_qty) * 100.0 / NULLIF(SUM(input_qty), 0)",
         "formula": "合格数 / 投入数 × 100%",
-        "description": "合格数量占投入数量的百分比（口径：good_qty / input_qty；良率 + 不良率 = 100%）",
+        # 2026-09-29 审计修正：原描述断言「良率 + 不良率 = 100%」，前提是 input_qty = good_qty + defect_qty，
+        # 而该前提已被 2026-09-25 对「投入量」的审计实测推翻（yans：3187009 ≠ 3200857），此处属漏改。
+        "description": "合格数量占投入数量的百分比（口径：good_qty / input_qty；yans 实测 97.556%）。"
+                       "注意分母是投入量，不是良率+不良率=100%——yans 实测两者相加为 100.43%，"
+                       "因投入量与产出量（good+defect）本身不相等",
         "dims": ["工序", "产线", "产品", "日期"],
     },
     {
         "name": "不良率",
-        "aliases": ["不合格率", "缺陷率"],
+        # 2026-09-29 补别名：「不良品率」是产线上极常见的同义问法（原只有「不合格率/缺陷率」会落空）
+        "aliases": ["不合格率", "缺陷率", "不良品率", "不良品比例"],
         "unit": "%",
         "tables": ["mes_process_output"],
         "sql_expression": "SUM(defect_qty) * 100.0 / NULLIF(SUM(input_qty), 0)",
@@ -184,12 +191,18 @@ BUILTIN_METRICS: list[dict] = [
     {
         "name": "缺陷数",
         "aliases": ["缺陷条数", "缺陷明细数", "不良记录数", "缺陷分布", "不良分布", "缺陷类型分布", "不良类型", "不良类型数", "缺陷最多", "出了几个缺陷", "缺陷有几条"],
-        "unit": "次",
+        # 2026-09-29 审计修正：原单位「次」不准确——本口径是 COUNT(*) 记录条数（yans 实测 2115 条），
+        # 且易与「缺陷件数」(5273 件) 混淆，故改为「条」。
+        "unit": "条",
         "tables": ["qms_defect_detail"],
         "sql_expression": "COUNT(*)",
         "formula": "COUNT(*)",
-        "description": "质量缺陷明细记录数（口径：qms_defect_detail 逐条缺陷计数）",
-        "dims": ["缺陷类型", "严重度", "工序", "产品"],
+        "description": "质量缺陷明细记录数（口径：qms_defect_detail 逐条缺陷计数；单位是「条」记录，"
+                       "与「缺陷件数」(defect_qty 求和，单位「件」) 是两个不同指标）",
+        # 2026-09-29 修复：移除失效维度「产品」——qms_defect_detail 无 product_id 列，
+        # _FACT_META 也未注册该表的「产品」映射（仅「产品类别」，且 yans 无 product_id），
+        # 留着会导致「各产品的缺陷数」编译出坏 SQL。
+        "dims": ["缺陷类型", "严重度", "工序"],
     },
     {
         "name": "缺陷件数",
@@ -200,7 +213,7 @@ BUILTIN_METRICS: list[dict] = [
         "sql_expression": "SUM(COALESCE(defect_qty,0))",
         "formula": "Σ(defect_qty)",
         "description": "缺陷不良件数合计（口径：qms_defect_detail 的 defect_qty 求和，区别于「缺陷数」的记录条数）",
-        "dims": ["缺陷类型", "严重度", "工序", "产品"],
+        "dims": ["缺陷类型", "严重度", "工序"],
     },
     {
         "name": "严重缺陷数",
@@ -208,23 +221,47 @@ BUILTIN_METRICS: list[dict] = [
         "unit": "件",
         "tables": ["qms_defect_detail"],
         "required_cols": ["severity_level"],
+        # 2026-09-29 审计修正：原口径只算 severity_level='critical'（1270 件），
+        # 而用户口径「严重缺陷占比」用 critical+major（3356 件）——同一系统里「严重缺陷」两套口径，
+        # 问「严重缺陷数」与「严重缺陷占比」会得到互相矛盾的答案。现统一为 critical+major，
+        # 与占比口径及别名（重大缺陷数/严重不良数）的业务语义对齐。
+        "sql_expression": "SUM(CASE WHEN severity_level IN ('critical', 'major') THEN COALESCE(defect_qty, 0) ELSE 0 END)",
+        "formula": "Σ(严重度 ∈ {critical, major} 的 defect_qty 件数)",
+        "description": "严重缺陷件数（口径：qms_defect_detail 中 severity_level 属于 critical 或 major 的"
+                       " defect_qty 求和，与「严重缺陷占比」分母口径一致）。2026-09-14 曾以 yans 实测校正过"
+                       "「记录数 vs 件数」（每条记录平均 2.49 件，记录数口径会低估）；2026-09-29 再校 severity 范围。"
+                       "只要 critical 单一等级请用「致命缺陷数」",
+        "dims": ["缺陷类型", "严重度", "工序"],
+    },
+    {
+        "name": "致命缺陷数",
+        "aliases": ["critical缺陷", "致命缺陷件数", "最高等级缺陷"],
+        "unit": "件",
+        "tables": ["qms_defect_detail"],
+        "required_cols": ["severity_level"],
+        # 2026-09-29 新增：把原先「严重缺陷数」里的 critical-only 口径单独保留，
+        # 供只想看最高等级的追问使用，避免与 critical+major 口径冲突。
         "sql_expression": "SUM(CASE WHEN severity_level = 'critical' THEN COALESCE(defect_qty, 0) ELSE 0 END)",
-        "formula": "Σ(严重度=critical 的 defect_qty 件数)",
-        "description": "严重缺陷件数（口径：qms_defect_detail 中 severity_level='critical' 的 defect_qty 求和，"
-                       "与「缺陷件数/不良数」同为件数口径。2026-09-14 以 yans 实测校正：原「按记录数」口径 519 与"
-                       "件数口径 1270 差 2.4 倍——每条缺陷记录平均 2.49 件，记录数口径会严重低估）",
+        "formula": "Σ(严重度 = critical 的 defect_qty 件数)",
+        "description": "最高严重等级（critical）的缺陷件数（口径：qms_defect_detail 中 severity_level='critical' "
+                       "的 defect_qty 求和；yans 实测 1270 件。区别于含 major 的「严重缺陷数」）",
         "dims": ["缺陷类型", "严重度", "工序"],
     },
     # ── 工单域（mes_work_order）──
     {
         "name": "工单数",
-        "aliases": ["工单总量", "工单数量", "工单总数", "工单状态的数量", "开了多少单", "工单有多少", "有多少单", "多少单", "工单状态", "各状态的工单", "各状态的工单各有多少", "工单状态分布"],
+        # 2026-09-29 补别名：「有多少工单」「多少工单」是最直白的问法，原表却只有「开了多少单」，
+        # 实测「有多少工单」find_metrics 零命中（会走 LLM 直生，不稳定）。
+        "aliases": ["工单总量", "工单数量", "工单总数", "工单状态的数量", "开了多少单", "工单有多少", "有多少单", "多少单", "工单状态", "各状态的工单", "各状态的工单各有多少", "工单状态分布", "有多少工单", "多少工单"],
         "unit": "单",
         "tables": ["mes_work_order"],
         "sql_expression": "COUNT(*)",
         "formula": "COUNT(*)",
         "description": "生产工单数量（口径：mes_work_order 记录数）",
-        "dims": ["状态", "产线", "产品", "日期"],
+        # 2026-09-29 补「工单状态」维度名：_detect_dim 对「工单状态分布」解析出「工单状态」，
+        # 而本口径 dims 只有「状态」（两者映射同一列 order_status），维度名对不上导致回退 LLM。
+        # 同族口径（在产/已完成/已取消工单数）的 dims 早已同时声明「状态」+「工单状态」，此处对齐。
+        "dims": ["状态", "工单状态", "产线", "产品", "日期"],
     },
     {
         "name": "计划数量",
@@ -239,7 +276,8 @@ BUILTIN_METRICS: list[dict] = [
     # ── 设备域（eqp_downtime_record）──
     {
         "name": "停机时长",
-        "aliases": ["停机时间", "停机分钟", "停机总时长", "停了多久", "设备停了多久"],
+        # 2026-09-29 补别名：「停机了多少」是现场口语问法（回答的是时长，不是次数），原表只有「停了多久」。
+        "aliases": ["停机时间", "停机分钟", "停机总时长", "停了多久", "设备停了多久", "停机了多少", "一共停机多长时间"],
         "unit": "分钟",
         "tables": ["eqp_downtime_record"],
         "sql_expression": "SUM(downtime_minutes)",
@@ -247,7 +285,9 @@ BUILTIN_METRICS: list[dict] = [
         # P0-4 维度层级钻取：设备类型 → 设备（dim_equipment 同表列级下钻）
         "dim_hierarchy": ["设备类型", "设备"],
         "description": "设备停机总时长（口径：eqp_downtime_record.downtime_minutes 求和）",
-        "dims": ["设备", "产线", "是否计划"],
+        # 2026-09-29 修复：「停机原因」是停机域最核心维度（_FACT_META 有映射），此前 dims 未声明，
+        # 导致「各停机原因的停机时长」命中不了走 LLM；「是否计划」是失效名（映射表叫「计划类型」）。
+        "dims": ["设备", "产线", "停机原因", "计划类型"],
     },
     {
         "name": "停机次数",
@@ -258,7 +298,7 @@ BUILTIN_METRICS: list[dict] = [
         "sql_expression": "COUNT(*)",
         "formula": "COUNT(*)",
         "description": "设备停机总次数（口径：eqp_downtime_record 记录数）",
-        "dims": ["设备", "产线", "是否计划"],
+        "dims": ["设备", "产线", "停机原因", "计划类型"],
     },
     {
         "name": "停机原因种类数",
@@ -288,7 +328,7 @@ BUILTIN_METRICS: list[dict] = [
         "sql_expression": "AVG(downtime_minutes)",
         "formula": "AVG(downtime_minutes)",
         "description": "平均单次停机时长（口径：eqp_downtime_record 的 downtime_minutes 平均值）",
-        "dims": ["设备", "产线", "车间"],
+        "dims": ["设备", "产线", "车间", "停机原因", "计划类型"],
     },
     {
         "name": "非计划停机时长",
@@ -322,7 +362,11 @@ BUILTIN_METRICS: list[dict] = [
     },
     {
         "name": "非计划停机占比",
-        "aliases": ["计划外停机占比", "非计划停机比例", "计划外停机比例", "故障停机占比"],
+        # 2026-09-29 摘除别名「故障停机占比」：字面「故障」指 downtime_reason='设备故障' 单一原因
+        # （占 15.16%），而本口径是 is_planned=FALSE 的全部非计划原因（占 52.72%）——两者差 3.5 倍。
+        # 该别名挂在这里会让「故障停机占比」被劫持到非计划口径（实测已发生），现归还给
+        # 专管设备故障的「设备故障停机占比」。
+        "aliases": ["计划外停机占比", "非计划停机比例", "计划外停机比例"],
         "unit": "%",
         "tables": ["eqp_downtime_record"],
         "sql_expression": "SUM(CASE WHEN is_planned = FALSE THEN downtime_minutes ELSE 0 END) * 100.0 / NULLIF(SUM(downtime_minutes), 0)",
@@ -406,7 +450,13 @@ BUILTIN_METRICS: list[dict] = [
     # ── 设备主数据域（dim_equipment，yans 基准：状态/类型分布）──
     {
         "name": "设备数",
-        "aliases": ["设备总量", "设备台数", "设备数量", "设备总数", "设备最多", "有几台设备", "有多少台设备", "几台设备", "设备总数和状态分布", "设备状态分布", "设备状态"],
+        # 2026-09-28 补语序变体：find_metrics 是**子串匹配**，原表只有「有多少台设备」，
+        # 而口语里「设备一共有多少台」「设备总共多少台」「设备多少台」把数量短语后置，
+        # 子串对不上 → 零命中 → 编译整体回退 LLM。实测「贴片机设备一共有多少台」因此走直生，
+        # 且 LLM 挑错了表（拿 eqp_downtime_record 数"停过机的设备"，而非 dim_equipment 数设备总数）。
+        # 补的这几条都是「设备」在前、数量短语在后的常见说法。
+        "aliases": ["设备总量", "设备台数", "设备数量", "设备总数", "设备最多", "有几台设备", "有多少台设备", "几台设备", "设备总数和状态分布", "设备状态分布", "设备状态",
+                    "设备一共有多少台", "设备总共有多少台", "设备总共多少台", "设备一共多少台", "设备多少台", "设备共有多少台"],
         "unit": "台",
         "tables": ["dim_equipment"],
         "sql_expression": "COUNT(*)",
@@ -516,10 +566,20 @@ BUILTIN_METRICS: list[dict] = [
                            "THEN MAX({standard_yield_rate|std_yield_rate}) * 100.0 "
                            "ELSE MAX({standard_yield_rate|std_yield_rate}) END"),
         "formula": "MAX(标准良率列)；存储为小数（如 0.965）时 ×100 归一为百分数，已是百分数（如 96.5）时原样输出",
-        "description": "工序标准良率（口径：dim_process 的标准良率列取最大；兼容 standard_yield_rate(小数) 与 std_yield_rate(百分数) 两种存储）",
+        # 2026-09-29 审计修正：原描述只说「取最大」，未点明这是「各工序标准良率中的最大值」——
+        # 无维度限定时容易被当成「全厂标准良率基准」。yans 实测该最大值 = 99.20%（PR08 包装入库），
+        # 是全厂最高的那道工序标准，不是全厂平均、也不是最低标准。
+        "description": "各工序标准良率中的最大值（口径：dim_process 标准良率列取 MAX；兼容 standard_yield_rate"
+                       "(小数) 与 std_yield_rate(百分数) 两种存储。yans 实测 99.20%，取自 PR08 包装入库工序，"
+                       "仅代表最高的那道工序标准，**不是全厂标准良率基准**；要看某工序请加「按工序」维度）",
         "dims": ["工序"],
     },
-    # ── 销售域（test_orders）──
+    # ── 销售域 ──
+    # 2026-09-29 审计说明：以下 8 条（销售域 4 条 / 物料域 2 条 / 工厂域 2 条）的事实表名
+    # 是 CSV 导入期的历史遗留（test_orders / test_materials / test_factories），
+    # 这三张表只存在于 postgres 库。**不需要额外字段限定**——get_effective_metrics 会经
+    # _metric_applicable 按当前库的真实表名过滤，在 yans / 123 库下这批口径自动不可见
+    # （实测 yans 下 get_effective_metrics 不含它们）。在 postgres 库下仍可正常使用。
     {
         "name": "销售金额",
         "aliases": ["销售额", "销售总额", "销售收入", "订单金额", "订单总额", "订单总金额"],
@@ -1028,10 +1088,24 @@ def _left_guard_vocab() -> set[str]:
                   # 2026-09-25 修复：「当前/现在」是合法时点修饰语（「当前库存还有多少」命中的
                   # 「库存还有多少」左侧剥不掉"当前"曾被误判 suspect → 零命中 → 回退 LLM）。
                   "当前", "现在",
+                  # 2026-09-29 修复：疑问/祈使功能词（「哪些产线本月产量超过上个月」里
+                  # 命中词左侧 run="哪些产线本月" 剥掉维度词与时间词后残留「哪些」，
+                  # 被当成未注册口径的修饰语 → find_metrics 零命中 → 编译链根本不起步 → 掉 LLM）。
+                  # 这些是句法功能词、不是口径修饰语：剥掉后「哪些一次合格率」仍剩「一次」→ 照常拦截。
+                  "哪些", "哪条", "哪几", "哪个", "哪台", "哪道", "列出", "找出", "有哪些",
                   # 2026-09-24 修复：厂级范围词缺失，导致「全厂良率是多少」被守卫误杀
                   # （命中别名"良率是多少"，左侧"全厂"剥不掉 → suspect → 编译回退 LLM）。
                   # 与已有「整体」「整个」「工厂」同类，属合法范围限定词。
-                  "全厂", "全公司", "全部产线", "整体产线"])
+                  "全厂", "全公司", "全部产线", "整体产线",
+                  # 2026-09-29 修复（同类问题第三次复发）：纯强调/限定副词缺失，
+                  # 「各工序的**实际**良率是多少」「各产线的**实际**良率」被守卫误杀 ——
+                  # 命中"良率"后左侧残留"实际"，剥不掉 → suspect → find_metrics 零命中
+                  # → 编译整体回退 LLM。实测同一句去掉"实际"即命中、加回即不命中，
+                  # 直接后果是确定性编译失效、退化到直生 SQL：耗时 0.7s → 26~69s，
+                  # 且产物退化成「合格数量 / 投入数量」两列并列，**没有算良率**。
+                  # 这几个词只表强调或时点，不改变口径语义（与"一次""出货"这类
+                  # 会偷换口径的真修饰语不同），故进词表。
+                  "实际", "真实", "确切", "具体", "目前", "如今", "时下"])
     return vocab
 
 
@@ -1050,6 +1124,25 @@ def _left_modifier_suspect(q: str, pos: int) -> bool:
     run = q[i + 1: pos]
     if not run:
         return False
+    # ── 2026-09-29：左侧若是**库里真实存在的枚举值**（不是修饰语），直接放行 ──
+    # 背景：本守卫的设计前提是「左侧残留 = 未注册口径的修饰语」。但左侧残留也可能是
+    # **取值**——「贴片机设备一共有多少台」里「贴片机」是 dim_equipment.equipment_type
+    # 的真实取值，"贴片机设备数量"就是"设备数量（贴片机）"，口径没变。
+    # 这类问法此前被判 suspect → 零命中 → 编译回退 LLM，而 LLM 会自作主张换表
+    # （实测这题被答成"停过机的设备数"，源表从 dim_equipment 换成了 eqp_downtime_record）。
+    # 判据用已建好的枚举倒排索引（_literal_table_index，按库落盘缓存 1h），命中即放行；
+    # 索引不可用时返回 False（保持旧行为，只做放宽不做收紧）。
+    # 注意只认**整段 run 恰为某个枚举值**，不认子串，避免「一次合格率」这种
+    # 真修饰语因为碰巧是某列取值而被误放行。
+    try:
+        from agent.llm_service import _literal_table_index as _lti
+        _idx = _lti() or {}
+        if isinstance(_idx, dict):
+            for _val in _idx.keys():
+                if isinstance(_val, str) and _val and _val == run:
+                    return False
+    except Exception:
+        pass
     vocab = _left_guard_vocab()
     changed = True
     while changed and run:
@@ -1118,7 +1211,23 @@ def find_metrics(query: str, limit: int = 3) -> list[dict]:
         _joined = any(re.match(r"\s*(?:和|与|及|、|,|，)\s*[\u4e00-\u9fa5]", q[len(w):])
                       for w in list(prefix_hits))
         if not _joined:
-            return list(prefix_hits.values())[:limit]
+            # 嵌套前缀过滤（2026-09-29）：短前缀别名是更长前缀别名的子串时丢弃短者
+            # （如「当前库存」⊂「当前库存总量」、「未达产」⊂「未达产工单」、
+            # 「检验合格率」⊂「检验合格率按批」）——两者都满足 q.startswith(w) 时会
+            # 同时进 prefix_hits，返回多个 → render_exec_sql_metric 唯一性让位 → 回退 LLM。
+            # 判据与第②档完整名嵌套过滤一致：长别名去掉短别名后剩的是否定词
+            # （不/非/无/未/欠）→ 视为对立指标（如「不良率」=「不」+「良率」）都保留；
+            # 其余（纯限定后缀）→ 丢短者，只留最精确的。
+            _NEG = ("不", "非", "无", "未", "欠")
+            _pfx = sorted(prefix_hits, key=len, reverse=True)
+            _pfx_out: list[dict] = []
+            for w in _pfx:
+                _nested = [x for x in _pfx if w in x and w != x]
+                if _nested and not any(x.replace(w, "", 1) in _NEG for x in _nested):
+                    continue
+                _pfx_out.append(prefix_hits[w])
+            if _pfx_out:
+                return _pfx_out[:limit]
     # ② 句中完整口径名：指标【名称】出现在 query 中（无前缀命中时），
     # 多个完整名并存（「产量和良率分别多少」）→ 全部返回走 clarify；单完整名 → 唯一。
     full_hits: dict[str, dict] = {}
@@ -1266,6 +1375,17 @@ def render_exec_sql_metric(query: str) -> dict | None:
     if len(execs) != 1:
         return None
     m = execs[0]
+    # 字符串型 exec_sql_by_dim 让位（2026-09-29 实测修复）：历史遗留的字符串模板
+    # （如「SELECT {dim} ... GROUP BY {dim}」）本意是按维度分组，但本函数只认 dict 型
+    # （按「产线/车间/产品/日期/仓库」选模板）。若问句带「各X/按X/每个X」分组信号而
+    # exec_sql_by_dim 又是字符串，强行用 exec_sql（整体单值）会**静默降级**——用户问
+    # 「各产线的设备可用率」却拿到一个整体百分比。这些口径的 sql_expression 非空且是
+    # 单事实表，普通编译器 try_compile_metric 已能正确 GROUP BY + JOIN 展示名，
+    # 故此处 return None 让位给普通编译（不损失确定性，还修好分组）。
+    if isinstance(m.get("exec_sql_by_dim"), str) and re.search(
+            r"各[\u4e00-\u9fa5]{1,8}|按[\u4e00-\u9fa5]{1,8}|每个[\u4e00-\u9fa5]{1,8}|每(?!次|天|日|月|周|季度|年)[\u4e00-\u9fa5]{1,8}",
+            query):
+        return None
     limit = 10
     mm = re.search(r"(?:前|最大|最多|最高|TOP|top)\s*(\d+)", query)
     if mm:
@@ -1467,7 +1587,25 @@ def resolve_metric_intent(query: str, acl=None) -> dict:
         # （用户没说清要哪个）仍走歧义澄清。
         if re.search(r"和|与|及|、|，|分别|各是|分别是", query):
             return {"status": "hit", "hits": out_hits, "hints": []}
-        return {"status": "ambiguous", "hits": out_hits, "hints": []}
+        # 2026-09-29（可用性修正）：无并列连词的 ≥2 命中**不再一律阻塞澄清**，改为
+        # 「能按最长匹配定出唯一主口径 → 直接执行主口径，其余挂备选；否则才澄清」。
+        # 为什么要改：阻塞的代价是一次澄清往返，用户点完还得再跑一遍完整链路；
+        # 而「严重缺陷占比」这类词本身就带唯一正确解——它是 hits 里最长的那个名称，
+        # 短名（严重缺陷数）只是被它包含的子串，词面已能判定，不该推给人再点一次。
+        # 判据（关键）：只有当**最长名严格长于其余所有候选**时才算主口径明确。
+        # 并列最长（如「产量」与「良率」同为 2 字、无连词）是真歧义 → 仍走阻塞，
+        # 这正是用户要求保留的「拒绝权」——拒绝的代价是再跑一次昂贵抽取，
+        # 但把真有歧义的题硬猜，等于把「答得慢」换成「答得糙」。
+        _names = [str(h.get("name") or "") for h in out_hits]
+        _maxlen = max((len(n) for n in _names), default=0)
+        _longest = [h for h in out_hits if len(str(h.get("name") or "")) == _maxlen]
+        if len(_longest) == 1:
+            primary = _longest[0]
+            rest = [h for h in out_hits if h is not primary]
+            return {"status": "ambiguous", "primary": primary,
+                    "hits": out_hits, "hints": [], "alternatives": rest}
+        return {"status": "ambiguous", "primary": None,
+                "hits": out_hits, "hints": [], "alternatives": out_hits}
     return {"status": "hit", "hits": out_hits, "hints": []}
 
 

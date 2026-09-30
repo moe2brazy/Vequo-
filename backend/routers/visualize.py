@@ -39,9 +39,13 @@ def _full_key(db_name: str) -> str:
 def prewarm_plan(db_name: str) -> None:
     """切库/连库后异步预热渲染方案（LLM 思考 + 缓存），避免用户首次点开 ER 图时等待 LLM"""
     key = _full_key(db_name)
-    if key in _plan_cache or key in _plan_working:
+    # 「先查后加」是两个非原子步骤，而这个函数会被并发调用（快速连续切库、连库与切库同时触发）：
+    # 两个调用可能同时通过检查、各自起一个后台线程跑同一份 LLM 预热（重复计费 + 重复耗时）。
+    # set.add 自身是原子的，用它的返回值当「我是不是第一个」的判据，一步完成判定与占位。
+    if key in _plan_cache:
         return
-    _plan_working.add(key)
+    if not _plan_working.add(key):
+        return  # 已有线程在预热这个 key，不重复起
     # 快照当前引擎：线程执行时可能已切库，防止 A 库方案误存 B 库键（竞态修复）
     try:
         from database import engine as _engine_snapshot
