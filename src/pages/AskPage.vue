@@ -178,6 +178,15 @@
                  :class="msg.role === 'user' ? 'ask-bubble-user' : 'ask-bubble-ai'">
               {{ msg.content }}
             </div>
+            <!-- 用户消息复制（2026-10-01）：贴气泡右下的迷你按钮，鼠标悬停消息行才显现，
+                 默认透明但占位（避免悬停时布局跳动），与 AI 回答操作栏同一套胶囊按钮风格 -->
+            <div v-if="msg.role === 'user'" class="ask-actions ask-actions-user">
+              <button
+                @click="copyUserMsg(msg)"
+                class="ask-action-btn ask-action-btn-sm ask-user-copy"
+                title="复制这条提问"
+              ><span v-if="msg.copiedUser"><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <polyline points="20 6 9 17 4 12" /> </svg></span></span><span v-else><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <rect width="14" height="14" x="8" y="8" rx="2" ry="2" /> <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" /> </svg></span></span>{{ msg.copiedUser ? ' 已复制' : ' 复制' }}</button>
+            </div>
             <!-- ===== 结果回答（最显眼：用户第一眼看到结论，溯源类内容在下方默认折叠）===== -->
             <div v-if="msg.result" class="ask-result-card">
               <div class="ask-result-head">
@@ -959,6 +968,7 @@ interface Message {
   answerText?: string            // 纯文本形态的回答（供"复制"按钮使用）
   copiedSql?: boolean            // SQL 复制成功的瞬时提示
   copiedAnswer?: boolean         // 回答复制成功的瞬时提示
+  copiedUser?: boolean           // 用户提问复制成功的瞬时提示（2026-10-01）
   sqlOpen?: boolean              // SQL 卡片展开状态（默认折叠）
   // ---- 口径管理（P1）：未命中反馈条 / 歧义澄清卡 ----
   metricResolution?: { status: string; hints?: string[]; hits?: any[] } | null
@@ -1488,7 +1498,7 @@ const renderAgentResult = (data: any, msg?: any): string => {
     // 用「无边框 + 柔和底 + 品牌竖标」的结论区承载，弱化描边、强化留白，
     // 让结论成为视觉重心，图表/表格降级为「数据依据」放在其后。
     if (data.analysis) {
-      html += `<div class="anl-conclusion">
+      html += `<div class="anl-conclusion" data-anl="1">
         <div class="anl-conclusion-title">
           <span class="anl-conclusion-dot"></span>
           分析结论
@@ -2012,6 +2022,7 @@ const sendMessage = async (presetText?: string | Event, opts?: { noConfirm?: boo
     let buffer = ''
     let finalData: any = null
     let lastRenderAt = 0   // 高频 token 渲染节流时间戳
+    let rendered = false   // 洞察后置：done 是否已立即渲染（避免流结束二次 applyFinalData）
 
     const updateMsg = () => {
       if (finalData?.type === 'analysis_confirm') {
@@ -2122,6 +2133,23 @@ const sendMessage = async (presetText?: string | Event, opts?: { noConfirm?: boo
           } else if (type === 'done') {
             streamingStep.value = ''
             finalData = payload.response || {}
+            // 洞察后置（2026-10-01）：done 里 analysis 已是规则摘要，立即渲染完整结果
+            // （表格+图表+规则摘要），不等流结束；LLM 洞察由后续 analysis 事件补发。
+            if (finalData) {
+              updateMsg()
+              rendered = true
+            }
+          } else if (type === 'analysis') {
+            // 洞察后置：补发 LLM 业务解读，覆盖 done 里的规则摘要。
+            // 只做 analysis 区块 DOM 局部替换，不重新 applyFinalData（避免图表重复初始化）。
+            if (finalData) {
+              finalData.analysis = payload.text || ''
+              const _mid = msg && msg._mid
+              const _body = _mid
+                ? document.querySelector<HTMLElement>(`.msg-item[data-mid="${_mid}"] [data-anl] .anl-conclusion-body`)
+                : null
+              if (_body) _body.innerHTML = renderAnalysis(finalData.analysis)
+            }
           } else if (type === 'error') {
             streamingStep.value = ''
             throw new Error(payload.message || payload.content || 'Agent 执行失败')
@@ -2172,9 +2200,9 @@ const sendMessage = async (presetText?: string | Event, opts?: { noConfirm?: boo
     // 流结束：仅当收到 done 事件（finalData 非空）才做最终整合——
     // 流被服务端干净关闭但未收到 done 时，保留已流式渲染的表格/图表，
     // 不做 applyFinalData(null) 的空覆盖（否则用户已见的结果瞬间消失，P1 修复）
-    if (finalData) {
+    if (finalData && !rendered) {
       updateMsg()
-    } else if (msg && !msg.result && (!msg.content || msg.content === '正在分析…')) {
+    } else if (!finalData && msg && !msg.result && (!msg.content || msg.content === '正在分析…')) {
       msg.content = '对话已结束'
     }
     // 2026-10-01：无论是否收到 done 事件，都必须结束加载态。
@@ -2402,6 +2430,13 @@ const copyAnswer = async (msg: any) => {
   const ok = await copyToClipboard(text)
   msg.copiedAnswer = ok
   if (ok) setTimeout(() => { msg.copiedAnswer = false }, 1800)
+}
+
+// 复制用户提问（2026-10-01）：与 copySql/copyAnswer 同一套剪贴板 + 瞬时提示模式
+const copyUserMsg = async (msg: any) => {
+  const ok = await copyToClipboard(msg?.content || '')
+  msg.copiedUser = ok
+  if (ok) setTimeout(() => { msg.copiedUser = false }, 1800)
 }
 
 // 重新回答：截断到本轮提问，用同一个问题重新走完整 Agent 流程
@@ -3365,6 +3400,20 @@ watch(() => props.initialQuestion, (question) => {
   font-size: 12px;
   color: var(--ink-400);
 }
+/* ===== 用户消息复制（2026-10-01）：气泡右下迷你胶囊按钮，默认透明、
+   悬停消息行才显现（占位不跳版），比 AI 操作栏更小一号（11px）===== */
+.ask-actions-user {
+  margin-top: 3px;
+  justify-content: flex-end;
+}
+.ask-action-btn-sm {
+  padding: 1px 8px;
+  font-size: 11px;
+  gap: 3px;
+}
+.msg-item .ask-user-copy { opacity: 0; }
+.msg-item:hover .ask-user-copy,
+.ask-user-copy:focus-visible { opacity: 1; }
 .ask-chart-select {
   padding: 4px 10px;
   border-radius: 9999px;

@@ -126,6 +126,12 @@ _FACT_META = {
             "产品": {"fact_col": "product_id", "join": ("dim_product", "product_id", "product_name")},
             "状态": {"fact_col": ["order_status", "status"], "join": None},
             "工单状态": {"fact_col": ["order_status", "status"], "join": None},   # 别名（同列，覆盖「工单状态」问法）
+            # 2026-10-01（黄金题库 id60）：工单表自己就是工单实体，「计划产量最多的工单」
+            # 此前无「工单」维度 → _auto_rank_dim 乱补第一个 JOIN 维度「产线」→ 按产线
+            # 汇总（95900）冒充单工单（2000）。按 work_order_no 直接分组即每张工单一行。
+            # 误分组防护：query 里「工单」若是口径词一部分（如「在产工单数」），会被
+            # try_compile 的口径词污染剔除按区间剔除，不会误触发分组。
+            "工单": {"fact_col": "work_order_no", "join": None},
         },
     },
     # 设备停机域
@@ -913,6 +919,21 @@ def _build_time_filter(fact_table: str, fact_col: str, query: str) -> str | None
             return f"{fact_col} >= {anchor} - INTERVAL '{max(0, n - 1)} days'"
     if re.search(r"(?:近|最近|过去|前|这)\s*半年|半年(?:以|之)?内", query):
         return f"{fact_col} >= {anchor} - INTERVAL '6 months'"
+    # ── 裸月份「9月份 / 9月」（2026-10-01 黄金题库批测修复，P0）─────────────
+    # 此前只认「2026年9月」（带年份）的绝对月份；裸「9月份的产量」完全不过滤时间 →
+    # 返回全期总量（3200857），与 9 月真实值（1191693）相差近 3 倍，数字格式完全正常、
+    # 用户毫无察觉 —— 黄金题库 5 道时间题（id61~65）全部中招的根因。
+    # 年份锚点用「事实列最大值的年份」（与本月/上月的 MAX 锚点哲学一致）：滞后/静态
+    # 数据集上裸月份永远命中最近一个有数据的同年月份，而不是空想的当前年。
+    # 负向断言排除「9月15日」这类日级表达（日级时间目前交 LLM，避免静默降级成整月）；
+    # 「近N个月/过去N月」已在前面的分支优先处理，不会走到这里。
+    _bm = re.search(r"(?<!\d)(\d{1,2})\s*月(?!份?\s*[0-9一二两三四五六七八九十]{1,2}\s*[日号])", query)
+    if _bm:
+        _mo = int(_bm.group(1))
+        if 1 <= _mo <= 12:
+            _y0 = f"(SELECT date_trunc('year', MAX({fact_col})) FROM {fact_table})"
+            return (f"{fact_col} >= {_y0} + INTERVAL '{_mo - 1} months' "
+                    f"AND {fact_col} < {_y0} + INTERVAL '{_mo} months'")
     if "上月" in query or "上个月" in query:
         return (f"{fact_col} >= date_trunc('month', {anchor}) - INTERVAL '1 month' "
                 f"AND {fact_col} < date_trunc('month', {anchor})")
@@ -2147,8 +2168,11 @@ def try_compile_metric(query: str) -> dict | None:
 
     from agent.metric_registry import find_metrics
     hits = find_metrics(query)
-    if not hits or len(hits) > 2:
-        return None  # 无指标 / 超过 2 个指标 → LLM（只安全编译 1~2 个同表指标）
+    # 2026-10-01：上限 2→3（黄金题库 id71「产量、合格数量、不良数量」三并列指标被
+    # 截断丢列）。编译路径对 N 个同表指标本就是同一机制（metrics_info 循环 + proj 拼列），
+    # 3 个同表指标拼 3 列与拼 2 列风险相同；跨表仍由 compile_multi_fact_bridge 接管。
+    if not hits or len(hits) > 3:
+        return None  # 无指标 / 超过 3 个指标 → LLM（只安全编译 1~3 个同表指标）
     # P0-2 声明式多表指标（compile_plan）：命中即优先确定性编译（如「库存周转天数」双事实表 CTE）。
     # 编译失败（如时间表达不在支持集）→ 自然落到普通编译，普通编译会因多表而回退 LLM（红线不变）。
     for _m in hits:
@@ -2246,8 +2270,26 @@ def try_compile_metric(query: str) -> dict | None:
                 # 误剔导致维度清空 → 回退 LLM。而真正要防的「各产品的设备故障停机占比」里
                 # 「设备」前是「的」（无分组信号），仍应剔除。故仅当维度词前**无**分组信号
                 # 时才按「口径词一部分」剔除。
+                # 2026-10-01 修复：维度词**后**紧邻「分析/分布/排行/排名」同样是明确分组信号
+                # （「停机原因分析」= 按停机原因分组）。否则「维度+后缀」问法（缺陷类型分布/
+                # 严重程度分布/停机原因排行/产品类别分布）里，维度词恰好落在命中的别名区间内
+                # 被误剔 → 编译成整表汇总一行（答非所问）。「缺陷类型分布」本就是黄金题库题，
+                # 此前同样被误编译成总条数 COUNT(*)。
+                # 2026-10-02 修复（黄金题库「各检验结果的数量」）：维度词在命中口径词区间内部、
+                # 但**区间起点**紧贴分组信号（各/按/每/分…）→ 用户「各+整个口径短语」的意图
+                # 就是按短语内的维度分组。此处「结果」距「各」隔了「检验」两字，上面两类
+                # 紧邻信号都判不到，维度被剔空 → 编译成整表 COUNT(*) 一行（答非所问）。
+                # 「各产品的设备故障停机占比」不受影响：区间起点前是「各产品的」（的 收尾，
+                # 无分组信号），「设备」仍按口径词一部分剔除，不会退化成二维分组。
                 _before = query[:_di]
-                if not re.search(r"(各|按|每|分|哪个|哪些|几个|这几个|每个|各个)$", _before):
+                _after = query[_di + len(_d):_di + len(_d) + 2]
+                _span_group = any(
+                    re.search(r"(各|按|每|分|哪个|哪些|几个|这几个|每个|各个)$", query[:s])
+                    for s, e in _spans if _di >= s and _di < e)
+                _is_group = (_span_group
+                             or re.search(r"(各|按|每|分|哪个|哪些|几个|这几个|每个|各个)$", _before)
+                             or re.match(r"(分析|分布|排行|排名)", _after))
+                if not _is_group:
                     continue
             _keep.append(_d)
         dims = _keep

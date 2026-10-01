@@ -104,7 +104,10 @@ BUILTIN_METRICS: list[dict] = [
     },
     {
         "name": "良率",
-        "aliases": ["合格率", "一次良率", "良品率", "全厂良率", "整体良率", "良率是多少", "良率水平"],
+        # 2026-10-01 补别名：「全厂综合良率/综合良率」是整厂汇总口径（good_qty/input_qty，无维度），
+        # 原表只有「全厂良率/整体良率」，实测「全厂综合良率」因「良率」左侧残留「综合」修饰语被
+        # _left_modifier_suspect 判定为未注册口径而零命中 → 走 LLM。补整词别名直接命中。
+        "aliases": ["合格率", "一次良率", "良品率", "全厂良率", "整体良率", "全厂综合良率", "综合良率", "良率是多少", "良率水平"],
         "unit": "%",
         "tables": ["mes_process_output"],
         "sql_expression": "SUM(good_qty) * 100.0 / NULLIF(SUM(input_qty), 0)",
@@ -150,7 +153,10 @@ BUILTIN_METRICS: list[dict] = [
     },
     {
         "name": "检验次数",
-        "aliases": ["检验批次", "检验批次数", "检验记录数", "检验单数", "抽检次数", "检验结果的数量", "结果分布", "检验结论分布", "检验最多", "检验了几批", "抽检了几批", "检验了多少次"],
+        # 2026-10-02 补别名：全称「检验结果分布」（短别名「结果分布」左侧紧贴「检验」
+        # 会被 find_metrics 的左侧修饰语守卫作废，必须注册全称才能命中）；
+        # 「各检验结果的数量」编译正确性由 metric_compiler 的区间起点分组信号修复保证。
+        "aliases": ["检验批次", "检验批次数", "检验记录数", "检验单数", "抽检次数", "检验结果的数量", "检验结果分布", "结果分布", "检验结论分布", "检验最多", "检验了几批", "抽检了几批", "检验了多少次"],
         "unit": "批",
         "tables": ["qms_inspection"],
         "sql_expression": "COUNT(*)",
@@ -190,7 +196,12 @@ BUILTIN_METRICS: list[dict] = [
     },
     {
         "name": "缺陷数",
-        "aliases": ["缺陷条数", "缺陷明细数", "不良记录数", "缺陷分布", "不良分布", "缺陷类型分布", "不良类型", "不良类型数", "缺陷最多", "出了几个缺陷", "缺陷有几条"],
+        # 2026-10-01 修复：移除「不良类型」「不良类型数」两个别名——「不良类型」是维度名不是「记录条数」，
+        # 挂在 COUNT(*) 口径的「缺陷数」上会劫持「各种不良类型主要出现在哪些产线」这类问法（命中缺陷数却
+        # 无「产线」维度与桥接 → 编译失败回退 LLM，慢且答非所问）。已转交「不良类型排行」（带产线桥接）。
+        # 2026-10-01 补别名：「严重程度分布」= 各严重度的缺陷数（dims 含「严重度」，维度别名「严重程度」已注册）。
+        # 原表无此词，实测零命中走 LLM。
+        "aliases": ["缺陷条数", "缺陷明细数", "不良记录数", "缺陷分布", "不良分布", "缺陷类型分布", "严重程度分布", "缺陷最多", "出了几个缺陷", "缺陷有几条"],
         # 2026-09-29 审计修正：原单位「次」不准确——本口径是 COUNT(*) 记录条数（yans 实测 2115 条），
         # 且易与「缺陷件数」(5273 件) 混淆，故改为「条」。
         "unit": "条",
@@ -277,7 +288,10 @@ BUILTIN_METRICS: list[dict] = [
     {
         "name": "停机时长",
         # 2026-09-29 补别名：「停机了多少」是现场口语问法（回答的是时长，不是次数），原表只有「停了多久」。
-        "aliases": ["停机时间", "停机分钟", "停机总时长", "停了多久", "设备停了多久", "停机了多少", "一共停机多长时间"],
+        # 2026-10-01 补别名：「停机原因分析/分布/排行」= 各停机原因的停机时长（dims 含「停机原因」）。
+        # 原表无此词，「停机原因」只是维度名不是别名，实测「停机原因分析」零命中走 LLM。
+        "aliases": ["停机时间", "停机分钟", "停机总时长", "停了多久", "设备停了多久", "停机了多少", "一共停机多长时间",
+                    "停机原因分析", "停机原因分布", "停机原因排行"],
         "unit": "分钟",
         "tables": ["eqp_downtime_record"],
         "sql_expression": "SUM(downtime_minutes)",
@@ -287,7 +301,9 @@ BUILTIN_METRICS: list[dict] = [
         "description": "设备停机总时长（口径：eqp_downtime_record.downtime_minutes 求和）",
         # 2026-09-29 修复：「停机原因」是停机域最核心维度（_FACT_META 有映射），此前 dims 未声明，
         # 导致「各停机原因的停机时长」命中不了走 LLM；「是否计划」是失效名（映射表叫「计划类型」）。
-        "dims": ["设备", "产线", "停机原因", "计划类型"],
+        # 2026-10-01 补「车间」维度：停机表经 line_id→dim_production_line 桥接出 workshop_name，
+        # 支撑「各车间的停机原因排行」这类跨维问法（_FACT_META 已注册该桥接，此前 dims 漏声明）。
+        "dims": ["设备", "产线", "车间", "停机原因", "计划类型"],
     },
     {
         "name": "停机次数",
@@ -332,7 +348,9 @@ BUILTIN_METRICS: list[dict] = [
     },
     {
         "name": "非计划停机时长",
-        "aliases": ["计划外停机时长", "非计划停机时间", "计划外停机时间"],
+        # 2026-10-01 补别名：「非计划停机总时长」是最直白的 total 问法，原表只有「计划外停机时长」等，
+        # 实测「非计划停机总时长」因多「总」字子串不匹配而零命中。
+        "aliases": ["计划外停机时长", "非计划停机时间", "计划外停机时间", "非计划停机总时长"],
         "unit": "分钟",
         "tables": ["eqp_downtime_record"],
         "sql_expression": "SUM(CASE WHEN is_planned = FALSE THEN downtime_minutes ELSE 0 END)",
@@ -352,7 +370,9 @@ BUILTIN_METRICS: list[dict] = [
     },
     {
         "name": "计划内停机时长",
-        "aliases": ["计划停机时长", "计划内停机时间", "计划保养时长"],
+        # 2026-10-01 补别名：「计划停机总时长」是最直白的 total 问法，原表只有「计划停机时长」，
+        # 实测「计划停机总时长」因多「总」字子串不匹配而零命中。
+        "aliases": ["计划停机时长", "计划内停机时间", "计划保养时长", "计划停机总时长"],
         "unit": "分钟",
         "tables": ["eqp_downtime_record"],
         "sql_expression": "SUM(CASE WHEN is_planned THEN downtime_minutes ELSE 0 END)",
@@ -377,17 +397,30 @@ BUILTIN_METRICS: list[dict] = [
     # ── 库存域（inv_inventory_snapshot）──
     {
         "name": "库存量",
-        # 2026-09-25 审计修正：原别名混入大量「当前/还剩」语义词（当前库存/还剩多少库存/
-        # 还有多少货…），而算式是全历史快照累计（yans 3366671），与最新快照真实值(72961)
-        # 相差约 46 倍——这些别名已迁往新口径「当前库存量」；「总库存/库存总量」归还「总库存」。
-        "aliases": ["库存数量", "可用库存", "库存变化"],
+        # 2026-10-01（黄金题库 id45/57 批测修复）：inv_inventory_snapshot 是**每日快照表**，
+        # 原算式 SUM(available_qty) 全历史累计（3366671）是快照重复累加出来的假库存，
+        # 与最新快照真实值（73781，可用+冻结）差约 46 倍；「各仓库的库存量」「库存量最多
+        # 的仓库」全中招。口径改为**最新快照日**的可用+冻结合计（与「各仓库库存量」「当前
+        # 总库存量」对齐）。sql_expression 含子查询会被 _safe_metric_expr 判不可编译（防
+        # 注入红线）→ 确定性执行由 exec_sql/exec_sql_by_dim 承担（与「安全库存达标率」同模式）。
+        # 别名「可用库存」「库存变化」移除：前者语义应为不含冻结（防混），后者是时序语义
+        # （趋势问法交 LLM 画每日序列，不该落到单值口径）。
+        "aliases": ["库存数量"],
         "unit": "件",
         "tables": ["inv_inventory_snapshot"],
         "sql_expression": "SUM(available_qty)",
-        "formula": "SUM(available_qty)（全历史快照累计）",
-        "description": "可用库存合计（口径：inv_inventory_snapshot.available_qty **全历史快照**求和，"
-                       "yans 实测 3366671）。⚠️ 该表是每日快照，问「当前/现在还有多少库存」应使用"
-                       "「当前库存量」口径（最新快照 2026-07-15 为 72961），两者差约 46 倍",
+        "exec_sql": "SELECT SUM(available_qty + COALESCE(frozen_qty,0)) AS \"库存量\" FROM inv_inventory_snapshot WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot)",
+        "exec_sql_by_dim": {
+            "_default": "SELECT SUM(available_qty + COALESCE(frozen_qty,0)) AS \"库存量\" FROM inv_inventory_snapshot WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot)",
+            "仓库": "SELECT warehouse_code AS \"仓库\", SUM(available_qty + COALESCE(frozen_qty,0)) AS \"库存量\" FROM inv_inventory_snapshot WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) GROUP BY warehouse_code ORDER BY \"库存量\" DESC",
+            "产品": "SELECT p.product_name AS \"产品\", SUM(i.available_qty + COALESCE(i.frozen_qty,0)) AS \"库存量\" FROM inv_inventory_snapshot i JOIN dim_product p ON p.product_id = i.product_id WHERE i.snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) GROUP BY p.product_name ORDER BY \"库存量\" DESC",
+            "日期": "SELECT to_char(snapshot_date, 'YYYY-MM-DD') AS \"日期\", SUM(available_qty + COALESCE(frozen_qty,0)) AS \"库存量\" FROM inv_inventory_snapshot GROUP BY snapshot_date ORDER BY snapshot_date",
+        },
+        "formula": "最新快照日 Σ(available_qty + frozen_qty)",
+        "description": "当前库存合计（口径：inv_inventory_snapshot **最新快照日** 的 可用+冻结 求和，"
+                       "yans 实测 73781：WH-A 43187 / WH-B 21000 / WH-QA 9594）。⚠️ 该表是每日快照，"
+                       "直接全历史 SUM 会重复累加（旧口径 3366671 差 46 倍，已废弃）；库存随时间的"
+                       "变化趋势请直接问「每天的库存量」（按快照日序列）。",
         "dims": ["仓库", "产品", "日期"],
     },
     {
@@ -499,7 +532,9 @@ BUILTIN_METRICS: list[dict] = [
     },
     {
         "name": "产品数",
-        "aliases": ["产品总量", "产品种类数", "产品种类", "产品总数"],
+        # 2026-10-01 补别名：「产品类别分布/排行」= 各产品类别的产品数（dims 含「产品类别」），
+        # 原表只有「产品种类」等词，实测「产品类别分布」零命中走 LLM。
+        "aliases": ["产品总量", "产品种类数", "产品种类", "产品总数", "产品类别分布", "产品类别排行"],
         "unit": "种",
         "tables": ["dim_product"],
         "sql_expression": "COUNT(*)",
@@ -531,7 +566,9 @@ BUILTIN_METRICS: list[dict] = [
     },
     {
         "name": "关键工序数",
-        "aliases": ["重点工序数", "关键工序数量", "关键工序总数", "关键工序有多少个", "有多少个关键工序", "几道关键工序", "关键工序有几道"],
+        # 2026-10-01 补别名：「关键工序的数量/各关键工序的数量」是带「的」的口语问法，
+        # 原表只有「关键工序数量」，实测多「的」字即零命中。
+        "aliases": ["重点工序数", "关键工序数量", "关键工序总数", "关键工序有多少个", "有多少个关键工序", "几道关键工序", "关键工序有几道", "各关键工序的数量", "关键工序的数量"],
         "unit": "道",
         "tables": ["dim_process"],
         "required_cols": ["is_key_process"],
@@ -1062,7 +1099,8 @@ def _left_guard_vocab() -> set[str]:
                     vocab.add(str(a).lower())
     except Exception:
         pass
-    vocab.update(["各", "每", "每个", "各个", "所有", "全部", "按",
+    vocab.update(["各", "每", "每个", "各个", "各种", "每种", "各类", "每类",
+                  "所有", "全部", "按",
                   "每月", "每周", "每日", "每天", "本月", "当月", "上月", "上个月",
                   "下月", "今年", "去年", "本季度", "上月末", "近期",
                   # 单字时间量词（「7月产量」「6月产量」中数字截断中文扫描后残留的「月」，
@@ -1230,6 +1268,21 @@ def find_metrics(query: str, limit: int = 3) -> list[dict]:
     scored = [(ln, w, m) for (ln, w, m, pos) in scored if not _left_modifier_suspect(q, pos)]
     if not scored:
         return []
+    # ④ 右侧「率」后缀防劫持（2026-10-01 黄金题库 id33）：「各产线的不良率」里长别名
+    # 「各产线的不良」(6字) 子串命中「产线不良数」，压过真正的「不良率」(3字) →
+    # 按产线汇总不良【件数】(22690) 冒充不良【率】(2.41%)，量纲完全错了还看不出来。
+    # 守卫：命中词右侧紧贴「率」而命中词自身又不以「率」结尾 → 右侧拼出了另一个
+    # 「……率」词（率类口径或未注册口径），本条命中作废，让位给率类指标/LLM。
+    # 正面例不受影响：「不良率」「合格率」本身以「率」结尾；「各产线的不良数」右侧是「数」。
+    _kept = []
+    for _ln, _w, _m in scored:
+        _p = q.find(_w)
+        if not _w.endswith("率") and _p >= 0 and _p + len(_w) < len(q) and q[_p + len(_w)] == "率":
+            continue
+        _kept.append((_ln, _w, _m))
+    scored = _kept
+    if not scored:
+        return []
     # ① 前缀状态口径最优先（全量命中里 query 以该词开头）：query 以精确口径词开头时
     # 泛口径（如"工单数"命中"等待生产的工单数量"里的"工单数量"）让位 ——
     # 「等待生产的工单数量」→ 待生产工单数；「已完成工单有多少」→ 已完成工单数。
@@ -1261,29 +1314,83 @@ def find_metrics(query: str, limit: int = 3) -> list[dict]:
                 _pfx_out.append(prefix_hits[w])
             if _pfx_out:
                 return _pfx_out[:limit]
-    # ② 句中完整口径名：指标【名称】出现在 query 中（无前缀命中时），
-    # 多个完整名并存（「产量和良率分别多少」）→ 全部返回走 clarify；单完整名 → 唯一。
-    full_hits: dict[str, dict] = {}
+    # ② 句中完整口径名/完整别名（2026-10-01 重写，黄金题库 id46/47/70/71）：
+    # 指标【名称】或【别名】出现在 query 中（无前缀命中时），多个并存 → 全部返回。
+    # 旧逻辑只收「名称==命中词」，别名命中的指标（缺陷件数 的别名「缺陷数量」、
+    # 不良数 的别名「不良数量」）被遗漏，反而让更短的名称命中抢答：
+    #   「各严重程度的缺陷数量」→ 缺陷数(COUNT 条数) 抢答 缺陷件数(SUM 件数)，量纲错；
+    #   「产量、合格数量、不良数量」→ 不良数量(别名命中) 整列丢失。
+    # 收齐后做「跨度感知」嵌套过滤（替代旧的纯字符串包含判断）：
+    #   - 短词 w 的**所有**出现都落在长词 w2 的出现范围内（w ⊂ w2）→ 嵌套限定，丢短者
+    #     （「未完工工单数」里的「工单数」）；若 query 带并列连词且 w2 去掉 w 后以否定词
+    #     开头（停机时长 和 非计划停机时长）→ 用户并列点名的对立口径，都保留。
+    #   - 短词与长词部分重叠但不互为子串（「各产线的不良[数]」：不良数 与 各产线的不良）
+    #     → 更长词优先，丢短者。
+    #   - 互不重叠的并列（产量、合格数量、不良数量）→ 全部保留。
+    full_hits: dict[tuple[str, str], dict] = {}
     for _ln, w, m in scored:
         nm = str(m.get("name") or "").lower()
-        if nm and nm in q and nm == w:
-            full_hits.setdefault(nm, m)
+        if w and w in q:
+            full_hits.setdefault((w, nm), m)
     if full_hits:
-        # 嵌套口径过滤：短名称是更长完整名称的子串时丢弃短者（如"工单数" ⊂ "在产工单数"），
-        # 只保留最精确的状态/限定口径；互不为子串的并列（产量/良率）全部返回走 clarify。
-        # 2026-09-14 v4 题库题1/2 修复：「良率」⊂「不良率」是**否定对立**（不良率=不+良率，
-        # 两个独立指标，必须都返回），不能按状态限定口径误丢弃——否则「各产线的良率和不良率」
-        # 只命中「不良率」，编译产物漏掉「良率」列。判据：长名称去掉短名称后剩的恰是否定词
-        # （不/非/无/未/欠）→ 视为对立指标，都保留；其余（在产+工单数）→ 状态限定，丢短者。
-        _NEG = ("不", "非", "无", "未", "欠")
-        _names = sorted(full_hits, key=len, reverse=True)
-        _out = []
-        for n in _names:
-            _nested = [m for m in _names if n in m and n != m]
-            if _nested and not any(m.replace(n, "", 1) in _NEG for m in _nested):
-                continue
-            _out.append(full_hits[n])
-        return _out[:limit]
+        _NEG_HEAD = ("不", "非", "无", "未", "欠")
+        _has_conn = bool(re.search(r"和|与|及|、|，|分别|各是|分别是", query))
+
+        def _spans_of(hay: str, needle: str) -> list[tuple[int, int]]:
+            _sp, _i = [], hay.find(needle)
+            while _i >= 0:
+                _sp.append((_i, _i + len(needle)))
+                _i = hay.find(needle, _i + 1)
+            return _sp
+
+        _keys = sorted(full_hits, key=lambda k: len(k[0]), reverse=True)
+        _out: list[dict] = []
+        for _k in _keys:
+            _w = _k[0]
+            _sp_w = _spans_of(q, _w)
+            _dropped = False
+            for _k2 in _keys:
+                _w2 = _k2[0]
+                if _w2 == _w or len(_w2) <= len(_w):
+                    continue
+                _sp_2 = _spans_of(q, _w2)
+                if _w in _w2 and all(
+                        any(a >= s and b <= e for (s, e) in _sp_2) for (a, b) in _sp_w):
+                    _rem = _w2.replace(_w, "", 1)
+                    if _has_conn and _rem and _rem[0] in _NEG_HEAD:
+                        continue  # 并列点名的否定对立口径（…和 非计划停机时长）→ 都保留
+                    _dropped = True
+                    break
+                if _w not in _w2 and _w2 not in _w and any(
+                        a < e2 and b > s2 for (a, b) in _sp_w for (s2, e2) in _sp_2):
+                    _dropped = True  # 部分重叠（非包含）→ 长词优先
+                    break
+            if not _dropped:
+                _out.append((_w, full_hits[_k]))
+        if _out:
+            # ⑤ 同表同算式去重（2026-10-02 黄金题库 id31/33/34/69）：同一命中词
+            # （如「良率」）会同时命中「良率」与「工序良率」这类同表、同算式的
+            # 命名变体，全部返回会让合并 SQL 产出两列一模一样的值（5行×2列=10值，
+            # 用户要一列却看到两列）。判据：tables 相同且 sql_expression（退化为
+            # formula）相同 → 视为同一口径，只保留一个；优先「名称恰等于命中词」
+            # 的（问「良率」列名叫「良率」），其次比「名称出现在问句中」。
+            # 算式不同的并列（停机时长 vs 非计划停机时长、良率 vs 不良率）不受影响。
+            _dedup: list[tuple[str, dict]] = []
+            _by_expr: dict[tuple, int] = {}
+            for _w, _m in _out:
+                _key = (tuple(sorted(_m.get("tables") or [])),
+                        str(_m.get("sql_expression") or _m.get("formula") or "").strip())
+                _pi = _by_expr.get(_key)
+                if _pi is None:
+                    _by_expr[_key] = len(_dedup)
+                    _dedup.append((_w, _m))
+                    continue
+                _pw, _pm = _dedup[_pi]
+                _cur = (str(_m.get("name")).lower() == _w, str(_m.get("name")) in q)
+                _old = (str(_pm.get("name")).lower() == _pw, str(_pm.get("name")) in q)
+                if _cur > _old:
+                    _dedup[_pi] = (_w, _m)
+            return [m for _, m in _dedup][:limit]
     # ③ 最长匹配兜底（含 123 库去重）
     scored.sort(key=lambda x: x[0], reverse=True)
     max_len = scored[0][0]

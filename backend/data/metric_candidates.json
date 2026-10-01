@@ -2994,6 +2994,25 @@
    "status": "pending",
    "source": "runtime",
    "mined_at": 1790842127
+  },
+  "13a06d2dd965": {
+   "id": "13a06d2dd965",
+   "expr": "COUNT(DISTINCT product_id)",
+   "tables": [
+    "inv_inventory_snapshot"
+   ],
+   "dims": [
+    "warehouse_code"
+   ],
+   "hit_count": 1,
+   "sample_question": "每个仓库各有多少种产品",
+   "name": "product_type_count",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1790860886
   }
  },
  "ignored": [
