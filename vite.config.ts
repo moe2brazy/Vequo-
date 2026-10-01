@@ -29,6 +29,15 @@ export default defineConfig({
   server: {
     // 同时监听 IPv4 与 IPv6（host:true 双栈）——避免浏览器 localhost 解析到 127.0.0.1 时连不上
     host: true,
+    // 只监视前端自身的文件。vite 默认把整个项目根递归建监视，
+    // 而本仓库根下还放着 backend/（含 .venv，约 3.9 万个文件），
+    // 建立监视要耗掉好几分钟；这段时间 dev server 已经打印 "ready"，却不响应任何请求，
+    // 浏览器打开就是空白页。把非前端目录排除掉，启动后立刻可用。
+    // 注意：node_modules / .git 本来是 vite 的默认忽略项，这里一并写上，
+    // 因为一旦自己传了 ignored，默认那两项就不再自动生效。
+    watch: {
+      ignored: ['**/node_modules/**', '**/.git/**', '**/backend/**'],
+    },
     proxy: {
       '/api': {
         target: 'http://127.0.0.1:8010',

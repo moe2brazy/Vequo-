@@ -29,73 +29,94 @@ const STEP_LABELS: Record<string, string> = {
 
 export async function askAgentStream(
   query: string,
-  opts: { onStep?: (label: string) => void; signal?: AbortSignal } = {},
+  opts: { onStep?: (label: string) => void; signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<AgentAnswer> {
-  const resp = await fetch('/api/agent/stream', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query }),
-    signal: opts.signal,
-  })
-  if (!resp.ok || !resp.body) {
-    const err = await resp.json().catch(() => null)
-    throw new Error(err?.detail || `请求失败(${resp.status})`)
+  // 2026-10-01 修复：
+  // 1) 增加整体超时（默认 120s）——后端 hang 时此前气泡会永远停在"正在思考…"
+  // 2) 内部 AbortController 与外部 signal 级联，finally 中 reader.cancel()
+  //    ——此前中途抛错时 SSE 连接不关闭，长会话会耗尽浏览器同域连接数
+  const timeoutMs = opts.timeoutMs ?? 120_000
+  const ctrl = new AbortController()
+  const onOuterAbort = () => ctrl.abort()
+  if (opts.signal) {
+    if (opts.signal.aborted) ctrl.abort()
+    else opts.signal.addEventListener('abort', onOuterAbort, { once: true })
   }
-  const reader = resp.body.getReader()
-  const decoder = new TextDecoder('utf-8')
-  let buffer = ''
-  let final: any = null
-
-  const handlePayload = (payload: any) => {
-    if (!payload || typeof payload.type !== 'string') return
-    if (payload.type === 'step') {
-      opts.onStep?.(STEP_LABELS[payload.name] || `正在${payload.name || '分析'}…`)
-    } else if (payload.type === 'done') {
-      final = payload.response || {}
-    } else if (payload.type === 'error') {
-      throw new Error(payload.message || payload.content || 'Agent 执行失败')
+  const timer = timeoutMs > 0 ? setTimeout(() => ctrl.abort(new Error('请求超时')), timeoutMs) : null
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
+  try {
+    const resp = await fetch('/api/agent/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query }),
+      signal: ctrl.signal,
+    })
+    if (!resp.ok || !resp.body) {
+      const err = await resp.json().catch(() => null)
+      throw new Error(err?.detail || `请求失败(${resp.status})`)
     }
-  }
+    reader = resp.body.getReader()
+    const decoder = new TextDecoder('utf-8')
+    let buffer = ''
+    let final: any = null
 
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    // 归一化换行，兼容 \r\n\r\n 分隔；一个事件内多行 data: 拼为同一 JSON
-    const norm = buffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
-    const events = norm.split('\n\n')
-    buffer = events.pop() || ''
-    for (const evt of events) {
-      const dataLines: string[] = []
-      for (const line of evt.split('\n')) {
-        if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
-      }
-      if (!dataLines.length) continue
-      try {
-        handlePayload(JSON.parse(dataLines.join('\n')))
-      } catch (e) {
-        if (e instanceof SyntaxError) continue // 畸形事件跳过，不中断整条流
-        throw e
+    const handlePayload = (payload: any) => {
+      if (!payload || typeof payload.type !== 'string') return
+      if (payload.type === 'step') {
+        opts.onStep?.(STEP_LABELS[payload.name] || `正在${payload.name || '分析'}…`)
+      } else if (payload.type === 'done') {
+        final = payload.response || {}
+      } else if (payload.type === 'error') {
+        throw new Error(payload.message || payload.content || 'Agent 执行失败')
       }
     }
-  }
-  // flush 解码器尾部缓冲（最后一段无空行结尾的完整事件）
-  buffer += decoder.decode()
-  const tail = buffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
-  for (const line of tail.split('\n')) {
-    if (!line.startsWith('data:')) continue
-    try { handlePayload(JSON.parse(line.slice(5).trimStart())) } catch { /* 忽略 */ }
-  }
 
-  const type: string = final?.type || ''
-  let answer: string = String(final?.answer || '').trim()
-  if (type === 'data_query') {
-    const rows = final?.result?.rows?.length ?? 0
-    answer = answer || `已查询到 ${rows} 条数据`
-    answer += '\n\n（数据查询的完整表格与图表请前往「智能问析」查看）'
+    // 与主循环一致的事件切分：按空行分块、事件内多行 data: 拼为同一 JSON
+    const processEvents = (text: string) => {
+      const events = text.split('\n\n')
+      const rest = events.pop() || ''
+      for (const evt of events) {
+        const dataLines: string[] = []
+        for (const line of evt.split('\n')) {
+          if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
+        }
+        if (!dataLines.length) continue
+        try {
+          handlePayload(JSON.parse(dataLines.join('\n')))
+        } catch (e) {
+          if (e instanceof SyntaxError) continue // 畸形事件跳过，不中断整条流
+          throw e
+        }
+      }
+      return rest
+    }
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      // 归一化换行，兼容 \r\n\r\n 分隔
+      buffer = processEvents(buffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n'))
+    }
+    // flush 解码器尾部缓冲（最后一段无空行结尾的完整事件）——
+    // 2026-10-01 修复：此前尾部逐行 JSON.parse，多行 data: 事件会被静默丢弃（最终回答丢失）
+    buffer += decoder.decode()
+    buffer = processEvents(buffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n') + '\n\n')
+
+    const type: string = final?.type || ''
+    let answer: string = String(final?.answer || '').trim()
+    if (type === 'data_query') {
+      const rows = final?.result?.rows?.length ?? 0
+      answer = answer || `已查询到 ${rows} 条数据`
+      answer += '\n\n（数据查询的完整表格与图表请前往「智能问析」查看）'
+    }
+    if (!answer) {
+      answer = '抱歉，我没有理解这个问题，可以换个说法再问一次，或前往「智能问析」使用完整 AI 分析。'
+    }
+    return { text: answer, type }
+  } finally {
+    if (timer) clearTimeout(timer)
+    if (opts.signal) opts.signal.removeEventListener('abort', onOuterAbort)
+    try { await reader?.cancel() } catch { /* 流已结束/已出错，忽略 */ }
   }
-  if (!answer) {
-    answer = '抱歉，我没有理解这个问题，可以换个说法再问一次，或前往「智能问析」使用完整 AI 分析。'
-  }
-  return { text: answer, type }
 }

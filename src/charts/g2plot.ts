@@ -35,18 +35,8 @@ export const OPS_PALETTE = [
 const TEXT_COLOR = '#5c6b7a'
 const AXIS_COLOR = '#c9d3df'
 
-/** 生成竖向渐变色（柱状图/面积图用：同色系由深到浅，比纯色更有质感）
- *  注意：echarts 需在页面里可用，这里延迟取 graphics API，避免模块加载时强依赖。 */
-export function verticalGradient(echarts: any, color: string, topAlpha = 1, bottomAlpha = 0.35) {
-  try {
-    return new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-      { offset: 0, color: hexToRgba(color, topAlpha) },
-      { offset: 1, color: hexToRgba(color, bottomAlpha) },
-    ])
-  } catch {
-    return color
-  }
-}
+// 2026-10-01 清理：删除死导出 verticalGradient——全项目无任何调用方，
+// ECharts 侧渐变都是各自实现的（charts/index.ts 内联 LinearGradient）。
 
 /** #RRGGBB → rgba(r,g,b,a) */
 export function hexToRgba(hex: string, alpha = 1): string {
@@ -103,17 +93,24 @@ export function isG2PlotType(type: string): boolean {
   return !!type && G2PLOT_TYPES.includes(String(type).toLowerCase())
 }
 
-// ── 列类型判定（与 AskPage 的 isNumCol 同口径：采样前 8 行，空值跳过）──
+// ── 列类型判定（与 charts/index.ts 的 isNumCol 同口径：采样前 8 行，空值跳过；
+// 2026-10-01 修复：剥离千分位逗号，此前 "1,234" 在本侧判为类别列、ECharts 侧判为数值列，
+// 两引擎 catCol/numCols 选择分叉导致维度错位）──
 const isNumCol = (col: string, rows: any[]): boolean => {
+  // 2026-10-01 修复：与 charts/index.ts 同口径——整窗多数决（≥70% 可转数字才算数值列），
+  // 原实现第一个非空值就 return，前 8 行全 NULL 的数值列会被误判为类目轴
+  let numCount = 0
+  let nonEmpty = 0
   for (const r of rows.slice(0, 8)) {
     const v = r?.[col]
-    if (v === null || v === undefined || v === '') continue
-    if (typeof v === 'number') return true
-    const s = String(v).trim()
-    if (s === '') continue
-    return !isNaN(Number(s))
+    if (v === null || v === undefined || String(v).trim() === '') continue
+    nonEmpty++
+    if (typeof v === 'number' && Number.isFinite(v)) { numCount++; continue }
+    const s = String(v).trim().replace(/,/g, '')
+    if (s !== '' && !isNaN(Number(s))) numCount++
   }
-  return false
+  if (nonEmpty === 0) return false
+  return numCount / nonEmpty >= 0.7
 }
 
 const numColsOf = (cols: string[], rows: any[]) => cols.filter((c) => isNumCol(c, rows))
@@ -169,7 +166,8 @@ function quantile(sorted: number[], q: number): number {
  * 构建 G2Plot 图表配置。
  * 返回 null 表示「该类型无法用当前数据渲染」，调用方应回退 SVG。
  */
-export function buildG2PlotConfig(type: string, cols: string[], rows: any[], palette?: string[]): Record<string, any> | null {
+// 2026-10-01 清理：取消 export（仅本文件内部使用），避免死导出扩大模块公共面
+function buildG2PlotConfig(type: string, cols: string[], rows: any[], palette?: string[]): Record<string, any> | null {
   const t = String(type || '').toLowerCase()
   if (!rows.length || !cols.length) return null
   const pal = palette || PALETTE

@@ -70,7 +70,7 @@ CN_EN_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("价格",   ("price",)),
     ("成本",   ("cost",)),
     ("工资",   ("salary",)),
-    ("温度",   ("temp",)),
+    ("温度",   ("temp", "temperature")),  # 2026-10-01 修复：_token_match 按下划线整词匹配，只写 temp 永远命不中 temperature 整词
     ("寿命",   ("life",)),
     ("序列",   ("seq",)),
     ("率",     ("rate", "ratio")),

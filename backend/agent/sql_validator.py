@@ -120,7 +120,9 @@ def validate_sql_safety(sql: str, dialect: str = "postgres") -> tuple[bool, str,
         cleaned = cleaned.rstrip(";").rstrip() + "\nLIMIT 100"
 
     # 6. 括号配对检查
-    if cleaned.count("(") != cleaned.count(")"):
+    # 2026-10-01 修复：先剥离字符串字面量再计数——此前 `WHERE status = '待补(料'`
+    # 这类字面量含不配对括号的正确 SQL 会被误判"括号不配对"而整条拦截。
+    if _strip_string_literals(cleaned).count("(") != _strip_string_literals(cleaned).count(")"):
         return False, "SQL 括号不配对", cleaned
 
     return True, "", cleaned

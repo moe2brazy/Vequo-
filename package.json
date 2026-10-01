@@ -11,7 +11,6 @@
   "dependencies": {
     "@antv/g2plot": "^2.4.35",
     "@fontsource/rajdhani": "^5.3.0",
-    "@fontsource/zcool-qingke-huangyou": "^5.3.0",
     "echarts": "^6.1.0",
     "vis-data": "^8.0.4",
     "vis-network": "^10.1.0",

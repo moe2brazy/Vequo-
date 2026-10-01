@@ -79,8 +79,18 @@ export function updateLocalUser(partial: Partial<AuthUser>): AuthUser | null {
 }
 
 
-/** 发送邮箱注册验证码；返回重发冷却秒数（默认 60） */
-export async function sendEmailCode(email: string): Promise<number> {
+/** 发送邮箱注册验证码的返回结果 */
+export interface SendCodeResult {
+  /** 重发冷却秒数（默认 60） */
+  cooldown: number
+  /** 是否已真实投递到邮箱。false = 后端处于调试模式，验证码只打在后端控制台 */
+  sent: boolean
+  /** 未真实投递的原因（如「MAIL_SMTP_PASSWORD 未填写完整」） */
+  hint: string
+}
+
+/** 发送邮箱注册验证码 */
+export async function sendEmailCode(email: string): Promise<SendCodeResult> {
   const resp = await fetch('/api/auth/email/send-code', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -90,7 +100,12 @@ export async function sendEmailCode(email: string): Promise<number> {
   if (!resp.ok) {
     throw new Error((data as any).detail || `验证码发送失败（HTTP ${resp.status}）`)
   }
-  return (data as any).cooldown || 60
+  return {
+    cooldown: (data as any).cooldown || 60,
+    // 后端旧版本没有 sent 字段，此时按「已发送」处理，避免误报调试模式
+    sent: (data as any).sent !== false,
+    hint: (data as any).mail_hint || '',
+  }
 }
 
 export async function login(email: string, password: string): Promise<AuthUser> {

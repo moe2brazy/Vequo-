@@ -6010,8 +6010,16 @@ class LLMService:
         # ── 语义缓存沉淀：SQL 执行成功 + 无结果告警 + 规则复核通过才写入。
         # 2026-09-12 修复：此前没有 _validate_result 门，"能跑但答非所问"的 SQL 也会沉淀，
         # 下次同义问法 0.2s 直接复用错误结果（评测 postgres#15/#19 实锤）。
+        # 2026-10-01 补第三道门 _output_quality_reason：前两道漏掉的是「退化输出」——
+        # nl2sql.log 里多例「命中 6 张表却退化成 SELECT t.* LIMIT 100 裸明细」：
+        # _validate_result 只在 _needs_aggregation 为真时才查 SELECT *，非聚合问法绕得过；
+        # _result_warning 也不覆盖。这类条目一旦沉淀，维度表 TTL 长达 86400s，
+        # 且命中侧（run() 的 _semantic_cache_hit）会跳过 LLM 复查直接复用 →
+        # 错误答案此后 0.2s 稳定复现一整天，比慢更难发现。
+        # 只影响"是否沉淀"，不阻断本次结果返回，误伤代价仅为下次不命中缓存。
         if not self.fast and self.sql_result.get("success") and self.sql_result.get("rows") \
-                and not self._result_warning and not self._validate_result():
+                and not self._result_warning and not self._validate_result() \
+                and not _output_quality_reason(self.query, self.sql):
             self._semantic_cache_store()
 
         # ── Step 6: 图表生成（先按真实数据结构校正图表类型）──
@@ -7990,19 +7998,39 @@ class LLMService:
                    "response": {"type": "ml_error", "error": "还没有可用的模型，请先训练。例如：用 XX 表训练模型预测 XX"}}
             return
 
-        # 从用户输入提取 "字段=值" 或 "字段是值"
-        values = {}
-        for m in re.finditer(r'([A-Za-z_][A-Za-z0-9_]*)\s*[=:是]\s*(-?\d+(?:\.\d+)?)', self.query):
-            values[m.group(1)] = float(m.group(2))
+        # 2026-10-01 修复（P0）：原正则只认英文列名，但结果卡上的提示就是「字段=数值」，
+        # 用户照着用中文说法问（「计划数量=1200 时的预测结果」）必然解析失败。
+        # 现在：短语先直接匹配特征列名（英文列名原样可用），匹配不上再走
+        # ml_plan.resolve_column 的中文词表映射（与建模时同一套口径）。
+        from agent.ml_plan import resolve_column
+        feats = model.get("features", [])
+        feat_cols = [{"name": f} for f in feats]
+        values: dict[str, float] = {}
+        for m in re.finditer(
+                r'([\u4e00-\u9fa5A-Za-z_][\u4e00-\u9fa5A-Za-z0-9_]{0,19})\s*[=：:是]\s*(-?\d+(?:\.\d+)?)',
+                self.query):
+            phrase = re.sub(r'^[当把将按照依据基于以看]+', '', m.group(1).strip())
+            if phrase in feats:
+                col = phrase                      # 用户直接写了英文列名
+            else:
+                col, _score = resolve_column(phrase, feat_cols, numeric_only=False, strict=False)
+                if not col:
+                    continue                      # 识别不了的短语跳过（可能不是在描述输入）
+            values[col] = float(m.group(2))
         if not values:
             feats = model.get("features", [])
             sample = "、".join(f"{f}=数值" for f in feats[:3])
             yield {"type": "done",
                    "response": {"type": "ml_error",
-                                "error": f"请提供预测输入，例如：{sample} 时的预测结果"}}
+                                "error": f"请提供预测输入，例如：{sample} 时的预测结果（支持中文字段名，如「计划数量=1200」）"}}
             return
 
         result = predict(model_name, values)
+        row = {"输入": json.dumps(values, ensure_ascii=False),
+               "预测": result.get("label", result.get("prediction"))}
+        if result.get("warnings"):
+            # 2026-10-01：缺特征/未见过的类别不再静默，结果卡「备注」列直接说明
+            row["备注"] = "；".join(result["warnings"])
         yield {"type": "done",
                "response": {
                    "type": "ml_result",
@@ -8010,7 +8038,7 @@ class LLMService:
                        "success": True,
                        "model": {"name": model_name, "label": model.get("label", model_name)},
                        "metrics": {},
-                       "pred_samples": [{"输入": json.dumps(values, ensure_ascii=False), "预测": result.get("label", result.get("prediction"))}],
+                       "pred_samples": [row],
                    },
                    "model_name": model_name,
                }}
@@ -11612,8 +11640,18 @@ def _sem_persist_load(db_key: str) -> None:
             if db_key not in _SEM_CACHE:
                 _SEM_CACHE[db_key] = []
             existing = {e.get("query") for e in _SEM_CACHE[db_key]}
+            # 维度对齐（2026-10-01）：持久层条目可能来自另一种 embedding 来源
+            # （本地 bge 512 维 / API / ngram 兜底 4096 维）。异维度条目恢复进内存后
+            # 在 _cos_sim 里永远判不出 ≥0.92，却会一直占着每库 200 条的名额，
+            # 把有效条目挤出去。恢复时就按当前 embedding 维度过滤掉。
+            try:
+                _dim_now = len(_embed_query("__dim__") or [])
+            except Exception:
+                _dim_now = 0
             for e in data:
                 if e.get("query") and e["query"] not in existing and "vec" in e:
+                    if _dim_now and len(e.get("vec") or []) != _dim_now:
+                        continue
                     _SEM_CACHE[db_key].append(e)
                     existing.add(e["query"])
     except Exception:
@@ -11647,6 +11685,15 @@ def _cos_sim(a, b) -> float:
     向量模长不一致，直接裸点积会随模长漂移，导致 0.92 阈值判定失真。
     """
     try:
+        # 维度必须一致（2026-10-01 修复）：zip() 会在较短向量处静默截断，
+        # 而下面的模长仍按各自**全长**计算 —— 512 维（bge）条目 vs 4096 维
+        # （ngram 兜底）查询时，分子只累加前 512 维、分母却摊到 4096 维，
+        # 相似度被系统性压低，永远够不到 0.92 阈值 → 语义缓存长期 0 命中、
+        # 每次都重跑整条 LLM 链路（日志里反复出现的 40s+ 即由此而来）。
+        # 混合来源（本地模型 ↔ API ↔ ngram 兜底）与持久层恢复的旧条目都会触发，
+        # 因此这里直接判定为不相似，而不是算出一个失真的低分。
+        if a is None or b is None or len(a) != len(b):
+            return 0.0
         na = math.sqrt(sum(x * x for x in a))
         nb = math.sqrt(sum(x * x for x in b))
         if na == 0 or nb == 0:

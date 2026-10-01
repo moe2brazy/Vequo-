@@ -155,13 +155,19 @@ def get_embedding_fn():
             return None
 
         # 1. 本地 sentence-transformers（首选，离线可用）
-        model_name = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5")
+        # 2026-10-01 可靠性修复：默认值原为 HF hub ID——离线/无网演示机上
+        # SentenceTransformer 会尝试联网下载并长时间挂住，最终静默降级为哈希向量。
+        # 仓库里本来就有 backend/models/bge-small-zh-v1.5/（93MB），默认改用本地目录，
+        # 只有显式配置 EMBEDDING_MODEL 时才覆盖。
+        _default_model = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                      "models", "bge-small-zh-v1.5")
+        model_name = os.getenv("EMBEDDING_MODEL", _default_model)
         try:
             _EMBED_FN = _build_sentence_transformers_fn(model_name)
             _EMBED_MODE = "local"
             return _EMBED_FN
         except Exception as e:
-            _logger.warning("本地模型不可用，尝试 API 接口: %s: %s", type(e).__name__, e)
+            _logger.warning("本地模型(%s)不可用，尝试 API 接口: %s: %s", model_name, type(e).__name__, e)
 
         # 2. OpenAI 兼容接口（独立 EMBEDDING_API_* 配置，或 LLM_CONFIG 配了 embedding_model）
         try:

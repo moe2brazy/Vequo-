@@ -263,7 +263,8 @@ function buildStockHealth(chart: any) {
         if (!ps.length) return ''
         const i = ps[0].dataIndex
         const d = data[i]
-        return `${d.name}<br/>可用库存：${d.value}<br/>安全库存：${d.safe}<br/>达成率：${d.ratio.toFixed(0)}%${d.alert ? '<br/><span style="color:#e11d48">⚠ 低于安全线</span>' : ''}`
+        const ratioText = d.ratio == null ? '—' : `${d.ratio.toFixed(0)}%` // null = 安全库存为 0，无达成率
+        return `${d.name}<br/>可用库存：${d.value}<br/>安全库存：${d.safe}<br/>达成率：${ratioText}${d.alert ? '<br/><span style="color:#e11d48">⚠ 低于安全线</span>' : ''}`
       },
     },
     legend: { top: 0, textStyle: { color: LABEL_COLOR, fontSize: 11 } },

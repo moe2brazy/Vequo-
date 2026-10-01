@@ -2834,6 +2834,166 @@
    "status": "pending",
    "source": "runtime",
    "mined_at": 1790775086
+  },
+  "c2ad131e27f2": {
+   "id": "c2ad131e27f2",
+   "expr": "SUM(mes_process_output.good_qty) WHERE stat_date>=date_trunc('month',current_date)-interval'1'monthandstat_date<date_trunc('month',current_date)",
+   "tables": [
+    "mes_process_output"
+   ],
+   "dims": [
+    "line_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "那上个月呢",
+   "name": "合格品产出量",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1790833300
+  },
+  "3892788ca429": {
+   "id": "3892788ca429",
+   "expr": "SUM(mpo.input_qty) WHERE sum(input_qty)>0",
+   "tables": [
+    "mes_process_output"
+   ],
+   "dims": [
+    "process_id",
+    "process_code",
+    "process_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "分析最低良率的工序",
+   "name": "total_input_qty",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1790839015
+  },
+  "02e99a993def": {
+   "id": "02e99a993def",
+   "expr": "SUM(mpo.good_qty) WHERE sum(input_qty)>0",
+   "tables": [
+    "mes_process_output"
+   ],
+   "dims": [
+    "process_id",
+    "process_code",
+    "process_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "分析最低良率的工序",
+   "name": "total_good_qty",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1790839015
+  },
+  "b3b0f43b22d8": {
+   "id": "b3b0f43b22d8",
+   "expr": "SUM(mpo.defect_qty) WHERE sum(input_qty)>0",
+   "tables": [
+    "mes_process_output"
+   ],
+   "dims": [
+    "process_id",
+    "process_code",
+    "process_name"
+   ],
+   "hit_count": 1,
+   "sample_question": "分析最低良率的工序",
+   "name": "total_defect_qty",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1790839015
+  },
+  "9fa6b411e93d": {
+   "id": "9fa6b411e93d",
+   "expr": "SUM(sample_qty - defect_qty)",
+   "tables": [
+    "qms_inspection"
+   ],
+   "dims": [
+    "product_id"
+   ],
+   "hit_count": 1,
+   "sample_question": "出货合格率",
+   "name": "qualified_rate",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1790839157
+  },
+  "5a0c7ccf5a0d": {
+   "expr": "AVG(standard_yield_rate)",
+   "field": "standard_yield_rate",
+   "field_type": "numeric",
+   "sample": "",
+   "table": "dim_process",
+   "tables": [
+    "dim_process"
+   ],
+   "time_col": "",
+   "name": "平均(standard_yield_rate)",
+   "aliases": [],
+   "unit": "",
+   "description": "来自表 dim_process 的 standard_yield_rate 字段（自动扫描候选）",
+   "source": "schema_scan",
+   "id": "5a0c7ccf5a0d",
+   "hit_count": 1,
+   "status": "pending",
+   "mined_at": 1790841211
+  },
+  "9c6af35cf714": {
+   "expr": "SUM(frozen_qty)",
+   "field": "frozen_qty",
+   "field_type": "integer",
+   "sample": "",
+   "table": "inv_inventory_snapshot",
+   "tables": [
+    "inv_inventory_snapshot"
+   ],
+   "time_col": "snapshot_date",
+   "name": "合计(frozen_qty)",
+   "aliases": [],
+   "unit": "",
+   "description": "来自表 inv_inventory_snapshot 的 frozen_qty 字段（自动扫描候选）",
+   "source": "schema_scan",
+   "id": "9c6af35cf714",
+   "hit_count": 1,
+   "status": "pending",
+   "mined_at": 1790841211
+  },
+  "7beab2da253a": {
+   "id": "7beab2da253a",
+   "expr": "LAG(total_output)",
+   "tables": [
+    "dim_production_line",
+    "mes_process_output",
+    "monthly_output"
+   ],
+   "dims": [],
+   "hit_count": 1,
+   "sample_question": "环比各产线产量",
+   "name": "prev_output",
+   "aliases": [],
+   "unit": "",
+   "description": "",
+   "status": "pending",
+   "source": "runtime",
+   "mined_at": 1790842127
   }
  },
  "ignored": [

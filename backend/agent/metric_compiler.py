@@ -749,8 +749,13 @@ def _auto_rank_dim(query: str, meta: dict, time_col: str | None) -> str | None:
     - 其余排行 → 优先带 JOIN 的业务维度（可显示中文名，如 产品/工序/产线），否则首个注册维度；
     - 没有任何可分组维度 → None（保持原汇总/回退路径，不瞎编）。
     """
+    # 2026-10-01 补 最优/最久/最佳：_left_guard_vocab 加入这三个最高级词后，
+    # 「最优良率」「最久停机时长」左侧能剥干净 → 编译命中，但此处 rank_intent 不认，
+    # 无维度时不补分组 → 产物退化成「全厂汇总一行」（最优良率 返回整体良率），
+    # 比走 LLM 更糟：行数对、指标对、语义全错且看不出来。实测 3 词 × 9 指标 = 27 条全中招。
     rank_intent = bool(re.search(
         r"TOP\s*\d+|最高|最低|最多|最少|最大|最小|最长|最短|最好|最差|最晚|最早|最新|最旧"
+        r"|最优|最久|最佳"
         r"|哪些|哪个|排名|排行|前\s*\d+\s*名", query, re.IGNORECASE))
     if not rank_intent:
         return None
@@ -791,7 +796,7 @@ def _resolve_drill(query: str, metric: dict, fact: str, dims: list[str]) -> tupl
             # （产线的父级是车间），若放行会生成把停机原因当车间用的错误过滤。
             # 这里按父级维度的注册列（含 JOIN 展示列）做精确匹配，两张都不匹配就放弃下钻，
             # 退回普通聚合（宁可少做一层下钻，不可生成语义错误的 WHERE）。
-            if val and _drill_value_belongs(val, meta, hierarchy[idx - 1]):
+            if val and _drill_value_belongs(val, metric, hierarchy[idx - 1]):
                 return dim, {"filter_value": val, "parent_level": hierarchy[idx - 1]}
         # 下钻词：切到下一级（「各产线的产量，下钻到设备」等）
         if _DRILL_DOWN_RE.search(query) and idx + 1 < len(hierarchy):
@@ -816,6 +821,32 @@ def _parse_value_filter(query: str) -> tuple[str, float, bool] | None:
     if m:
         return "<=", float(m.group(2)), bool(m.group(3))
     return None
+
+
+_CN_DIGITS = {"零": 0, "一": 1, "两": 2, "二": 2, "三": 3, "四": 4,
+              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+
+
+def _cn_num(token: str) -> int | None:
+    """中文数字 → int。覆盖 一~十 / 十五 / 二十 / 三十二，无法解析返回 None。
+
+    2026-10-01 新增：时间词表此前只认阿拉伯数字（``近\\s*(\\d+)\\s*个月``），
+    「最近三个月」「近三个月」「过去半年」全部落空 → time_range 被静默丢弃、
+    SQL 无 WHERE、返回全历史。库里只有两个月数据时答案看着是对的，数据一全就是错答案。
+    """
+    t = (token or "").strip()
+    if not t:
+        return None
+    if t.isdigit():
+        return int(t)
+    if not all(ch in _CN_DIGITS for ch in t):
+        return None
+    if t == "十":
+        return 10
+    if "十" in t:
+        hi, _, lo = t.partition("十")
+        return (_CN_DIGITS.get(hi, 1) if hi else 1) * 10 + (_CN_DIGITS.get(lo, 0) if lo else 0)
+    return _CN_DIGITS.get(t)
 
 
 def _build_time_filter(fact_table: str, fact_col: str, query: str) -> str | None:
@@ -866,6 +897,22 @@ def _build_time_filter(fact_table: str, fact_col: str, query: str) -> str | None
     m = re.search(r"近\s*(\d+)\s*个月", query)
     if m:
         return f"{fact_col} >= {anchor} - INTERVAL '{m.group(1)} months'"
+    # ── 中文数字 /「过去」/「半年」兜底（2026-10-01）──────────────────
+    # 上面两条只吃阿拉伯数字，这里是纯增量：只有上面都没命中才走到这儿，
+    # 因此不会改变任何原有问句的编译结果。
+    m = re.search(r"(?:近|最近|过去|前)\s*([0-9]+|[一二两三四五六七八九十]+)\s*个?\s*月", query)
+    if m:
+        n = _cn_num(m.group(1))
+        if n:
+            return f"{fact_col} >= {anchor} - INTERVAL '{n} months'"
+    m = re.search(r"(?:近|最近|过去|前)\s*([0-9]+|[一二两三四五六七八九十]+)\s*(?:个)?\s*(?:天|日)", query)
+    if m:
+        # 与「近N天」同一口径：锚点日 + 过去 N-1 天，共 N 个日历日
+        n = _cn_num(m.group(1))
+        if n:
+            return f"{fact_col} >= {anchor} - INTERVAL '{max(0, n - 1)} days'"
+    if re.search(r"(?:近|最近|过去|前|这)\s*半年|半年(?:以|之)?内", query):
+        return f"{fact_col} >= {anchor} - INTERVAL '6 months'"
     if "上月" in query or "上个月" in query:
         return (f"{fact_col} >= date_trunc('month', {anchor}) - INTERVAL '1 month' "
                 f"AND {fact_col} < date_trunc('month', {anchor})")
@@ -1006,9 +1053,12 @@ def _compare_ranges(query: str, anchor: str, time_col: str, is_yoy: bool):
             prev_lt = f"{time_col} <= {anchor} - INTERVAL '1 year'"
             prev_label = "去年同月"
         else:
+            # 期长对齐（关键，2026-10-01 修复）：上期上界 = anchor 往前推一个周期（闭区间），
+            # 而不是「上月整月」。数据只到月中时，上月整月(30天) vs 本月至今(15天)
+            # 会让环比系统性大幅偏负（日均明明持平也显示 -50%）。
             prev_gte = f"{time_col} >= {ms} - INTERVAL '1 month'"
-            prev_lt = f"{time_col} < {ms}"
-            prev_label = "上月"
+            prev_lt = f"{time_col} <= {anchor} - INTERVAL '1 month'"
+            prev_label = "上月同期"
         return cur_gte, cur_lt, prev_gte, prev_lt, prev_label
     if "本季度" in query or "本季" in query:
         qs = f"date_trunc('quarter', {anchor})"
@@ -1020,8 +1070,8 @@ def _compare_ranges(query: str, anchor: str, time_col: str, is_yoy: bool):
             prev_label = "去年同季"
         else:
             prev_gte = f"{time_col} >= {qs} - INTERVAL '3 months'"
-            prev_lt = f"{time_col} < {qs}"
-            prev_label = "上季度"
+            prev_lt = f"{time_col} <= {anchor} - INTERVAL '3 months'"
+            prev_label = "上季度同期"
         return cur_gte, cur_lt, prev_gte, prev_lt, prev_label
     if "今年" in query or "本年" in query:
         ys = f"date_trunc('year', {anchor})"
@@ -1033,8 +1083,8 @@ def _compare_ranges(query: str, anchor: str, time_col: str, is_yoy: bool):
             prev_label = "去年同期"
         else:
             prev_gte = f"{time_col} >= {ys} - INTERVAL '1 year'"
-            prev_lt = f"{time_col} < {ys}"
-            prev_label = "去年"
+            prev_lt = f"{time_col} <= {anchor} - INTERVAL '1 year'"
+            prev_label = "去年同期"
         return cur_gte, cur_lt, prev_gte, prev_lt, prev_label
     return None
 
@@ -1303,8 +1353,14 @@ def compile_period_diff(query: str) -> dict | None:
     if ddef.get("via"):
         return None
 
-    cur_agg = f"SUM(CASE WHEN EXTRACT(MONTH FROM {time_col}) = {cur_m} THEN {inner} ELSE 0 END)"
-    prev_agg = f"SUM(CASE WHEN EXTRACT(MONTH FROM {time_col}) = {prev_m} THEN {inner} ELSE 0 END)"
+    # 2026-10-01 修复（跨年翻倍）：EXTRACT(MONTH) 不带年份约束时，数据跨 2025/2026 两年
+    # 会把两年的同名月份各自加总（数值约翻倍、变化率失真）。这里用标量子查询把
+    # 月份锚定到数据最新一年（PG 对标量子查询只求值一次，性能无损）；显式年份的问句
+    # （如「2025年7月」）本来就不进本编译器，不受影响。
+    data_year = f"(SELECT date_trunc('year', MAX({time_col})) FROM {fact})"
+    year_ok = f"{time_col} >= {data_year}"
+    cur_agg = f"SUM(CASE WHEN EXTRACT(MONTH FROM {time_col}) = {cur_m} AND {year_ok} THEN {inner} ELSE 0 END)"
+    prev_agg = f"SUM(CASE WHEN EXTRACT(MONTH FROM {time_col}) = {prev_m} AND {year_ok} THEN {inner} ELSE 0 END)"
 
     if ddef.get("join"):
         dt, dk, ddisp = ddef["join"]
@@ -1470,6 +1526,10 @@ def _grouped_compare_ranges(query: str):
     if re.search(r"今年|本年", query):
         return ("year", "b.p0", "b.mx", "b.p0 - INTERVAL '1 year'", "b.mx - INTERVAL '1 year'",
                 "今年", "去年")
+    # 2026-10-01：纯「同比」无显式本期词 → 年同比（环比默认月环比，见下方默认分支）。
+    if _COMPARE_YOY.search(query):
+        return ("year", "b.p0", "b.mx", "b.p0 - INTERVAL '1 year'", "b.mx - INTERVAL '1 year'",
+                "今年", "去年")
     return ("month", "b.p0", "b.mx", "b.p0 - INTERVAL '1 month'", "b.mx - INTERVAL '1 month'",
             "本月", "上月")
 
@@ -1482,7 +1542,12 @@ def compile_period_compare_grouped(query: str) -> dict | None:
     """
     if get_db_type() == "mysql":
         return None
-    if not _has_grouped_compare_intent(query):
+    # 2026-10-01 放开：纯「同比/环比 + 维度」也走分组两期对比。此前只认
+    # 「本期词+上期词+谓词」三段式，导致句首/句尾「各产线产量同比」「环比各产线产量」
+    # 被普通编译降级成单期聚合、彻底丢掉对比语义（0.1s 高置信错答）。
+    # 整体对比由 compile_period_compare 接管，这里只管带维度的分组对比；
+    # 同比+环比同时出现属歧义，由 try_compile_metric 统一回退 LLM。
+    if not (_has_grouped_compare_intent(query) or _has_compare_intent(query)):
         return None
     from agent.metric_registry import find_metrics
     hits = find_metrics(query)
@@ -1990,6 +2055,9 @@ def try_compile_metric(query: str) -> dict | None:
         return None
     # 同比/环比意图 → 走专用编译（避免被当成普通时间过滤错误编译出「本期值」）
     if _has_compare_intent(query):
+        # 同比+环比同时出现 → 歧义，回退 LLM（与 compile_period_compare 内部守卫一致）
+        if _COMPARE_YOY.search(query) and _COMPARE_MOM.search(query):
+            return None
         _pc = compile_period_compare(query)
         if _pc:
             return _pc
@@ -2256,7 +2324,18 @@ def try_compile_metric(query: str) -> dict | None:
     # 而正确答案是 96.5/97/97）。方向错是最隐蔽的一类错误：行数对、指标对，就是排序反了。
     # 「最晚/最新」按时间语义取最大 → DESC；「最早/最旧」→ ASC。
     else:
-        if re.search(r"最低|最少|最小|最短|最差|最早|最旧|最慢", query):
+        # 2026-10-01 补充：显式排序短语此前完全没被识别，一律落到默认 DESC。
+        # 实测「各工序良率从低到高」→ ORDER BY "良率" DESC，首行是 99.21（最高的）；
+        # 「各产线产量从少到多」→ 同样 DESC，首行 690403（最多的）。
+        # 行数对、指标对、就是方向反了 —— 用户完全看不出异常。
+        # 放在最高级词之前判断：带「从X到Y」的问句方向语义比「最X」更明确。
+        if re.search(r"从\s*(?:低|小|少|短|早|旧|慢|差)\s*(?:到|至)\s*(?:高|大|多|长|晚|新|快|好)"
+                     r"|升序|从小到大|从低到高|从少到多", query):
+            order_dir = "ASC"
+        elif re.search(r"从\s*(?:高|大|多|长|晚|新|快|好)\s*(?:到|至)\s*(?:低|小|少|短|早|旧|慢|差)"
+                       r"|降序|从大到小|从高到低|从多到少", query):
+            order_dir = "DESC"
+        elif re.search(r"最低|最少|最小|最短|最差|最早|最旧|最慢", query):
             order_dir = "ASC"
         elif re.search(r"最高|最多|最大|最长|最好|最新|最晚|最快", query):
             order_dir = "DESC"
@@ -2277,6 +2356,11 @@ def try_compile_metric(query: str) -> dict | None:
             time_desc = "今年"
         elif "去年" in query:
             time_desc = "去年"
+        elif (mm := re.search(r"(?:近|最近|过去|前)\s*(?:[0-9]+|[一二两三四五六七八九十]+)\s*个?\s*月"
+                              r"|(?:近|最近|过去|前|这)\s*半年", query)):
+            time_desc = mm.group(0)
+        elif (mm := re.search(r"(?:近|最近|过去|前)\s*(?:[0-9]+|[一二两三四五六七八九十]+)\s*(?:个)?\s*(?:天|日)", query)):
+            time_desc = mm.group(0)
         else:
             time_desc = "自定义时间范围"
     where = f" WHERE {time_filter}" if time_filter else ""

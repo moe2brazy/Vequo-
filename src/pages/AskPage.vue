@@ -1164,6 +1164,12 @@ const loadChat = (id: string) => {
 // 删除对话
 const deleteChat = (id: string) => {
   if (!confirm('确定要删除这条对话吗？')) return
+  // 若删除的是当前会话：取消在途请求，并关闭可能残留的二次确认弹窗——
+  // 弹窗方案绑定旧会话，currentChatId 切走后确认执行会把结果写进错误会话（串号）
+  if (currentChatId.value === id) {
+    if (isLoading.value) stopGenerating()
+    closeConfirmDialog()
+  }
   history.value = history.value.filter(h => h.id !== id)
   if (currentChatId.value === id) {
     currentChatId.value = history.value.length > 0 ? history.value[0].id : null
@@ -1382,6 +1388,11 @@ const renderAgentResult = (data: any, msg?: any): string => {
       // 目标来自另一张表时必须说清楚，否则"预测目标 good_qty"会让人以为选错了表
       if (mr.join_note) {
         html += `<div class="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1 mb-2">${esc(mr.join_note)}</div>`
+      }
+      // 数据说明（如"原始 5000 行，剔除含缺失值记录后剩余 3200 行（缺失最多：xxx）"）：
+      // 建模数据量骤减时给出原因，避免"有效数据不足"类问题无从解释
+      if (mr.data_note) {
+        html += `<div class="text-xs text-gray-600 bg-gray-50 border border-gray-200 rounded px-2 py-1 mb-2">${esc(mr.data_note)}</div>`
       }
       if (mr.metrics && Object.keys(mr.metrics).length > 0) {
         html += '<div class="text-xs mb-2 flex flex-wrap gap-x-4 gap-y-1">'
@@ -2165,7 +2176,17 @@ const sendMessage = async (presetText?: string | Event, opts?: { noConfirm?: boo
       updateMsg()
     } else if (msg && !msg.result && (!msg.content || msg.content === '正在分析…')) {
       msg.content = '对话已结束'
+    }
+    // 2026-10-01：无论是否收到 done 事件，都必须结束加载态。
+    // 原逻辑只在上面两个分支里复位 thinkingStreaming ——「有 result 但没等到 done」
+    // （服务端正常关闭连接 / 网关中途断开）时两个分支都不进，界面会一直转圈且无任何提示。
+    if (msg) {
       msg.thinkingStreaming = false
+      if (!finalData && msg.result) {
+        msg.content = (msg.content && msg.content !== '正在分析…')
+          ? msg.content
+          : '结果可能不完整：连接在生成答案前已中断，请重试。'
+      }
     }
     const owner = ownerChatOf(msg)
     if (owner) owner.updatedAt = new Date().toISOString()
@@ -2765,8 +2786,10 @@ const saveToStorage = () => {
   // 原实现把截断结果赋值回内存 → 会话数 >24 时最旧会话在内存中也被删掉、
   // 长对话第 61 条起消息永久消失（localStorage 里同样已删，无法恢复），
   // 且每次调用都替换整个数组引用，导致整页 computed / v-for 全量重渲染。
+  // 2026-10-01 修复：history 数组是「最新在前」（createNewChat 用 unshift），
+  // slice(-24) 保留的其实是最旧的 24 个、会静默丢弃最新会话，改为 slice(0, 24)
   const payload = history.value
-    .slice(-24)
+    .slice(0, 24)
     .map((c: any) => ({
       ...c,
       // 报告 HTML 一份几十 KB，写进本地存储（总配额 5MB）会把对话历史挤掉：
@@ -2803,7 +2826,7 @@ const saveToStorage = () => {
         try {
           pruneLocalStorage()
           localStorage.setItem(key, JSON.stringify(history.value
-            .slice(-12)
+            .slice(0, 12)
             .map((c: any) => ({ ...c, messages: (c.messages || []).slice(-20) }))))
         } catch {
           console.warn('历史记录超出存储配额，本轮不持久化（内存中仍可用）')
@@ -2845,6 +2868,11 @@ onMounted(() => {
   if (!hasHistory) {
     createNewChat()
   }
+
+  // 初始问题必须在 loadFromStorage 之后消费（原因见 consumeInitialQuestion 上方注释）：
+  // 顺序反了会把本地历史覆盖成单条新会话。
+  mountedReady.value = true
+  consumeInitialQuestion()
 
   scrollToBottom()
 })
@@ -2902,18 +2930,38 @@ watch(currentMessages, (nw, old) => {
 })
 
 // 监听外部传入的初始问题（来自分析模板 / 快捷问题 / 总览建议）
-// immediate：AskPage 首次挂载时就带着 initialQuestion（从知识页点应用模板切过来）
-// 的场景也能消费，避免「首次点应用模板没反应」；问题已自动发送，输入框保持为空
-watch(() => props.initialQuestion, (question) => {
-  if (question && question.trim()) {
-    const q = question.trim()
+//
+// ⚠️ 此处**绝不能用 immediate:true**（2026-10-01 修复）：
+// immediate 的 watcher 在 setup 同步阶段执行，早于 onMounted 里的 loadFromStorage()。
+// 而 consumeInitialQuestion → createNewChat() 会立刻 saveToStorage() 落盘，
+// 把「只有 1 条新会话」的数组写进 localStorage；等 loadFromStorage() 再去读，
+// 读到的就是被自己覆盖后的数据 —— 该用户此前的全部会话永久丢失，且无任何提示。
+// 最常见触发路径：知识页「应用模板」/ Cmd+K 提问（App.vue navigateToAsk）。
+// 因此首次值改由 onMounted 在 loadFromStorage 之后消费，watcher 只处理挂载后的变化。
+const mountedReady = ref(false)
+
+const consumeInitialQuestion = () => {
+  const q = String(props.initialQuestion || '').trim()
+  if (!q) return
+  // 复用当前会话：若它还是刚创建的空会话（只有一条欢迎语），不要再建一个空的
+  // （onMounted 里无历史时会先 createNewChat，否则会留下两条「新对话」）
+  const cur: any = history.value.find((h: any) => h.id === currentChatId.value)
+  const isBlank = !cur || (cur.messages || []).length <= 1
+  if (!isBlank) {
     createNewChat()
-    nextTick(() => {
-      emit('question-consumed')
-      sendMessage(q)
-    })
   }
-}, { immediate: true })
+  nextTick(() => {
+    emit('question-consumed')
+    sendMessage(q)
+  })
+}
+
+watch(() => props.initialQuestion, (question) => {
+  if (!mountedReady.value) return   // 首次值交给 onMounted，避免早于 loadFromStorage
+  if (question && question.trim()) {
+    consumeInitialQuestion()
+  }
+})
 </script>
 
 <style scoped>

@@ -91,7 +91,34 @@ def _handle_abs_month(m) -> dict | None:
 
 
 # 正则规则表：(pattern, handler)  按顺序匹配，第一个命中生效
+def _handle_abs_year_month(m) -> dict | None:
+    """处理「2023年3月」式年月组合（必须放在纯年份规则之前，否则年份先命中、月份被吞，
+    整个查询范围被放大 ~12 倍且 label 显示为整年）。"""
+    try:
+        y = int(m.group("year"))
+        mm = int(m.group("month"))
+    except Exception:
+        return None
+    if not (1900 <= y <= 2199 and 1 <= mm <= 12):
+        return None
+    # DATE 'YYYY-MM-01' + INTERVAL '1 month' 在 PG 与 MySQL 均为合法写法，跨库无需转换
+    start = f"DATE '{y:04d}-{mm:02d}-01'"
+    return {
+        "raw": f"{y}年{mm}月",
+        "gte": start,
+        "lt": f"{start} + INTERVAL '1 month'",
+        "label": f"{y}年{mm}月(整月)",
+        "unit": "month",
+        "amount": None,
+    }
+
+
 _RULES = [
+    # 绝对年月组合（2023年3月 / 2024 年 12 月）—— 必须放在纯年份规则之前。
+    # 2026-10-01 修复：此前「2023年3月」先被年份规则命中返回整年区间，
+    # 「3月」被完全忽略（结果约为正确值的 12 倍，label 还显示"2023年(整年)"）。
+    (re.compile(r"(?P<year>(?:19|20)\d{2})\s*年\s*(?P<month>1[0-2]|[1-9])\s*月", re.IGNORECASE),
+     lambda m: _handle_abs_year_month(m)),
     # 绝对年份（2023年 / 2024 年）—— 必须放在"最近N年"之前。
     # 数据正确性修复（P0）：规则 1 的 (?:最近|近|过去)? 前缀是【可选】的，
     # 实测 `统计2023年产量` 被解析成 gte = CURRENT_DATE - INTERVAL '2023 years'，

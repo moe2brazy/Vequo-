@@ -122,7 +122,14 @@ async function handleSendCode() {
   sendingCode.value = true
   registerError.value = ''
   try {
-    codeCooldown.value = await sendEmailCode(email)
+    const res = await sendEmailCode(email)
+    codeCooldown.value = res.cooldown
+    // 后端没把邮件真发出去时必须当场说清：否则界面显示「已发送」，
+    // 用户只能一直等一封永远不会来的邮件——本次故障就是这样被藏住的。
+    if (!res.sent) {
+      registerError.value = `验证码已生成，但邮件没有发出：${res.hint || '后端邮件服务未配置'}。`
+        + '请到后端控制台查看本次验证码，或补全 backend/.env 的 MAIL_SMTP_* 配置后重启后端。'
+    }
     window.clearInterval(codeTimer)
     codeTimer = window.setInterval(() => {
       codeCooldown.value -= 1

@@ -444,7 +444,9 @@ def _build_stock_health(table: str, tlab: str, fields: list[dict]) -> dict | Non
             s = _to_num(row.get("s")) or 0
             if not name:
                 continue
-            ratio = _round2(a / s * 100) if s > 0 else 999.0
+            # 2026-10-01 修复：安全库存合计为 0 时无"达成率"可言，此前用 999.0 哨兵
+            # 会被前端直接展示成「达成率：999%」。改为 null，前端显示「—」。
+            ratio = _round2(a / s * 100) if s > 0 else None
             data.append({"name": name, "value": a, "safe": s, "ratio": ratio,
                          "alert": s > 0 and a < s})
     if len(data) < 2:

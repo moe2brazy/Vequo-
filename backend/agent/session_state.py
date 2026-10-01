@@ -28,9 +28,16 @@ _GRANULARITY = [
 ]
 
 # ── 时间范围 ────────────────────────────────────────────
+# 2026-10-01：原词表只收阿拉伯数字（近\s*(\d+)\s*个月），「最近三个月」「近三个月」
+# 「过去三个月」「最近半年」全部漏空 → 槽位缺失 → 提示词里没有时间约束 → SQL 无 WHERE。
+# 下两条是纯增量（排在阿拉伯数字之后），不改变原有命中结果。
+_CN_NUM = r"[0-9]+|[一二两三四五六七八九十]+"
 _TIME_RANGE = [
     (r"近\s*(\d+)\s*天|最近\s*(\d+)\s*天", "last_N_days"),
     (r"近\s*(\d+)\s*个月|最近\s*(\d+)\s*个月", "last_N_months"),
+    (rf"(?:近|最近|过去|前)\s*({_CN_NUM})\s*个?\s*月", "last_N_months"),
+    (rf"(?:近|最近|过去|前)\s*({_CN_NUM})\s*(?:个)?\s*(?:天|日)", "last_N_days"),
+    (r"(?:近|最近|过去|前|这)\s*半年|半年(?:以|之)?内", "last_6_months"),
     (r"上个月|上月", "last_month"),
     (r"这个月|本月", "this_month"),
     (r"昨天|昨日", "yesterday"),
@@ -44,7 +51,12 @@ _TIME_RANGE = [
 ]
 
 # ── 排序 / 取数 ─────────────────────────────────────────
+# 2026-10-01：原表只有「从高到低」没有「从低到高」，且「从X到Y」会被下面的「最高/最低」
+# 抢先命中（"从低到高"含"低"→ 判成 asc 纯属巧合，"从少到多"含"多"→ 判成 desc 则是错的）。
+# 显式排序短语优先级最高，放在最前。
 _ORDER = [
+    (r"从\s*(?:低|小|少|短|早|旧|慢|差)\s*(?:到|至)\s*(?:高|大|多|长|晚|新|快|好)|升序|从小到大", "asc"),
+    (r"从\s*(?:高|大|多|长|晚|新|快|好)\s*(?:到|至)\s*(?:低|小|少|短|早|旧|慢|差)|降序|从大到小", "desc"),
     (r"前\s*(\d+)\s*名|TOP\s*(\d+)|前\s*(\d+)\s*位", "top"),
     (r"最高|最多|排名第一|第一", "desc"),
     (r"最低|最少", "asc"),
@@ -57,6 +69,33 @@ _METRICS = [
     "安全库存", "缺货量", "质检不合格率", "工单数", "停机次数", "停机时长",
     "投入量", "产值", "销量", "销售额", "金额",
 ]
+
+
+_CN_DIGITS = {"零": 0, "一": 1, "两": 2, "二": 2, "三": 3, "四": 4,
+              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+
+
+def _to_int(token) -> int | None:
+    """阿拉伯数字或中文数字 → int，无法解析返回 None。
+
+    2026-10-01 新增：词表放开中文数字后，原来的 `int(num)` 遇到「三」会抛 ValueError
+    —— 而这个异常发生在槽位提取里，会打断整条链路。这里统一走安全转换。
+    """
+    if token is None:
+        return None
+    t = str(token).strip()
+    if not t:
+        return None
+    if t.isdigit():
+        return int(t)
+    if not all(ch in _CN_DIGITS for ch in t):
+        return None
+    if t == "十":
+        return 10
+    if "十" in t:
+        hi, _, lo = t.partition("十")
+        return (_CN_DIGITS.get(hi, 1) if hi else 1) * 10 + (_CN_DIGITS.get(lo, 0) if lo else 0)
+    return _CN_DIGITS.get(t)
 
 
 @dataclass
@@ -83,7 +122,10 @@ def extract_slots(query: str) -> dict:
         m = re.search(pat, q)
         if m:
             num = next((g for g in m.groups() if g), None)
-            slots["time_range"] = {"key": val, "n": int(num) if num else None}
+            n = _to_int(num) if num else None
+            if n is None and val == "last_6_months":
+                n = 6
+            slots["time_range"] = {"key": val, "n": n}
             break
     # 排序 / 取数
     for pat, val in _ORDER:
@@ -92,7 +134,9 @@ def extract_slots(query: str) -> dict:
             num = next((g for g in m.groups() if g), None)
             slots["order"] = val
             if num:
-                slots["limit"] = int(num)
+                _lim = _to_int(num)
+                if _lim is not None:
+                    slots["limit"] = _lim
             break
     # 指标（去重：被更长指标覆盖的短指标剔除，如「不良率」不应再命中「良率」）
     raw = [m for m in _METRICS if m in q]
