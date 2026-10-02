@@ -52,17 +52,52 @@
           title="扫描库表结构自动生成候选指标（P0-1 语义层自动构建）"
           class="px-2.5 py-1 text-xs bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50 whitespace-nowrap"
         >{{ scanning ? '扫描中…' : '扫描库表' }}</button>
+        <!-- 2026-10-02 用户需求：快捷管理——多选/全选批量入库或忽略 -->
+        <button
+          @click="toggleSelMode"
+          class="px-2.5 py-1 text-xs border rounded-lg whitespace-nowrap"
+          :class="selMode
+            ? 'bg-gray-700 text-white border-gray-700 hover:bg-gray-800'
+            : 'border-gray-300 text-gray-600 hover:bg-gray-50'"
+        >{{ selMode ? '退出管理' : '快捷管理' }}</button>
       </div>
 
       <div v-if="candErr" class="px-3 py-2 text-[11px] text-rose-600">{{ candErr }}</div>
+
+      <!-- 快捷管理工具条：全选 + 已选计数 + 批量入库/忽略 -->
+      <div v-if="selMode && candidates.length" class="px-3 py-2 bg-blue-50/60 border-b border-blue-100 flex items-center gap-2.5 flex-wrap">
+        <label class="flex items-center gap-1.5 text-[11px] text-gray-600 cursor-pointer select-none">
+          <input type="checkbox" :checked="allSelected" @change="toggleAll" class="accent-blue-600" />
+          全选
+        </label>
+        <span class="text-[11px] text-gray-500">已选 {{ selIds.size }} / {{ candidates.length }} 条</span>
+        <div class="flex-1"></div>
+        <button
+          @click="batchApply('adopt')"
+          :disabled="!selIds.size || batchBusy"
+          class="px-2.5 py-1 text-[11px] bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 whitespace-nowrap"
+        >{{ batchBusy ? '处理中…' : '批量入库' }}</button>
+        <button
+          @click="batchApply('ignore')"
+          :disabled="!selIds.size || batchBusy"
+          class="px-2.5 py-1 text-[11px] text-rose-600 border border-rose-200 rounded-lg hover:bg-rose-50 disabled:opacity-50 whitespace-nowrap"
+        >批量忽略</button>
+      </div>
 
       <div v-if="!candidates.length" class="px-3 py-5 text-[11px] text-gray-400 text-center">
         暂无候选。点击「挖掘候选」，系统会从历史成功查询里提炼尚未注册的口径。
       </div>
 
       <div v-else class="divide-y divide-gray-100">
-        <div v-for="c in candidates" :key="c.id" class="px-3 py-2.5 rounded-lg transition-colors">
-          <div class="flex items-start justify-between gap-3">
+        <div v-for="c in candidates" :key="c.id" class="px-3 py-2.5 rounded-lg transition-colors flex gap-2">
+          <input
+            v-if="selMode"
+            type="checkbox"
+            :checked="selIds.has(c.id)"
+            @change="toggleOne(c.id)"
+            class="mt-1 accent-blue-600 shrink-0"
+          />
+          <div class="min-w-0 flex-1 flex items-start justify-between gap-3">
             <div class="min-w-0 flex-1">
               <div class="flex items-center gap-2 flex-wrap">
                 <input
@@ -319,7 +354,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 
 interface Metric {
   name: string
@@ -442,6 +477,56 @@ const ignore = async (c: any) => {
     candidates.value = candidates.value.filter((x) => x.id !== c.id)
   } catch (e: any) {
     alert(e?.message || '忽略失败')
+  }
+}
+
+// ── 2026-10-02 用户需求：候选快捷管理（多选/全选批量入库或忽略）────────
+const selMode = ref(false)
+const selIds = ref<Set<string>>(new Set())
+const batchBusy = ref(false)
+const allSelected = computed(() =>
+  candidates.value.length > 0 && candidates.value.every((c) => selIds.value.has(c.id)),
+)
+
+const toggleSelMode = () => {
+  selMode.value = !selMode.value
+  selIds.value = new Set()   // 退出/进入管理模式都清空选择，避免残留
+}
+const toggleAll = () => {
+  selIds.value = allSelected.value
+    ? new Set()
+    : new Set(candidates.value.map((c) => c.id as string))
+}
+const toggleOne = (id: string) => {
+  const s = new Set(selIds.value)
+  if (s.has(id)) s.delete(id)
+  else s.add(id)
+  selIds.value = s
+}
+
+const batchApply = async (action: 'adopt' | 'ignore') => {
+  const ids = [...selIds.value]
+  if (!ids.length) return
+  if (action === 'ignore' &&
+      !confirm(`确认忽略选中的 ${ids.length} 条候选？忽略后将进黑名单，挖掘不再推荐同一口径。`)) return
+  batchBusy.value = true
+  candErr.value = ''
+  try {
+    const d = await api('/api/metrics/candidates/batch', {
+      method: 'POST',
+      body: JSON.stringify({ ids, action }),
+    })
+    const okSet = new Set<string>(d.ok || [])
+    candidates.value = candidates.value.filter((c) => !okSet.has(c.id))
+    selIds.value = new Set()
+    if ((d.failed || []).length) {
+      candErr.value = `${d.failed.length} 条处理失败：${d.failed.map((f: any) => f.error).join('；')}`
+    }
+    if (action === 'adopt' && okSet.size) await load()   // 入库后刷新指标列表
+  } catch (e: any) {
+    candErr.value = e?.message || '批量操作失败'
+  } finally {
+    batchBusy.value = false
   }
 }
 

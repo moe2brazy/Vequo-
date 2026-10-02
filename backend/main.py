@@ -980,6 +980,50 @@ def ignore_metric_candidate(cid: str):
     return {"success": True}
 
 
+# 2026-10-02（用户需求）：候选口径「快捷管理」——指标管理页多选/全选后一键入库或忽略。
+# 复用单条 adopt/ignore（自带黑名单、采纳留痕、名称兜底），这里只做批量循环与失败收集。
+@app.post("/api/metrics/candidates/batch",
+          dependencies=[Depends(require_roles("admin"))])
+def batch_metric_candidates(body: dict):
+    """候选批量处置：body = {ids: [...], action: "adopt"|"ignore"}。
+
+    adopt  → 逐条入库（空名候选会失败并计入 failed，不影响其余）；
+    ignore → 逐条移出候选池 + 黑名单。
+    """
+    from agent.metric_miner import adopt_candidate, ignore_candidate
+    ids = body.get("ids") or []
+    action = str(body.get("action") or "").strip()
+    if action not in ("adopt", "ignore"):
+        raise HTTPException(status_code=400, detail="action 仅支持 adopt / ignore")
+    if not isinstance(ids, list) or not ids:
+        raise HTTPException(status_code=400, detail="ids 不能为空")
+    ok: list[str] = []
+    failed: list[dict] = []
+    for cid in ids[:200]:  # 上限保护：一次批量别把请求拖爆
+        cid = str(cid)
+        try:
+            if action == "adopt":
+                res = adopt_candidate(cid)  # 空参 = 用候选自带名称/别名/单位
+                if res.get("success"):
+                    ok.append(cid)
+                else:
+                    failed.append({"id": cid, "error": str(res.get("error", "采纳失败"))[:120]})
+            else:
+                if ignore_candidate(cid):
+                    ok.append(cid)
+                else:
+                    failed.append({"id": cid, "error": "候选不存在或已被处理"})
+        except Exception as e:
+            failed.append({"id": cid, "error": str(e)[:120]})
+    try:
+        u = get_current_user()
+        audit("metric_batch_%s" % action, user=u.get("username", ""),
+              role=u.get("role", ""), total=len(ok), failed=len(failed))
+    except Exception:
+        pass
+    return {"success": True, "ok": ok, "failed": failed}
+
+
 # ── 经营记忆中心（P1-2，对标 FineBI 经营记忆：跨会话业务上下文复用）──
 
 class MemoryNoteRequest(BaseModel):
