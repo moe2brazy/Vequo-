@@ -3302,5 +3302,43 @@
     "reviewer": "admin",
     "reviewed_at": "2026-09-30T14:08:35.277896+00:00",
     "review_comment": "管理员直接变更（自动留痕）"
+  },
+  {
+    "id": "5e63f02c6e04",
+    "created_at": "2026-10-01T17:06:49.138244+00:00",
+    "requester": "admin",
+    "kind": "role_grant",
+    "kind_label": "用户角色授权",
+    "target": "123456",
+    "payload": {
+      "username": "123456",
+      "roles": [],
+      "action": "set_user_roles"
+    },
+    "reason": "调整用户「123456」角色",
+    "status": "auto_approved",
+    "reviewer": "admin",
+    "reviewed_at": "2026-10-01T17:06:49.138244+00:00",
+    "review_comment": "管理员直接变更（自动留痕）"
+  },
+  {
+    "id": "84b57f21e205",
+    "created_at": "2026-10-01T17:06:58.573337+00:00",
+    "requester": "admin",
+    "kind": "role_grant",
+    "kind_label": "用户角色授权",
+    "target": "123456",
+    "payload": {
+      "username": "123456",
+      "roles": [
+        "viewer"
+      ],
+      "action": "set_user_roles"
+    },
+    "reason": "调整用户「123456」角色",
+    "status": "auto_approved",
+    "reviewer": "admin",
+    "reviewed_at": "2026-10-01T17:06:58.573337+00:00",
+    "review_comment": "管理员直接变更（自动留痕）"
   }
 ]

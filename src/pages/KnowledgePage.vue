@@ -1,19 +1,24 @@
 <template>
-  <div class="kb-shell">
+  <!-- 根元素显式接管 attrs：本页顶层还有多个 <Teleport>（弹窗挂 body），组件是多根，
+       Vue 不会自动继承父级传入的 class="h-full"（还会刷 Extraneous non-props attributes 警告）。
+       显式绑定后，.kb-shell 才能拿到内容区高度，图谱/术语词典视图才撑得住底部。 -->
+  <div class="kb-shell" v-bind="$attrs">
 
     <!-- ================= 主区 ================= -->
     <div class="kb-main">
 
-      <!-- 顶部状态条（替代原蓝紫说明条） -->
-      <header class="kb-topbar">
-        <div class="kb-topbar-title">
-          <span class="kb-topbar-icon"><AppIcon name="brain" :size="22" /></span>
-          <div>
-            <div class="kb-topbar-name">业务知识库</div>
-            <div class="kb-topbar-sub">连接自然语言问题与数据底座的业务语义层</div>
-          </div>
+      <!-- 顶部导航栏（导航居中 + 全局搜索与工具） -->
+      <nav class="kb-tabs">
+        <div class="kb-tabs-nav">
+          <button
+            v-for="view in viewTabs"
+            :key="view.key"
+            class="kb-tab"
+            :class="{ active: activeView === view.key }"
+            @click="activeView = view.key"
+          ><AppIcon :name="view.icon" :size="14" /> {{ view.name }}</button>
         </div>
-        <div class="kb-topbar-tools">
+        <div class="kb-tabs-tools">
           <div class="kb-global-search">
             <AppIcon name="search" :size="14" class="kb-global-search-icon" />
             <input v-model="globalSearchQ" type="text" placeholder="搜索对象/指标/规则/术语…" @input="onGlobalSearchInput" @focus="globalSearchFocus = true" @blur="blurSearch" />
@@ -26,8 +31,7 @@
               </div>
             </div>
           </div>
-          <button class="kb-tool-btn" title="知识健康度（基于当前数据本地实时计算）" @click="showHealthPanel"><AppIcon name="heart-pulse" :size="15" /> 健康度</button>
-          <!-- 导出需 export 操作权限（与数据总览报告同口径），未开通时显示锁提示 -->
+          <!-- 导出需 export 操作权限（与数据总览报告同口径）；未开通时整个按钮不展示 -->
           <div v-if="canDo('export')" class="kb-export-menu">
             <button class="kb-tool-btn" title="导出知识" :disabled="!!exportLoading"><AppIcon name="download" :size="15" /></button>
             <div class="kb-export-dropdown">
@@ -37,76 +41,7 @@
               <button @click="exportKnowledge('metrics','csv')">导出指标口径 (CSV)</button>
             </div>
           </div>
-          <span v-else class="inline-flex items-center gap-1.5 text-xs text-gray-400" title="当前角色未开通「导出」操作权限。管理员可在「权限管理 → 角色 → 选择角色 → 权限 → 操作权限」中勾选「导出数据」并保存">
-            <AppIcon name="lock" :size="13" /> 导出需管理员开通权限
-          </span>
         </div>
-      </header>
-
-      <!-- 数据底座概览：4 张 KPI 卡片，点击跳对应视角 -->
-      <section class="kb-overview">
-        <div class="kb-overview-head">
-          <AppIcon name="layers" :size="16" class="text-gray-400" />
-          <span>数据底座概览</span>
-        </div>
-        <div class="kb-overview-grid">
-          <button class="kb-stat-card group" title="查看数据表" @click="openTableList()">
-            <span class="kb-stat-chip"><AppIcon name="database" :size="20" :stroke-width="1.9" /></span>
-            <span class="min-w-0">
-              <span class="kb-stat-card-num">{{ tableCount }}</span>
-              <span class="kb-stat-card-label">数据表
-                <AppIcon name="arrow-right" :size="12" class="kb-stat-card-arrow" />
-              </span>
-            </span>
-          </button>
-          <button class="kb-stat-card group" title="查看术语词典" @click="openTermList()">
-            <span class="kb-stat-chip"><AppIcon name="book-open" :size="20" :stroke-width="1.9" /></span>
-            <span class="min-w-0">
-              <span class="kb-stat-card-num">{{ termDictionary.length }}</span>
-              <span class="kb-stat-card-label">术语词典
-                <AppIcon name="arrow-right" :size="12" class="kb-stat-card-arrow" />
-              </span>
-            </span>
-          </button>
-          <button class="kb-stat-card group" title="查看表间关系" @click="openRelationshipGraph()">
-            <span class="kb-stat-chip"><AppIcon name="share-2" :size="20" :stroke-width="1.9" /></span>
-            <span class="min-w-0">
-              <span class="kb-stat-card-num">{{ graphComponentRels.length }}</span>
-              <span class="kb-stat-card-label">表间关系
-                <AppIcon name="arrow-right" :size="12" class="kb-stat-card-arrow" />
-              </span>
-            </span>
-          </button>
-          <button class="kb-stat-card group" title="查看分析主题" @click="openTopicList()">
-            <span class="kb-stat-chip"><AppIcon name="target" :size="20" :stroke-width="1.9" /></span>
-            <span class="min-w-0">
-              <span class="kb-stat-card-num">{{ topicList.length }}</span>
-              <span class="kb-stat-card-label">分析主题
-                <AppIcon name="arrow-right" :size="12" class="kb-stat-card-arrow" />
-              </span>
-            </span>
-          </button>
-          <button class="kb-stat-card group" title="查看我的收藏" @click="openFavList()">
-            <span class="kb-stat-chip"><AppIcon name="star" :size="20" :stroke-width="1.9" /></span>
-            <span class="min-w-0">
-              <span class="kb-stat-card-num">{{ favCount }}</span>
-              <span class="kb-stat-card-label">我的收藏
-                <AppIcon name="arrow-right" :size="12" class="kb-stat-card-arrow" />
-              </span>
-            </span>
-          </button>
-        </div>
-      </section>
-
-      <!-- 视角切换 Tab -->
-      <nav class="kb-tabs">
-        <button
-          v-for="view in viewTabs"
-          :key="view.key"
-          class="kb-tab"
-          :class="{ active: activeView === view.key }"
-          @click="activeView = view.key"
-        ><AppIcon :name="view.icon" :size="14" /> {{ view.name }}</button>
       </nav>
 
       <!-- 加载 / 错误状态 -->
@@ -139,19 +74,18 @@
           <div class="kb-scene-summary">
             <div class="kb-summary-title">
               <b>{{ currentSceneInfo.name }}</b>
-              <span class="kb-summary-desc">{{ currentSceneInfo.desc }}</span>
-            </div>
-            <div class="kb-summary-stats">
-              <button title="定位到业务对象" @click="scrollToSec('kb-sec-objects')"><AppIcon name="package" :size="12" /> 对象 <b>{{ sceneObjects(activeScene).length }}</b></button>
-              <button title="定位到分析主题" @click="scrollToSec('kb-sec-topics')"><AppIcon name="target" :size="12" /> 主题 <b>{{ currentSceneTopics.length }}</b></button>
-              <button title="定位到核心指标" @click="scrollToSec('kb-sec-metrics')"><AppIcon name="line-chart" :size="12" /> 指标 <b>{{ sceneMetricsUnique.length }}</b></button>
-              <button title="定位到业务规则" @click="scrollToSec('kb-sec-rules')"><AppIcon name="ruler" :size="12" /> 规则 <b>{{ currentSceneData.rules?.length || 0 }}</b></button>
+              <span class="kb-summary-intro">{{ sceneIntro(activeScene) }}</span>
             </div>
           </div>
         </div>
+      </template>
 
-        <!-- 详情面板（对象/指标/规则/主题 选中后展示，Tab: 概览/字段/关系） -->
-        <div v-if="selectedDetail" class="kb-detail">
+      <!-- 详情弹框（对象 / 指标 / 规则 / 分析主题）：刻意放在视图 v-if 链之外 + Teleport 到 body。
+           这样侧边「业务域」在任意页面点击都能直接弹出解释（Tab: 概览/字段/关系），
+           不用先切到场景知识，也不会让页面跳转 / 换场景。 -->
+      <Teleport to="body">
+        <div v-if="selectedDetail" class="kb-detail-mask" @click.self="closeDetail">
+          <div class="kb-detail kb-detail-modal">
           <div class="kb-detail-head">
             <span class="kb-detail-icon"><AppIcon :name="selectedDetail.icon" :size="21" /></span>
             <div class="kb-detail-title-wrap">
@@ -202,10 +136,10 @@
                 </div>
               </div>
               <!-- P1-B1：分析主题 = 迷你分析台（推荐指标一键跑/看口径） -->
-              <div v-if="selectedDetail.kind === '分析主题' && sceneMetricsUnique.length" class="kb-topic-workbench">
+              <div v-if="selectedDetail.kind === '分析主题' && detailSceneMetrics.length" class="kb-topic-workbench">
                 <div class="kb-topic-wb-title"><AppIcon name="line-chart" :size="12" /> 本场景推荐指标（点开看口径 / 问析）</div>
                 <div class="kb-rel-chips">
-                  <button v-for="m in sceneMetricsUnique.slice(0, 10)" :key="m.name" class="kb-rel-chip" :title="m.formula" @click="openMetricDetail(m, activeScene)">{{ m.name }}</button>
+                  <button v-for="m in detailSceneMetrics.slice(0, 10)" :key="m.name" class="kb-rel-chip" :title="m.formula" @click="openMetricInDetail(m)">{{ m.name }}</button>
                 </div>
                 <button class="kb-topic-wb-ask kb-primary-btn" @click="topicWbAsk">
                   <AppIcon name="sparkles" :size="12" /> 围绕「{{ selectedDetail.title }}」去智能问析
@@ -293,46 +227,27 @@
                     <button v-for="q in selectedDetail.questions || []" :key="q" class="kb-question kb-question-btn" @click="goAskQ(q)"><AppIcon name="message-circle" :size="11" /> {{ q }}</button>
                   </div>
                 </div>
-                <div v-if="sceneMetricsUnique.length" class="kb-rel-group">
+                <div v-if="detailSceneMetrics.length" class="kb-rel-group">
                   <div class="kb-rel-title"><AppIcon name="line-chart" :size="12" /> 当前场景核心指标</div>
                   <div class="kb-rel-chips">
-                    <button v-for="m in sceneMetricsUnique.slice(0, 12)" :key="m.name" class="kb-rel-chip" @click="openMetricDetail(m, activeScene)">{{ m.name }}</button>
+                    <button v-for="m in detailSceneMetrics.slice(0, 12)" :key="m.name" class="kb-rel-chip" @click="openMetricInDetail(m)">{{ m.name }}</button>
                   </div>
                 </div>
               </template>
             </div>
           </div>
         </div>
+        </div>
+      </Teleport>
 
-        <!-- ===== v6 场景知识：实时快照 → 分析主题 → 指标全览 → 业务规则 → 数据支撑 ===== -->
+      <!-- 场景知识主区（分析主题 / 业务规则 / 数据支撑 / 核心指标全览）：与上面的场景胶囊同属「场景知识」视图。
+           注意：这里必须自己再判一次 loading/errorMsg —— 它已经不在上面那条 v-if 链里了，
+           否则加载中/报错时还会把这些卡片（含空状态）一并渲染出来。 -->
+      <template v-if="!loading && !errorMsg && activeView === 'scene'">
+
+        <!-- ===== v6 场景知识：分析主题 → 业务规则 → 数据支撑 → 核心指标全览（最底层） ===== -->
         <div class="kb-v6">
-          <!-- ① 实时快照大卡（按注册口径实时计算） -->
-          <div class="kb-snap-head">
-            <span class="kb-snap-title"><AppIcon name="activity" :size="15" /> 实时业务快照</span>
-            <span class="kb-snap-sub">按「指标口径」注册口径实时计算<template v-if="snapTime"> · 更新于 {{ snapTime }}</template></span>
-            <button class="kb-manage-btn" @click="goMetricsPage"><AppIcon name="arrow-right" :size="11" /> 管理口径</button>
-          </div>
-          <div v-if="snapBusy(activeScene) && !keyCards.length" class="kb-snap-loading">正在按注册口径计算实时值…</div>
-          <div v-else class="kb-snap-grid">
-            <button
-              v-for="c in keyCards"
-              :key="c.name"
-              class="kb-snap-card"
-              :class="{ dim: !c.ok }"
-              :title="c.expr || ''"
-              @click="openSnapMetric(c)"
-            >
-              <span class="kb-snap-name">{{ c.name }}</span>
-              <span class="kb-snap-val">{{ fmtVal(c.value, c.unit) }}</span>
-              <span class="kb-snap-foot">
-                <span class="kb-snap-unit">{{ c.unit || '—' }}</span>
-                <span class="kb-snap-def">口径 ›</span>
-                <em v-if="!c.ok" class="kb-snap-miss">暂无可算数据</em>
-              </span>
-            </button>
-          </div>
 
-          <!-- ② 分析主题（综合分析入口卡 + 指标趋势弱化行） -->
           <div v-if="currentSceneTopics.length" class="kb-card kb-v6-card" id="kb-sec-topics">
             <div class="kb-card-head"><span><AppIcon name="target" :size="14" /> 分析主题</span><span class="kb-card-sub">{{ sceneTopicsBiz.length }} 个综合分析 · {{ sceneTopicsMetric.length }} 个指标趋势</span></div>
             <div class="kb-card-body">
@@ -372,7 +287,34 @@
             </div>
           </div>
 
-          <!-- ③ 核心指标全览（该场景全部注册口径，实时值分组） -->
+          <div v-if="currentSceneData.rules?.length" class="kb-card kb-v6-card" id="kb-sec-rules">
+            <div class="kb-card-head"><span><AppIcon name="ruler" :size="14" /> 业务规则</span><span class="kb-card-sub">异常判定 · 告警边界</span></div>
+            <div class="kb-card-body kb-rules-grid">
+              <div v-for="(rule, i) in currentSceneData.rules" :key="i" class="kb-rule" @click="openRuleDetail(rule, activeScene)">
+                <div class="kb-rule-head">
+                  <span class="kb-rule-name">{{ rule.name }}</span>
+                  <span v-if="rule.source" class="kb-rule-src">{{ rule.source }}</span>
+                </div>
+                <div v-if="rule.condition" class="kb-rule-cond">判定：{{ rule.condition }}</div>
+                <div v-if="rule.formula" class="mono kb-rule-formula">{{ rule.formula }}</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- ⑤ 数据支撑：该场景对应的数据表（完整字段明细；点表卡看业务详情，放大看完整字段）
+               排版与分析主题 / 业务规则卡保持一致：.kb-card-head（灰底标题条）+ .kb-card-body -->
+          <div class="kb-card kb-v6-card" id="kb-sec-objects">
+            <div class="kb-card-head">
+              <span><AppIcon name="package" :size="14" /> 数据支撑 · 数据表</span>
+              <span class="kb-card-sub">{{ sceneTables(activeScene).length }} 张表 · {{ sceneTotalCols }} 个字段 · {{ sceneTotalRows }} 行 · 点击表卡查看业务详情 · 放大查看完整字段</span>
+            </div>
+            <div class="kb-card-body">
+              <TableCardGrid :tables="sceneTables(activeScene)" :loading="tableListLoading" @enlarge="openTableEnlarge" @open="openSceneObjFromTable" />
+            </div>
+          </div>
+        </div>
+
+          <!-- ⑥ 核心指标全览（最底层）（该场景全部注册口径，实时值分组） -->
           <div class="kb-card kb-v6-card" id="kb-sec-metrics">
             <div class="kb-card-head"><span><AppIcon name="line-chart" :size="14" /> 核心指标全览</span><span class="kb-card-sub">覆盖该场景全部注册口径 · 实时计算</span><button class="kb-manage-btn" @click="goMetricsPage"><AppIcon name="arrow-right" :size="11" /> 管理全部口径</button></div>
             <div v-if="snapBusy(activeScene) && !sceneSnapshot.groups.length" class="kb-empty">正在计算实时值…</div>
@@ -399,68 +341,10 @@
             </template>
           </div>
 
-          <!-- ④ 业务规则 -->
-          <div v-if="currentSceneData.rules?.length" class="kb-card kb-v6-card" id="kb-sec-rules">
-            <div class="kb-card-head"><span><AppIcon name="ruler" :size="14" /> 业务规则</span><span class="kb-card-sub">异常判定 · 告警边界</span></div>
-            <div class="kb-card-body kb-rules-grid">
-              <div v-for="(rule, i) in currentSceneData.rules" :key="i" class="kb-rule" @click="openRuleDetail(rule, activeScene)">
-                <div class="kb-rule-head">
-                  <span class="kb-rule-name">{{ rule.name }}</span>
-                  <span v-if="rule.source" class="kb-rule-src">{{ rule.source }}</span>
-                </div>
-                <div v-if="rule.condition" class="kb-rule-cond">判定：{{ rule.condition }}</div>
-                <div v-if="rule.formula" class="mono kb-rule-formula">{{ rule.formula }}</div>
-              </div>
-            </div>
-          </div>
-
-          <!-- ⑤ 数据支撑：业务对象与字段（折叠，悬停字段看含义） -->
-          <div class="kb-card kb-v6-card" id="kb-sec-objects">
-            <details class="kb-fold">
-              <summary>
-                <span class="kb-fold-title"><AppIcon name="package" :size="14" /> 数据支撑 · 业务对象与字段</span>
-                <span class="kb-fold-sub">{{ sceneObjects(activeScene).length }} 张表 · {{ sceneTotalCols }} 个字段 · {{ sceneTotalRows }} 行</span>
-                <span class="kb-fold-tip">悬停字段名看中文含义</span>
-              </summary>
-              <div class="kb-card-body kb-obj-cards" style="margin-top:10px">
-                <div
-                  v-for="obj in currentSceneData.objects"
-                  :key="obj.table"
-                  class="kb-obj-card"
-                  :class="{ active: selectedDetail?.kind === '业务对象' && selectedDetail?.table === obj.table }"
-                  @click="openObjectDetail(obj, activeScene)"
-                >
-                  <div class="kb-obj-card-top">
-                    <span class="kb-object-icon"><AppIcon name="table" :size="15" /></span>
-                    <div class="kb-obj-title">
-                      <div class="kb-obj-name">
-                        {{ obj.label || obj.table }}
-                        <span v-if="obj.is_core" class="kb-core-chip">核心</span>
-                        <span v-if="obj.heat" class="kb-heat-chip"><AppIcon name="zap" :size="10" /> {{ obj.heat }}</span>
-                      </div>
-                      <div class="kb-obj-sub"><span class="mono">{{ obj.table }}</span><span v-if="obj.row_count !== undefined"> · {{ obj.row_count.toLocaleString() }} 行</span></div>
-                    </div>
-                    <button class="kb-ask-btn" title="去智能问析分析该对象" @click.stop="askAboutObj(obj)"><AppIcon name="send" :size="11" /> 去问析</button>
-                  </div>
-                  <div class="kb-obj-desc">{{ obj.desc }}</div>
-                  <div class="kb-obj-tags">
-                    <span class="kb-obj-tag"><AppIcon name="columns" :size="10" /> 字段 {{ (obj.columns || obj.fields || []).length }}</span>
-                    <span v-if="objMetrics(obj).length" class="kb-obj-tag kb-tag-met"><AppIcon name="line-chart" :size="10" /> 指标 {{ objMetrics(obj).length }}</span>
-                    <span v-if="objRules(obj).length" class="kb-obj-tag kb-tag-rule"><AppIcon name="ruler" :size="10" /> 规则 {{ objRules(obj).length }}</span>
-                  </div>
-                  <div class="kb-obj-fields">
-                    <span v-for="col in (obj.columns || obj.fields || []).slice(0, 8)" :key="typeof col === 'string' ? col : col.name" class="kb-field-chip" :title="typeof col === 'string' ? '' : (col.translation || col.comment || '')">{{ typeof col === 'string' ? col : col.name }}</span>
-                    <span v-if="(obj.columns || obj.fields || []).length > 8" class="kb-field-more">+{{ (obj.columns || obj.fields || []).length - 8 }}</span>
-                  </div>
-                </div>
-              </div>
-            </details>
-          </div>
-        </div>
       </template>
       <!-- ================= 视图2：知识图谱 ================= -->
       <template v-else-if="activeView === 'graph'">
-        <div class="kb-graph-shell">
+        <div class="kb-graph-shell kb-view-fill">
           <div class="kb-graph-toolbar">
             <div class="kb-graph-toolbar-left">
               <span class="kb-graph-title"><AppIcon name="git-fork" :size="14" /> 业务知识图谱</span>
@@ -494,10 +378,29 @@
             <span class="kb-legend-note">■ 方形=表级节点 · ● 圆形=字段级节点</span>
             <span v-if="!filteredGraphNodes.length" class="kb-legend-warn">请至少勾选一个类型（右上角过滤按钮）</span>
           </div>
-          <div class="kb-graph-canvas">
-            <!-- LightRAG 知识图谱：1:1 复刻 knowledge_graph.html（物理模拟 + 可拖拽 + 悬停提示）
-                 fit-zoom：适配后再放大 40%，否则 44 个节点的标签在 620px 高画布里过小 -->
-            <LightRagGraph ref="graphRef" :height="620" :fit-zoom="1.4" @node-click="onGraphNodeClick" />
+          <div class="kb-graph-body">
+            <div class="kb-graph-canvas">
+              <!-- LightRAG 知识图谱：1:1 复刻 knowledge_graph.html（物理模拟 + 可拖拽 + 悬停提示）
+                   不传 height → 由 .kb-graph-canvas 撑满剩余高度（内容不足一屏时不留白），
+                   画布最小 420px（见 LightRagGraph 自身 min-height），窗口太矮时页面照常滚动。
+                   fit-zoom：适配后再放大 40%，否则 44 个节点的标签过小 -->
+              <LightRagGraph ref="graphRef" :fit-zoom="1.4" @node-click="onGraphNodeClick" />
+            </div>
+            <!-- 节点中文解释：与图谱左右分栏（同一屏内直接可见，不用往下滑） -->
+            <GraphNodeDetail
+              v-if="selectedGraphNode"
+              :title="graphNodeModalTitle"
+              :kind="graphNodeKindZh"
+              :node-id="selectedGraphNode.id"
+              :zh="graphNodeZh"
+              :raw-desc="selectedGraphNode.rawDesc"
+              :facts="graphNodeFacts"
+              :tables="graphNodeTables"
+              :relations="graphNodeRelations"
+              @close="selectedGraphNode = null"
+              @pick="onGraphNodeClick"
+              @open-table="openSceneObjectOfTable"
+            />
           </div>
         </div>
 
@@ -517,116 +420,62 @@
               </div>
             </div>
             <div class="kb-fullscreen-body">
-              <LightRagGraph ref="graphFullscreenRef" :height="graphFullscreenHeight" @node-click="onGraphNodeClick" />
+              <LightRagGraph ref="graphFullscreenRef" @node-click="onGraphNodeClick" />
+              <!-- 全屏查看时同样是左右分栏，不遮图谱、不用下滑 -->
+              <GraphNodeDetail
+                v-if="selectedGraphNode"
+                :title="graphNodeModalTitle"
+                :kind="graphNodeKindZh"
+                :node-id="selectedGraphNode.id"
+                :zh="graphNodeZh"
+                :raw-desc="selectedGraphNode.rawDesc"
+                :facts="graphNodeFacts"
+                :tables="graphNodeTables"
+                :relations="graphNodeRelations"
+                @close="selectedGraphNode = null"
+                @pick="onGraphNodeClick"
+                @open-table="openSceneObjectOfTable"
+              />
             </div>
           </div>
         </Teleport>
 
-        <!-- 节点中文解释弹框：点击图谱节点弹出（含右上角「全局查看」浮层里的图谱）。
-             说明口径来源于《数据介绍.md》（表/字段中文含义、指标口径、枚举值）。
-             注意：这里刻意不用 ModalDialog（Tailwind z-50），因为它会被 .kb-fullscreen（z-index 100）
-             的全局查看浮层盖住，表现为「全局查看时点节点没反应」；改用页面自身的 .kb-modal-mask（z-index 300）。 -->
-        <Teleport to="body">
-          <div v-if="selectedGraphNode" class="kb-modal-mask" @click.self="selectedGraphNode = null">
-            <div class="kb-modal kb-modal-node">
-              <div class="kb-modal-head">
-                <span><AppIcon name="info" :size="14" /> {{ graphNodeModalTitle }}</span>
-                <button class="kb-detail-close" @click="selectedGraphNode = null"><AppIcon name="x" :size="14" /></button>
-              </div>
-              <div class="kb-modal-body">
-                <div class="kg-zh">
-                  <div class="kg-zh-head">
-                    <span class="kg-zh-badge">{{ graphNodeKindZh }}</span>
-                    <span class="kg-zh-id mono">{{ selectedGraphNode.id }}</span>
-                    <span v-if="graphNodeZh?.table" class="kg-zh-id mono">{{ graphNodeZh.table }}</span>
-                  </div>
-                  <p class="kg-zh-desc">
-                    {{ graphNodeZh?.desc || '暂未收录该节点的中文说明，下方为知识图谱原始描述。' }}
-                  </p>
-
-                  <div v-if="graphNodeFacts.length" class="kg-zh-grid">
-                    <div v-for="f in graphNodeFacts" :key="f.label">
-                      <span>{{ f.label }}</span><b :class="{ mono: f.mono }">{{ f.value }}</b>
-                    </div>
-                  </div>
-
-                  <div v-if="graphNodeZh?.formula" class="kg-zh-block">
-                    <div class="kg-zh-block-title"><AppIcon name="function-square" :size="12" /> 指标口径</div>
-                    <pre class="kg-zh-code mono">{{ graphNodeZh.formula }}</pre>
-                  </div>
-
-                  <div v-if="graphNodeZh?.points?.length" class="kg-zh-block">
-                    <div class="kg-zh-block-title"><AppIcon name="list" :size="12" /> 说明要点</div>
-                    <ul class="kg-zh-points">
-                      <li v-for="(p, pi) in graphNodeZh.points" :key="pi">{{ p }}</li>
-                    </ul>
-                  </div>
-
-                  <div v-if="graphNodeZh?.columns?.length" class="kg-zh-block">
-                    <div class="kg-zh-block-title"><AppIcon name="columns" :size="12" /> 字段中文含义（{{ graphNodeZh.columns.length }}）</div>
-                    <table class="kg-zh-table">
-                      <thead>
-                        <tr><th>字段</th><th>类型</th><th>键</th><th>中文含义</th></tr>
-                      </thead>
-                      <tbody>
-                        <tr v-for="col in graphNodeZh.columns" :key="col.name">
-                          <td class="mono">{{ col.name }}</td>
-                          <td class="mono">{{ col.type }}</td>
-                          <td>
-                            <span v-if="col.key === 'PK'" class="kg-key-badge kg-key-pk">PK</span>
-                            <span v-else-if="col.key === 'FK'" class="kg-key-badge kg-key-fk" title="外键">FK</span>
-                            <span v-else>—</span>
-                          </td>
-                          <td>{{ col.zh }}<span v-if="col.ref" class="kg-zh-ref">→ {{ col.ref }}</span></td>
-                        </tr>
-                      </tbody>
-                    </table>
-                  </div>
-
-                  <div v-if="graphNodeTables.length" class="kg-zh-block">
-                    <div class="kg-zh-block-title"><AppIcon name="database" :size="12" /> 涉及数据表</div>
-                    <div class="kg-zh-chips">
-                      <button v-for="t in graphNodeTables" :key="t" class="kg-zh-chip mono" @click="openSceneObjectOfTable(t)">{{ t }}</button>
-                    </div>
-                  </div>
-
-                  <div class="kg-zh-block">
-                    <div class="kg-zh-block-title"><AppIcon name="git-fork" :size="12" /> 关联关系（{{ graphNodeRelations.length }}）</div>
-                    <div v-if="!graphNodeRelations.length" class="kg-zh-empty">该节点暂无关联关系</div>
-                    <div v-else class="kg-zh-rels">
-                      <button v-for="(r, ri) in graphNodeRelations" :key="ri" class="kg-zh-rel" @click="onGraphNodeClick(r.otherId)">
-                        <span class="kg-zh-rel-dir" :class="{ out: r.out }">{{ r.out ? '→' : '←' }}</span>
-                        <span class="kg-zh-rel-main">
-                          <b>{{ r.otherLabel }}</b>
-                          <em>{{ r.desc || r.relType }}</em>
-                        </span>
-                        <span class="kg-zh-rel-id mono">{{ r.otherId }}</span>
-                      </button>
-                    </div>
-                  </div>
-
-                  <div v-if="!graphNodeZh" class="kg-zh-origin">
-                    <div class="kg-zh-block-title">知识图谱原始描述</div>
-                    <p>{{ selectedGraphNode.rawDesc || '—' }}</p>
-                  </div>
-                </div>
-              </div>
-              <div class="kb-modal-foot">
-                <button
-                  v-if="graphNodePrimaryTable"
-                  class="kb-primary-btn"
-                  @click="openSceneObjectOfTable(graphNodePrimaryTable)"
-                ><AppIcon name="folder-open" :size="11" /> 在场景知识中查看该对象</button>
-                <button class="kb-ghost-btn" @click="selectedGraphNode = null">关闭</button>
-              </div>
-            </div>
-          </div>
-        </Teleport>
       </template>
 
-      <!-- ================= 视图3：术语词典 ================= -->
-      <template v-else-if="activeView === 'terms'">
+      <!-- ================= 视图3：表间关系（原「数据底座概览」弹窗迁移为导航视图） ================= -->
+      <template v-else-if="activeView === 'rels'">
         <div class="kb-terms-shell">
+          <div class="kb-terms-toolbar">
+            <div class="kb-terms-toolbar-left">
+              <span class="kb-graph-title"><AppIcon name="share-2" :size="14" /> 表间关系知识图谱</span>
+              <span class="kb-terms-count">共 {{ modalGraphData.length }} 条关系 · {{ modalGraphNodes.length }} 个节点</span>
+            </div>
+            <div class="kb-terms-toolbar-right">
+              <button class="kb-ghost-btn" @click="loadRels(true)"><AppIcon name="refresh-cw" :size="11" /> 刷新</button>
+            </div>
+          </div>
+          <div v-if="graphLoading" class="kb-state">
+            <div class="kb-spinner"></div>
+            <span>正在加载表间关系…</span>
+          </div>
+          <div v-else-if="modalGraphData.length === 0 && modalGraphNodes.length === 0" class="kb-empty">暂无关系数据</div>
+          <div v-else class="kb-rels-body">
+            <div class="mb-2 text-xs font-semibold text-gray-600">关系明细（{{ modalGraphData.length }} 条）</div>
+            <div class="grid max-h-56 gap-1 overflow-y-auto text-xs text-gray-600 sm:grid-cols-2">
+              <div v-for="relation in modalGraphData" :key="relation.description" class="rounded bg-gray-50 px-2 py-1.5">
+                {{ relDisplay(relation) }}
+              </div>
+            </div>
+            <div class="mt-4">
+              <KnowledgeGraph :nodes="modalGraphNodes" :relationships="modalGraphData" :height="640" />
+            </div>
+          </div>
+        </div>
+      </template>
+
+      <!-- ================= 视图4：术语词典 ================= -->
+      <template v-else-if="activeView === 'terms'">
+        <div class="kb-terms-shell kb-view-fill">
           <div class="kb-terms-toolbar">
             <div class="kb-terms-toolbar-left">
               <span class="kb-graph-title"><AppIcon name="book-open" :size="14" /> 业务术语词典</span>
@@ -655,7 +504,7 @@
               <div v-for="term in group.items" :key="term.term" class="kb-term" @click="openTermDetail(term)">
                 <div class="kb-term-main">
                   <div class="kb-term-top">
-                    <span class="kb-term-name">{{ term.term }}</span>
+                    <span class="kb-term-name">{{ term.term_cn || term.term }}</span>
                     <span class="kb-term-badge" :class="'kb-badge-' + badgeKey(term.knowledge_type)">{{ term.knowledge_type }}</span>
                     <span class="kb-term-badge kb-term-badge-cat">{{ term.category }}</span>
                     <span v-if="term.custom" class="kb-term-badge-custom">自定义</span>
@@ -664,7 +513,7 @@
                 </div>
                 <div class="kb-term-actions">
                   <button v-if="term.custom" class="kb-term-action" title="删除自定义术语" @click.stop="deleteCustomTerm(term.term)"><AppIcon name="trash-2" :size="13" /></button>
-                  <button class="kb-term-action" :class="{ fav: isTermFav(term.term) }" :title="isTermFav(term.term) ? '取消收藏' : '收藏'" @click.stop="toggleTermFav(term.term)"><AppIcon name="star" :size="13" /></button>
+                  <button class="kb-term-action" :class="{ fav: isTermFav(term) }" :title="isTermFav(term) ? '取消收藏' : '收藏'" @click.stop="toggleTermFav(term)"><AppIcon name="star" :size="13" /></button>
                 </div>
                 <div class="kb-term-side">
                   <div class="mono kb-term-en">{{ term.en }}</div>
@@ -673,7 +522,7 @@
                 <div class="kb-term-meta">
                   <span v-if="term.data_type" class="mono">类型：{{ term.data_type }}</span>
                   <span v-if="term.abbreviation">简称：{{ term.abbreviation }}</span>
-                  <span v-if="term.mapped_table">来源：{{ term.mapped_table }}{{ term.mapped_field ? '.' + term.mapped_field : '' }}</span>
+                  <span v-if="term.mapped_table">来源：{{ term.table_cn || term.mapped_table }}{{ term.mapped_field ? '.' + term.mapped_field : '' }}</span>
                 </div>
               </div>
             </div>
@@ -681,7 +530,7 @@
         </div>
       </template>
 
-      <!-- ================= 视图4：分析模板 ================= -->
+      <!-- ================= 视图5：分析模板 ================= -->
       <template v-else-if="activeView === 'templates'">
         <div class="kb-templates">
           <div class="kb-templates-toolbar">
@@ -741,7 +590,7 @@
         </div>
       </template>
 
-      <!-- ================= 视图5：我的收藏 ================= -->
+      <!-- ================= 视图7：我的收藏 ================= -->
       <template v-else-if="activeView === 'fav'">
         <div class="kb-fav">
           <div class="kb-fav-head">
@@ -817,18 +666,6 @@
             </div>
           </div>
         </div>
-
-        <!-- 迷你关系图 -->
-        <div class="kb-panel-graph">
-          <div class="kb-panel-graph-head">
-            <span><AppIcon name="git-fork" :size="13" /> 关联关系</span>
-            <button v-if="miniTarget" class="kb-ghost-btn" @click="resetMiniGraph">全部</button>
-          </div>
-          <div v-if="miniGraphNodes.length" class="kb-panel-graph-body">
-            <KnowledgeGraph ref="miniGraphRef" :nodes="miniGraphNodes" :relationships="miniGraphRels" :height="200" @node-click="onMiniGraphNodeClick" />
-          </div>
-          <div v-else class="kb-empty kb-empty-small">暂无关联关系</div>
-        </div>
       </template>
     </aside>
   </div>
@@ -894,38 +731,6 @@
     </div>
   </Teleport>
 
-  <!-- ====== 知识健康度面板 ====== -->
-  <Teleport to="body">
-    <div v-if="showHealth" class="kb-modal-mask" @click.self="showHealth = false">
-      <div class="kb-modal kb-modal-lg">
-        <div class="kb-modal-head"><span><AppIcon name="heart-pulse" :size="14" /> 知识健康度</span><button class="kb-detail-close" @click="showHealth = false"><AppIcon name="x" :size="14" /></button></div>
-        <div class="kb-modal-body">
-          <template v-if="healthData">
-            <div class="kb-health-score"><div class="kb-health-ring" :style="{ '--pct': healthData.score }"><b>{{ healthData.score }}</b><span>覆盖率</span></div></div>
-            <div class="kb-health-grid">
-              <div class="kb-health-card"><span>数据表</span><b>{{ healthData.tables }}</b><small v-if="healthData.tables_without_alias" class="warn">{{ healthData.tables_without_alias }} 缺中文名</small></div>
-              <div class="kb-health-card"><span>字段</span><b>{{ healthData.fields_total }}</b><small v-if="healthData.fields_without_translation" class="warn">{{ healthData.fields_without_translation }} 缺业务含义</small></div>
-              <div class="kb-health-card"><span>指标</span><b>{{ healthData.metrics_total }}</b><small v-if="healthData.metrics_without_formula" class="warn">{{ healthData.metrics_without_formula }} 缺口径</small></div>
-              <div class="kb-health-card"><span>规则</span><b>{{ healthData.rules_total }}</b></div>
-              <div class="kb-health-card"><span>主题</span><b>{{ healthData.topics_total }}</b></div>
-              <div class="kb-health-card"><span>术语</span><b>{{ healthData.terms_total }}</b><small v-if="healthData.custom_terms_total">{{ healthData.custom_terms_total }} 为自定义</small></div>
-              <div class="kb-health-card"><span>孤立表</span><b>{{ healthData.orphan_tables }}</b><small v-if="healthData.orphan_tables" class="warn">无关联关系</small></div>
-              <div class="kb-health-card"><span>关系数</span><b>{{ healthData.relationships }}</b></div>
-              <div class="kb-health-card"><span>已停用</span><b>{{ healthData.disabled_total }}</b></div>
-            </div>
-            <div class="kb-health-foot">基于当前已加载数据实时计算 · 含中文别名 / 字段业务含义 / 指标公式 / 表间关系四个维度加权</div>
-          </template>
-          <div v-else class="kb-empty">加载中…</div>
-        </div>
-      </div>
-    </div>
-  </Teleport>
-
-  <!-- ====== 数据底座概览弹窗：数据表列表 ====== -->
-  <ModalDialog :visible="showTableModal" title="数据表列表" width="960px" maxHeight="82vh" @close="showTableModal = false">
-    <TableCardGrid :tables="tableList" :loading="tableListLoading" @view-data="viewTableData" @enlarge="openTableEnlarge" />
-  </ModalDialog>
-
   <!-- ====== 数据底座概览弹窗：单表放大 ====== -->
   <ModalDialog :visible="showEnlargeModal" :title="enlargeTable?.chinese_name || enlargeTable?.table_name || ''" width="820px" maxHeight="86vh" @close="showEnlargeModal = false">
     <div v-if="enlargeTable" class="space-y-4">
@@ -961,164 +766,6 @@
               <span v-if="!col.nullable" class="text-[10px] text-red-400">NOT NULL</span>
             </div>
             <div class="mt-1 text-[13px] leading-relaxed text-gray-600">{{ col.translation || col.comment || '—' }}</div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </ModalDialog>
-
-  <!-- ====== 数据底座概览弹窗：术语词典 ====== -->
-  <ModalDialog :visible="showTermModal" title="术语词典" width="760px" maxHeight="82vh" @close="showTermModal = false">
-    <div class="space-y-3">
-      <div
-        v-for="term in termDictionary"
-        :key="term.term"
-        class="rounded-xl border border-gray-100 bg-white px-4 py-3 hover:border-gray-200 transition"
-      >
-        <div class="flex items-center gap-2">
-          <AppIcon name="book-open" :size="14" class="text-purple-400" />
-          <span class="font-semibold text-gray-800">{{ term.term }}</span>
-          <span v-if="term.category" class="text-[10px] rounded-full bg-gray-100 text-gray-500 px-2 py-0.5">{{ term.category }}</span>
-        </div>
-        <p class="mt-1 text-sm text-gray-600">{{ term.definition }}</p>
-        <div v-if="term.mapped_table && term.mapped_field" class="mt-1 text-xs text-gray-400 font-mono">
-          {{ term.mapped_table }}.{{ term.mapped_field }}
-        </div>
-      </div>
-      <div v-if="!termDictionary.length" class="text-center text-gray-400 py-8">暂无术语</div>
-    </div>
-  </ModalDialog>
-
-  <!-- ====== 数据底座概览弹窗：表间关系知识图谱 ====== -->
-  <ModalDialog :visible="showGraphModal" title="表间关系知识图谱" width="min(94vw, 1400px)" maxHeight="92vh" @close="showGraphModal = false">
-    <div v-if="graphLoading" class="text-center text-gray-400 py-16">加载中...</div>
-    <div v-else-if="modalGraphData.length === 0 && modalGraphNodes.length === 0" class="text-center text-gray-400 py-16">暂无关系数据</div>
-    <div v-else>
-      <KnowledgeGraph :nodes="modalGraphNodes" :relationships="modalGraphData" :height="640" />
-      <div class="mt-2 flex flex-wrap items-center gap-1.5 text-[11px] text-gray-400">
-        <span class="mr-1">节点颜色按业务场景分组：</span>
-        <span v-for="(c, s) in SCENE_LEGEND" :key="s" class="flex items-center gap-1 rounded-full px-2 py-0.5 border" :style="{ borderColor: c.border, background: c.bg, color: c.text }">{{ s }}</span>
-      </div>
-      <div class="mt-4 border-t border-gray-100 pt-4">
-        <div class="mb-2 text-xs font-semibold text-gray-600">关系明细（{{ modalGraphData.length }} 条）</div>
-        <div class="grid max-h-40 gap-1 overflow-y-auto text-xs text-gray-500 sm:grid-cols-2">
-          <div v-for="relation in modalGraphData" :key="relation.description" class="rounded bg-gray-50 px-2 py-1.5">
-            {{ relation.description }}
-          </div>
-        </div>
-      </div>
-    </div>
-  </ModalDialog>
-
-  <!-- ====== 数据底座概览弹窗：分析主题 ====== -->
-  <ModalDialog :visible="showTopicModal" title="当前数据库分析主题" width="720px" maxHeight="80vh" @close="showTopicModal = false">
-    <div class="grid grid-cols-1 gap-4">
-      <div
-        v-for="topic in topicList"
-        :key="topic.id"
-        class="rounded-2xl border p-5 transition-all hover:shadow-md bg-white"
-        :class="topicBorderClass(topic.id)"
-      >
-        <div class="flex items-start gap-3 mb-3">
-          <span class="topic-tile" :style="topicTileStyle(topic.id)">{{ topicMonogram(topic.name) }}</span>
-          <div class="flex-1 min-w-0">
-            <div class="flex items-center gap-2 flex-wrap">
-              <div class="text-lg font-semibold text-gray-900">{{ topic.name }}</div>
-              <span
-                v-if="topic.kind"
-                class="rounded-full px-2 py-0.5 text-[10px] font-medium"
-                :class="topic.kind === '通用能力' ? 'bg-gray-100 text-gray-500' : 'bg-indigo-50 text-indigo-500'"
-              >{{ topic.kind }}</span>
-              <span
-                v-for="r in topic.roles"
-                :key="r"
-                class="rounded-full px-2 py-0.5 text-[10px] bg-gray-100 text-gray-500"
-              >{{ ROLE_LABEL[r] || r }}</span>
-            </div>
-            <p class="text-sm text-gray-500 mt-1">{{ topic.description }}</p>
-          </div>
-        </div>
-
-        <div class="ml-12 space-y-3">
-          <div v-if="topic.objects?.length">
-            <div class="flex items-center gap-1.5 text-xs text-gray-400 mb-1.5">
-              <AppIcon name="box" :size="13" /> 涉及对象（{{ topic.objects.length }}）<span class="text-gray-300"> · 点击查看字段翻译</span>
-            </div>
-            <div class="flex flex-wrap gap-1.5">
-              <span
-                v-for="obj in topic.objects"
-                :key="obj.table"
-                class="text-xs px-2.5 py-1 rounded-full cursor-pointer transition"
-                :class="activeObjTables.has(obj.table) ? 'bg-indigo-500 text-white shadow-sm' : 'bg-gray-100 text-gray-700 hover:bg-indigo-50 hover:text-indigo-700'"
-                @click="toggleObj(obj.table)"
-              >{{ obj.label }}<span :class="activeObjTables.has(obj.table) ? 'text-indigo-100' : 'text-gray-400'"> · {{ obj.columns?.length }} 字段</span></span>
-            </div>
-            <template v-for="obj in topic.objects" :key="obj.table">
-              <div v-if="activeObjTables.has(obj.table)" class="mt-2 rounded-lg border border-indigo-100 bg-indigo-50/40 p-2.5">
-                <div class="flex items-center gap-1.5 text-xs font-medium text-indigo-700 mb-1.5">
-                  <AppIcon name="table" :size="13" /> {{ obj.label }}
-                  <span v-if="obj.row_count !== undefined" class="font-normal text-indigo-400"> · {{ Number(obj.row_count).toLocaleString() }} 行</span>
-                </div>
-                <div class="grid max-h-52 gap-1 overflow-y-auto pr-1 sm:grid-cols-2">
-                  <div v-for="col in obj.columns" :key="col.name" class="rounded bg-white px-2 py-1.5 text-xs border border-indigo-50">
-                    <div class="flex items-center gap-1.5">
-                      <code class="text-[11px] font-semibold text-gray-700">{{ col.name }}</code>
-                      <span class="text-[10px] text-gray-400">{{ col.type }}</span>
-                      <span v-if="col.primary_key" class="text-[9px] rounded bg-amber-100 text-amber-700 px-1">PK</span>
-                      <span v-if="col.masked" class="inline-flex items-center gap-0.5 text-[9px] rounded bg-amber-50 text-amber-600 px-1" title="该字段按你的权限做了脱敏展示"><AppIcon name="lock" :size="9" />脱敏</span>
-                    </div>
-                    <div class="mt-0.5 text-[11px] text-gray-600 leading-snug">{{ col.translation }}</div>
-                  </div>
-                </div>
-              </div>
-            </template>
-          </div>
-
-          <div v-if="topic.metrics?.length">
-            <div class="flex items-center gap-1.5 text-xs text-gray-400 mb-1.5"><AppIcon name="trending-up" :size="13" /> 核心指标</div>
-            <div class="space-y-1">
-              <div v-for="m in topic.metrics" :key="m.name" class="rounded bg-orange-50 px-2.5 py-1.5 text-xs">
-                <span class="font-medium text-orange-700">{{ m.name }}</span>
-                <span v-if="m.unit" class="text-gray-400 ml-1">（{{ m.unit }}）</span>
-                <div v-if="m.formula" class="mt-0.5 font-mono text-[11px] text-gray-600">{{ m.formula }}</div>
-              </div>
-            </div>
-          </div>
-
-          <div v-if="topic.rules?.length">
-            <div class="flex items-center gap-1.5 text-xs text-gray-400 mb-1.5"><AppIcon name="ruler" :size="13" /> 判定规则（{{ topic.rules.length }}）</div>
-            <div class="space-y-1 max-h-36 overflow-y-auto pr-1">
-              <div v-for="(rule, i) in topic.rules" :key="i" class="rounded bg-amber-50 px-2.5 py-1.5 text-xs">
-                <span class="font-medium text-amber-700">{{ rule.name }}</span>
-                <span class="text-gray-400 mx-1">→</span>
-                <span class="text-gray-600">{{ rule.condition }}</span>
-              </div>
-            </div>
-          </div>
-
-          <div v-if="topic.topics?.length">
-            <div class="flex items-center gap-1.5 text-xs text-gray-400 mb-1.5"><AppIcon name="message-circle" :size="13" /> 支持提问</div>
-            <div class="space-y-2">
-              <div v-for="(st, i) in topic.topics" :key="i">
-                <div class="text-[11px] font-medium text-gray-500 mb-0.5">{{ st.name }}</div>
-                <div class="ml-3 space-y-1">
-                  <div v-for="q in st.questions" :key="q" class="rounded bg-indigo-50 px-2 py-1 text-xs text-indigo-700">{{ q }}</div>
-                </div>
-              </div>
-            </div>
-          </div>
-          <div v-if="!topic.topics?.length && topic.supported_questions?.length">
-            <div class="flex items-center gap-1.5 text-xs text-gray-400 mb-1.5"><AppIcon name="message-circle" :size="13" /> 支持提问</div>
-            <div class="space-y-1">
-              <div v-for="question in topic.supported_questions" :key="question" class="rounded bg-indigo-50 px-2 py-1 text-xs text-indigo-700">{{ question }}</div>
-            </div>
-          </div>
-
-          <div v-if="topic.chart_types?.length">
-            <div class="flex items-center gap-1.5 text-xs text-gray-400 mb-1.5"><AppIcon name="bar-chart-2" :size="13" /> 支持图表</div>
-            <div class="flex flex-wrap gap-1.5">
-              <span v-for="ct in topic.chart_types" :key="ct" class="text-xs bg-blue-50 text-blue-600 px-2.5 py-1 rounded-full">{{ CHART_TYPE_LABEL[ct] || ct }}</span>
-            </div>
           </div>
         </div>
       </div>
@@ -1184,6 +831,7 @@
 import { ref, computed, onMounted, watch, nextTick } from 'vue'
 import KnowledgeGraph from '../components/KnowledgeGraph.vue'
 import LightRagGraph from '../components/LightRagGraph.vue'
+import GraphNodeDetail from '../components/GraphNodeDetail.vue'
 import AppIcon from '../components/AppIcon.vue'
 import ModalDialog from '../components/ModalDialog.vue'
 import TableCardGrid from '../components/TableCardGrid.vue'
@@ -1201,12 +849,8 @@ const emit = defineEmits<{
 // 核心指标卡「管理全部口径」：跳转指标口径注册表页（同一注册表的管理视图，消除"以哪个为准"的困惑）
 const goMetricsPage = () => emit('navigate', 'metrics')
 
-// ========== 数据底座概览弹窗（数据表/术语/关系/主题，自总览页迁移） ==========
-const showTableModal = ref(false)
+// ========== 数据表 / 表间关系（顶部导航视图，自原「数据底座概览」弹窗迁移） ==========
 const showEnlargeModal = ref(false)
-const showTermModal = ref(false)
-const showGraphModal = ref(false)
-const showTopicModal = ref(false)
 
 const tableList = ref<any[]>([])
 const tableListLoading = ref(false)
@@ -1227,9 +871,8 @@ async function fetchJson(url: string, init?: RequestInit): Promise<any> {
   return data
 }
 
-const openTableList = async () => {
-  showTableModal.value = true
-  if (tableList.value.length > 0) return
+const loadTables = async (force = false) => {
+  if (!force && (tableList.value.length > 0 || tableListLoading.value)) return
   tableListLoading.value = true
   try {
     const data = await fetchJson('/api/tables/')
@@ -1241,24 +884,39 @@ const openTableList = async () => {
   }
 }
 
+// 数据支撑表卡「放大」：直接打开该对象的详情弹框（Tab 定位到「字段」看完整字段），
+// 不再另开一个「单表放大」弹框。原来 放大 按钮的点击会冒泡到卡片头部再触发一次 open，
+// 结果同时弹出两张卡片（对象详情 + 单表放大）；现在合并为一张：
+// 详情弹框里已包含 说明 / 字段（完整列表）/ 关系，以及收藏・点赞・去问析等操作。
 const openTableEnlarge = (tbl: any) => {
-  enlargeTable.value = tbl
-  showEnlargeModal.value = true
+  const obj = (scenesMap.value[activeScene.value]?.objects || []).find((o: any) => o.table === tbl.table_name)
+  if (!obj) {
+    // 兵底：表不在当前场景对象里（理论上不会发生）→ 退回原来的单表放大弹框
+    enlargeTable.value = tbl
+    showEnlargeModal.value = true
+    return
+  }
+  openObjectDetail(obj, activeScene.value)
+  detailTab.value = 'fields'
 }
 
-const viewTableData = () => {
-  // 知识页「场景知识」Tab 已承载表结构，此处仅关闭弹窗
-  showTableModal.value = false
-  showEnlargeModal.value = false
+// 表中文名（与《数据介绍.md》第 2 节一致，用于关系明细展示）
+const TABLE_CN_LOOKUP: Record<string, string> = {
+  dim_product: '产品主数据', dim_process: '工序主数据', dim_production_line: '产线主数据',
+  dim_equipment: '设备主数据', mes_work_order: '生产工单', mes_process_output: '工序产量',
+  qms_inspection: '质量检验', qms_defect_detail: '不良明细', eqp_downtime_record: '设备停机记录',
+  inv_inventory_snapshot: '库存快照',
+}
+// 关系明细行：中文表名.字段 → 中文表名.字段（业务说明）
+const relDisplay = (r: any) => {
+  const s = `${TABLE_CN_LOOKUP[r.source_table] || r.source_table}.${r.source_column}`
+  const t = `${TABLE_CN_LOOKUP[r.target_table] || r.target_table}.${r.target_column}`
+  const note = r.note ? `（${r.note}）` : ''
+  return `${s} → ${t}${note}`
 }
 
-const openTermList = () => {
-  showTermModal.value = true
-}
-
-const openRelationshipGraph = async () => {
-  showGraphModal.value = true
-  if (modalGraphData.value.length > 0 || modalGraphNodes.value.length > 0 || graphLoading.value) return
+const loadRels = async (force = false) => {
+  if (!force && (modalGraphData.value.length > 0 || modalGraphNodes.value.length > 0 || graphLoading.value)) return
   graphLoading.value = true
   try {
     const data = await fetchJson('/api/tables/relationships')
@@ -1271,62 +929,6 @@ const openRelationshipGraph = async () => {
   }
 }
 
-const openTopicList = () => {
-  showTopicModal.value = true
-}
-
-// 知识图谱场景图例（与 KnowledgeGraph.vue 的 SCENE_COLORS 保持一致）
-const SCENE_LEGEND: Record<string, { bg: string; border: string; text: string }> = {
-  '生产': { bg: '#eff6ff', border: '#3b82f6', text: '#1d4ed8' },
-  '质量': { bg: '#fef2f2', border: '#ef4444', text: '#b91c1c' },
-  '设备': { bg: '#fffbeb', border: '#f59e0b', text: '#b45309' },
-  '库存': { bg: '#e8f3ff', border: '#1677ff', text: '#2E7CF0' },
-  '销售': { bg: '#f5f3ff', border: '#8b5cf6', text: '#6d28d9' },
-  '采购': { bg: '#fff7ed', border: '#f97316', text: '#c2410c' },
-  '人事': { bg: '#fce7f3', border: '#ec4899', text: '#be185d' },
-  '财务': { bg: '#f0fdfa', border: '#2563eb', text: '#0f766e' },
-  '基础数据': { bg: '#f1f5f9', border: '#64748b', text: '#334155' },
-}
-
-// 图表类型中文标签
-const CHART_TYPE_LABEL: Record<string, string> = { bar: '柱状图', line: '折线图', pie: '饼图' }
-
-// 系统角色中文标签
-const ROLE_LABEL: Record<string, string> = { admin: '管理员', viewer: '普通员工' }
-
-const TOPIC_COLORS = [
-  'border-blue-200 hover:border-blue-400',
-  'border-blue-200 hover:border-blue-400',
-  'border-orange-200 hover:border-orange-400',
-  'border-cyan-200 hover:border-cyan-400',
-  'border-purple-200 hover:border-purple-400',
-  'border-rose-200 hover:border-rose-400',
-]
-const hashId = (id: string) => {
-  let h = 0
-  for (const ch of String(id)) h = (h * 31 + ch.charCodeAt(0)) >>> 0
-  return h
-}
-const topicBorderClass = (id: string) => TOPIC_COLORS[hashId(id) % TOPIC_COLORS.length]
-
-const TOPIC_TILES = [
-  { background: 'rgba(10,132,255,0.10)', color: '#0A84FF' },
-  { background: 'rgba(77,158,255,0.12)', color: '#1677FF' },
-  { background: 'rgba(255,159,10,0.12)', color: '#D97E06' },
-  { background: 'rgba(175,82,222,0.10)', color: '#AF52DE' },
-  { background: 'rgba(255,55,95,0.10)', color: '#FF375F' },
-  { background: 'rgba(0,199,190,0.12)', color: '#00A39B' },
-]
-const topicTileStyle = (id: string) => TOPIC_TILES[hashId(id) % TOPIC_TILES.length]
-const topicMonogram = (name: string) => (name || '?').trim().charAt(0)
-
-const activeObjTables = ref<Set<string>>(new Set())
-const toggleObj = (table: string) => {
-  const next = new Set(activeObjTables.value)
-  if (next.has(table)) next.delete(table)
-  else next.add(table)
-  activeObjTables.value = next
-}
 
 // ========== 用户知识数据：收藏 / 反馈 / 人工覆盖 / 自定义术语 ==========
 const userData = ref<any>({ username: '', favorites: [], feedback: {}, overrides: {}, custom_terms: [], template_use_count: {} })
@@ -1358,8 +960,8 @@ const favKindIcon = (item: any) => (FAV_META[item.kind] || { icon: 'star' }).ico
 const favVisible = computed(() => knowledgeFavorites.value.filter((f: any) => f.key && String(f.key) !== 'undefined'))
 
 // 术语收藏（kind='term'，key=术语名）
-const isTermFav = (name: string) => isFavorite('term', name)
-const toggleTermFav = (name: string) => toggleFavorite({ kind: 'term', key: name, label: name })
+const isTermFav = (term: any) => isFavorite('term', term?.term)
+const toggleTermFav = (term: any) => toggleFavorite({ kind: 'term', key: term.term, label: term.term_cn || term.term })
 
 // 分析模板收藏（kind='template'，key=模板 id）
 const isTemplateFav = (id: string) => isFavorite('template', String(id))
@@ -1429,7 +1031,7 @@ const removeFav = (item: any) => removeFavorite(item.kind, item.key)
 const clearAllFavs = () => {
   if (window.confirm('确定清空全部收藏吗？')) clearFavorites()
 }
-const openFavList = () => { activeView.value = 'fav' }
+
 const setFeedback = async (key: string, vote: string) => {
   try {
     const res = await fetch('/api/knowledge/feedback', {
@@ -1503,11 +1105,18 @@ const errorMsg = ref('')
 // ========== 视图切换 ==========
 const viewTabs = [
   { key: 'scene', icon: 'folder', name: '场景知识' },
+  { key: 'terms', icon: 'book-open', name: '术语词典' },
   { key: 'graph', icon: 'git-fork', name: '知识图谱' },
-  { key: 'templates', icon: 'file-text', name: '分析模板' },
+  { key: 'rels', icon: 'share-2', name: '表间关系' },
+  { key: 'templates', icon: 'file-text', name: '分析模版' },
   { key: 'fav', icon: 'star', name: '我的收藏' },
 ]
 const activeView = ref('scene')
+// 导航视图懒加载：进入「数据表 / 表间关系」时拉取对应数据
+watch(() => activeView.value, (v) => {
+  if (v === 'scene') loadTables()
+  else if (v === 'rels') loadRels()
+})
 
 // ========== 场景数据 ==========
 const scenesMap = ref<Record<string, any>>({})
@@ -1536,10 +1145,23 @@ const sceneTopicsMetric = computed(() =>
 
 // ====== P0（2026-09-03）：场景内容增强辅助 ======
 const sceneObjects = (key: string) => scenesMap.value[key]?.objects || []
+// 当前场景对应的数据表（来自 /api/tables/ 全量表，按场景对象表名过滤）
+const sceneTables = (key: string) => {
+  const names = new Set((scenesMap.value[key]?.objects || []).map((o: any) => o.table))
+  return tableList.value.filter((t: any) => names.has(t.table_name))
+}
 const currentSceneInfo = computed(() => {
   const s = scenes.value.find((x) => x.key === activeScene.value)
   return { name: s?.name || activeScene.value, desc: s?.desc || '' }
 })
+// 场景用途解释：概要条说明"该场景是干什么的"（优先于后端简短 desc 展示）
+const SCENE_INTRO: Record<string, string> = {
+  production: '面向制造业生产执行环节：追踪产量与产能利用、对比工序良率、评估工单达成与在制负荷，识别瓶颈工序与质量短板，支撑排产优化、交付保障与生产改进决策。',
+  quality: '面向产品质量管控环节：监控检验合格率、不良分布与缺陷结构，定位不良高发工序与产品，支撑质量改进优先级判定与缺陷源头治理。',
+  equipment: '面向设备运行管理环节：统计停机时长、停机次数与非计划停机占比，关联停机原因与产线表现，支撑设备效率评估、保养计划与停机改进。',
+  inventory: '面向库存管理环节：监控库存水位、可用/冻结与安全库存对比，预警缺货与积压风险，支撑补货决策、库存周转优化与呆滞清理。',
+}
+const sceneIntro = (key: string) => SCENE_INTRO[key] || scenesMap.value[key]?.desc || ''
 // 指标去重：注册表内置+自定义可能同名（如 已完成工单数/返工数量），卡片只展示一次
 const sceneMetricsUnique = computed(() => {
   const seen = new Set<string>()
@@ -1556,13 +1178,6 @@ const sceneMetricsUnique = computed(() => {
 // ====== v6 实时快照（GET /api/knowledge/scene-snapshot/{scene}，按注册口径实时计算） ======
 const snapshots = ref<Record<string, any>>({})
 const snapshotBusy = ref<Record<string, boolean>>({})
-// 每个场景的「关键结果」4 大卡（名称须与指标注册表一致，缺失自动跳过）
-const SCENE_KEY_CARDS: Record<string, string[]> = {
-  production: ['产量', '良率', '在产工单数', '不良率'],
-  quality: ['质检合格率', '抽检不良数', '检验次数', '质检不合格率'],
-  equipment: ['停机时长', '停机次数', '平均停机时长', '非计划停机占比'],
-  inventory: ['库存缺口量', '库存预警数', '库存量', '总库存'],
-}
 // 场景可继续补的口径（未注册占位 → 引导到口径页注册后自动出现）
 const SCENE_SUGGESTS: Record<string, string[]> = {
   production: ['拖期工单数', '报废数量', '按产线产量排行', '按班次对比'],
@@ -1585,26 +1200,6 @@ const loadSnapshot = async (key: string) => {
 }
 const snapBusy = (key: string) => !!snapshotBusy.value[key]
 const sceneSnapshot = computed(() => snapshots.value[activeScene.value] || { groups: [] })
-const snapTime = computed(() =>
-  sceneSnapshot.value.updated_at
-    ? new Date(sceneSnapshot.value.updated_at * 1000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
-    : '')
-// 关键结果卡：从快照扁平项里按序取（不在注册表/不可算的跳过，不显示假数字）
-const keyCards = computed(() => {
-  const want = SCENE_KEY_CARDS[activeScene.value] || []
-  const flat: any[] = []
-  for (const g of sceneSnapshot.value.groups || []) {
-    for (const it of g.items || []) flat.push({ ...it, table: g.table })
-  }
-  const alias: Record<string, string> = { 在产工单数: '在制工单数' }
-  const out: any[] = []
-  for (const n of want) {
-    let it = flat.find((x) => x.name === n)
-    if (!it && alias[n]) it = flat.find((x) => x.name === alias[n])
-    if (it) out.push(it)
-  }
-  return out
-})
 const sceneSuggests = computed(() => SCENE_SUGGESTS[activeScene.value] || [])
 const sceneTotalCols = computed(() =>
   (currentSceneData.value.objects || []).reduce((s: number, o: any) => s + ((o.columns || o.fields || []).length), 0))
@@ -1637,16 +1232,6 @@ watch(() => activeScene.value, (k) => {
 
 const objMetrics = (obj: any) =>
   sceneMetricsUnique.value.filter((m: any) => (m.tables || []).includes(obj?.table))
-// 对象 → 关联规则（规则文本提及表名/中文名，弱关联如实呈现；无命中不显示角标）
-const objRules = (obj: any) => {
-  const t = obj?.table || ''
-  const lb = obj?.label || ''
-  if (!t) return []
-  return (currentSceneData.value.rules || []).filter((r: any) => {
-    const s = `${r.name || ''} ${r.condition || ''} ${r.formula || ''} ${r.source || ''}`
-    return s.includes(t) || (lb.length >= 2 && s.includes(lb))
-  })
-}
 // 对象 → 去问析：优先用关联注册指标组问（确定性秒查）；否则用场景主题典型问题兜底
 const askAboutObj = (obj: any) => {
   const label = obj?.label || obj?.table
@@ -1661,10 +1246,6 @@ const askAboutObj = (obj: any) => {
   emit('navigate-ask', q)
 }
 const goAskQ = (q: string) => { if (q) emit('navigate-ask', q) }
-const scrollToSec = (id: string) => {
-  const el = document.getElementById(id)
-  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' })
-}
 
 // 场景图标：不渲染后端 emoji 字段，按场景名映射固定 Lucide 图标
 const sceneIcon = (name?: string): string => {
@@ -1683,11 +1264,6 @@ const sceneIcon = (name?: string): string => {
   return 'target'
 }
 
-const tableCount = computed(() => {
-  let count = 0
-  Object.values(scenesMap.value).forEach((s: any) => { count += (s.objects || []).length })
-  return count
-})
 
 // ========== 详情面板（概览 / 字段 / 关系） ==========
 type DetailKind = '业务对象' | '业务指标' | '业务规则' | '分析主题'
@@ -1722,13 +1298,33 @@ const badgeKey = (kind?: string) => {
   return map[kind || ''] || 'obj'
 }
 const closeDetail = () => { selectedDetail.value = null }
+// 弹框内的「本场景指标」按所选知识所属场景取：侧边业务域点击不再切场景，不能沿用 activeScene
+const detailSceneMetrics = computed(() => {
+  const metrics = scenesMap.value[selectedDetail.value?.sceneKey || activeScene.value]?.metrics || []
+  const seen = new Set<string>()
+  const out: any[] = []
+  for (const m of metrics) {
+    const n = m?.name
+    if (!n || seen.has(n)) continue
+    seen.add(n)
+    out.push(m)
+  }
+  return out
+})
+// 弹框内点关联指标：同样按所选知识所属场景打开（场景名/来源表标注才不会串场景）
+const openMetricInDetail = (m: any) => openMetricDetail(m, selectedDetail.value?.sceneKey || activeScene.value)
 // 从任意上下文按表名打开业务对象详情（跨场景定位）
 const openObjByTable = (table: string) => {
   const ref = findObjRef(table)
   if (!ref) return
   activeScene.value = ref.sceneKey
   openObjectDetail(ref.obj, ref.sceneKey)
-  scrollToSec('kb-sec-objects')
+}
+
+// 数据支撑表卡点击：按表名定位到该场景业务对象，打开对象详情
+const openSceneObjFromTable = (tbl: any) => {
+  const obj = (scenesMap.value[activeScene.value]?.objects || []).find((o: any) => o.table === tbl.table_name)
+  if (obj) openObjectDetail(obj, activeScene.value)
 }
 
 const openObjectDetail = (obj: any, sceneKey: string) => {
@@ -1827,7 +1423,6 @@ const miniGraphRels = computed(() => {
     r.source_table === target || r.target_table === target)
 })
 const neighborCount = computed(() => Math.max(0, miniGraphNodes.value.length - 1))
-const resetMiniGraph = () => { miniTarget.value = '' }
 const onMiniGraphNodeClick = (id: string) => {
   // 点击迷你图节点 → 打开对应对象的详情（若存在）
   miniTarget.value = id
@@ -1940,6 +1535,8 @@ const locateInGraph = (table: string) => {
   for (const s of Object.values(scenesMap.value) as any[]) {
     if ((s?.objects || []).some((o: any) => o.table === table)) { sc = s?.name || ''; break }
   }
+  // 详情弹框已移到视图链之外（全局浮层），跳图谱时必须自己关掉，否则会一直压在图谱上
+  selectedDetail.value = null
   activeView.value = 'graph'
   activeGraphScene.value = sc || ''
   const n = graphComponentNodes.value.find((x: any) => String(x.id) === table || String(x.name) === table)
@@ -1956,7 +1553,6 @@ const openSceneObjectOfTable = (table?: string) => {
   activeScene.value = ref.sceneKey
   selectedGraphNode.value = null // 关闭图谱节点中文解释弹框，避免返回图谱时残留
   openObjectDetail(ref.obj, ref.sceneKey)
-  setTimeout(() => scrollToSec('kb-sec-objects'), 80)
 }
 
 
@@ -2045,11 +1641,9 @@ const graphNodeZh = computed<ZhEntry | null>(() => {
 const graphNodeKindZh = computed(() =>
   graphNodeZh.value?.kind || entityTypeZh(selectedGraphNode.value?.entityType))
 
-const graphNodeModalTitle = computed(() => {
-  const zh = graphNodeZh.value
-  if (zh) return `${zh.title} · ${zh.kind}`
-  return `${selectedGraphNode.value?.label || '节点'} · 节点说明`
-})
+// 面板标题只显示节点名字：知识类型在下面那个蓝色徒标里已经有了，不再重复
+const graphNodeModalTitle = computed(() =>
+  graphNodeZh.value?.title || selectedGraphNode.value?.label || '节点')
 
 // 弹框顶部的事实卡（数据表 / 行数 / 业务场景 / 单位）
 const graphNodeFacts = computed(() => {
@@ -2071,7 +1665,6 @@ const graphNodeTables = computed(() => {
   const list = zh.table ? [zh.table, ...(zh.tables || [])] : (zh.tables || [])
   return Array.from(new Set(list.filter(Boolean)))
 })
-const graphNodePrimaryTable = computed(() => graphNodeTables.value[0] || '')
 
 // 该节点的关联关系（取图谱边，配中文描述，可点击跳转到对端节点）
 const graphNodeRelations = computed(() => {
@@ -2093,7 +1686,6 @@ const graphNodeRelations = computed(() => {
     })
 })
 const graphFullscreen = ref(false)
-const graphFullscreenHeight = ref(700)
 const graphRef = ref<any>(null)
 const graphFullscreenRef = ref<any>(null)
 // 当前生效的图谱数据源：full = 六类知识图谱，simple = 原「表+外键」图
@@ -2103,7 +1695,6 @@ const graphTableCount = computed(() => activeGraphNodes.value.filter((n: any) =>
 const graphRelCount = computed(() => activeGraphRels.value.length)
 const openGraphFullscreen = () => {
   graphFullscreen.value = true
-  graphFullscreenHeight.value = Math.max(700, window.innerHeight - 60)
 }
 const toggleGraphFilter = (key: string) => {
   const idx = activeGraphFilters.value.indexOf(key)
@@ -2113,8 +1704,7 @@ const toggleGraphFilter = (key: string) => {
 const filteredGraphNodes = computed(() => {
   // LightRAG 模式下旧的「类型 / 场景」过滤器已从界面隐藏，不能再参与过滤：
   // LightRAG 实体的 entity_type 是 data / concept / UNKNOWN，不在下面 7 类业务词表内，
-  // 继续过滤会让结果恒为空，连带把「知识健康度」的关系数 / 关系覆盖率算成 0
-  // （实测：45 条关系被算成 0，总分被压低 20 分）。
+  // 继续过滤会让结果恒为空。
   if (lightRagActive.value) return activeGraphNodes.value
   const filters = activeGraphFilters.value
   if (!filters.length) return []
@@ -2124,10 +1714,6 @@ const filteredGraphNodes = computed(() => {
     if (activeGraphScene.value && n.scene !== activeGraphScene.value) return false
     return true
   })
-})
-const filteredGraphRels = computed(() => {
-  const nodeIds = new Set(filteredGraphNodes.value.map((n) => n.id))
-  return activeGraphRels.value.filter((r) => nodeIds.has(r.source_table) && nodeIds.has(r.target_table))
 })
 
 const SCENE_COLOR_MAP: Record<string, { background: string; border: string }> = {
@@ -2195,6 +1781,17 @@ const lightRagActive = ref(false)
 watch([activeGraphScene, graphMode], async () => {
   await nextTick()
   ;(graphFullscreen.value ? graphFullscreenRef.value : graphRef.value)?.fitView?.()
+})
+
+// 「节点中文解释」面板展开/收起会改变图谱画布高度：重新适配一次，
+// 否则画布变小后视图还停在旧位置，边上节点会跑到画布外，看起来像「图谱少了/没了」。
+// 只监听「有无选中节点」的变化，所以点不同节点不会反复重置视图。
+watch(() => !!selectedGraphNode.value, async () => {
+  await nextTick()
+  // 等两帧：面板展开 → 浏览器布局 → LightRagGraph 的 ResizeObserver 同步完画布尺寸，再 fit
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    ;(graphFullscreen.value ? graphFullscreenRef.value : graphRef.value)?.fitView?.()
+  }))
 })
 // /graph 原始返回缓存：完整模式构建时复用（表节点元信息 + 外键边），避免二次请求
 const rawGraphNodesById = ref<Map<string, any>>(new Map())
@@ -2594,7 +2191,7 @@ const filteredTerms = computed(() => {
     }
     result = result.filter((t: any) => {
       const haystack = [
-        t.term || '', t.en || '', t.definition || '',
+        t.term || '', t.term_cn || '', t.en || '', t.definition || '',
         t.category || '', t.abbreviation || '', t.knowledge_type || '',
       ].join(' ').toLowerCase()
       return Array.from(expandWords).some(w => haystack.includes(w))
@@ -2646,14 +2243,14 @@ const openTermDetail = (term: any) => {
     '分析主题': '分析主题是面向具体业务问题的知识集合，围绕某一分析目标组织相关的对象、指标和规则。',
   }
   const e = escHtml
-  const tTerm = e(term.term || '-')
+  const tTerm = e(term.term_cn || term.term || '-')
   const tKt = e(kt)
   const tEn = e(term.en || '-')
   const tAbbr = e(term.abbreviation || '-')
   const tDef = e(term.definition || '暂无详细定义')
   const tCat = e(term.category || '-')
   const tType = e(term.data_type || '-')
-  const tTable = e(term.mapped_table || '-')
+  const tTable = e(term.table_cn || term.mapped_table || '-')
   const tField = e(term.mapped_field || '')
   detailModal.value = {
     title: tTerm,
@@ -2873,8 +2470,7 @@ const domainTree = computed(() => {
 const isActiveDomain = (node: DomainNode) => selectedDetail.value?.id === node.id
 
 const selectDomainNode = (node: DomainNode) => {
-  activeView.value = 'scene'
-  activeScene.value = node.sceneKey
+  // 只弹解释框，不切视图 / 不切场景（页面不跳转）；知识所属场景记录在 selectedDetail.sceneKey 里
   switch (node.kind) {
     case '业务对象': openObjectDetail(node.payload, node.sceneKey); break
     case '业务指标': openMetricDetail(node.payload, node.sceneKey); break
@@ -2888,60 +2484,6 @@ watch(() => selectedDetail.value?.table, (table) => {
   if (table) miniTarget.value = table
   else if (!miniTarget.value) miniTarget.value = ''
 })
-
-// ========== 知识健康度（本地实时计算，不再依赖后端） ==========
-const healthData = ref<any>(null)
-const showHealth = ref(false)
-const computeHealth = () => {
-  let tables = 0, fieldsTotal = 0, fieldsWithoutTranslation = 0
-  let tablesWithoutAlias = 0, metricsTotal = 0, metricsWithoutFormula = 0
-  let rulesTotal = 0
-  const allTables = new Set<string>()
-  const referenced = new Set<string>()
-  for (const s of Object.values(scenesMap.value) as any[]) {
-    for (const o of (s?.objects || [])) {
-      tables++
-      if (o.table) allTables.add(o.table)
-      if (!o.label) tablesWithoutAlias++
-      const cols = o.columns || o.fields || []
-      fieldsTotal += cols.length
-      for (const c of cols) {
-        if (!c.translation && !c.comment) fieldsWithoutTranslation++
-      }
-    }
-    for (const m of (s?.metrics || [])) {
-      metricsTotal++
-      if (!m.formula) metricsWithoutFormula++
-      for (const t of (m.tables || [])) referenced.add(t)
-    }
-    rulesTotal += (s?.rules || []).length
-  }
-  for (const t of termDictionary.value) {
-    if (t.mapped_table) referenced.add(t.mapped_table)
-  }
-  const relsTotal = filteredGraphRels.value.length
-  const orphanTables = [...allTables].filter((t) => !referenced.has(t)).length
-  const aliasScore = tables ? (tables - tablesWithoutAlias) / tables : 0
-  const fieldScore = fieldsTotal ? (fieldsTotal - fieldsWithoutTranslation) / fieldsTotal : 0
-  const metricScore = metricsTotal ? (metricsTotal - metricsWithoutFormula) / metricsTotal : 0
-  const relScore = tables ? Math.min(1, relsTotal / Math.max(tables * 0.5, 1)) : 0
-  const score = Math.round((aliasScore * 0.2 + fieldScore * 0.3 + metricScore * 0.3 + relScore * 0.2) * 100)
-  let customTerms = 0
-  for (const t of termDictionary.value) if (t.is_custom || t.custom) customTerms++
-  healthData.value = {
-    score,
-    tables, tables_without_alias: tablesWithoutAlias,
-    fields_total: fieldsTotal, fields_without_translation: fieldsWithoutTranslation,
-    metrics_total: metricsTotal, metrics_without_formula: metricsWithoutFormula,
-    rules_total: rulesTotal,
-    topics_total: topicList.value.length,
-    terms_total: termDictionary.value.length, custom_terms_total: customTerms,
-    orphan_tables: orphanTables,
-    disabled_total: 0,
-    relationships: relsTotal,
-  }
-}
-const showHealthPanel = () => { computeHealth(); showHealth.value = true }
 
 // ========== 全局搜索 ==========
 const globalSearchQ = ref('')
@@ -2969,8 +2511,8 @@ const runGlobalSearch = () => {
     }
   }
   for (const t of termDictionary.value) {
-    const name = t.term || t.name || ''
-    const blob = `${name} ${t.definition || ''}`.toLowerCase()
+    const name = t.term_cn || t.term || t.name || ''
+    const blob = `${name} ${t.term || ''} ${t.definition || ''}`.toLowerCase()
     if (blob.includes(q)) out.push({ key: `term:${name}`, type: '术语', title: name, subtitle: t.category ? `术语 · ${t.category}` : '术语', icon: 'book-open' })
   }
   for (const tp of topicList.value) {
@@ -3193,6 +2735,7 @@ onMounted(async () => {
   loadTemplates()
   loadUserData()
   loadSnapshot(activeScene.value)
+  loadTables()
   // 模板 ref：读取一次确保组件实例已挂载（消除 vue-tsc 未使用告警）
   void miniGraphRef
   if (props.initialScene && scenesMap.value[props.initialScene]) {
@@ -3215,6 +2758,10 @@ watch(() => props.initialScene, (scene) => {
   display: flex;
   gap: 18px;
   align-items: stretch;
+  /* 兜底：父级 .workspace-content 的高度由 flex 撑出，个别场景下 h-full(100%) 会解析为 auto，
+     这里按「顶栏 64 + 内容区上下内边距 16/22 = 102」再垫一层最小高度，
+     保证知识图谱 / 术语词典等短内容视图始终铺到视口底部（内容更高时 min-height 不设上限）。 */
+  min-height: calc(100vh - 102px);
 }
 .kb-main {
   flex: 1;
@@ -3225,74 +2772,16 @@ watch(() => props.initialScene, (scene) => {
 }
 .mono { font-family: 'Rajdhani', Consolas, monospace; }
 
-/* ====== 顶部状态条 ====== */
-.kb-topbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 18px;
-  padding: 16px 20px;
-  border: 1px solid #e5e6eb;
-  border-radius: 14px;
-  background: #ffffff;
-  box-shadow: 0 8px 26px rgba(16, 24, 40, .05);
-}
-.kb-topbar-title { display: flex; align-items: center; gap: 13px; }
-.kb-topbar-icon {
-  display: grid;
-  width: 42px; height: 42px;
-  place-items: center;
-  border: 1px solid #4D9EFF;
-  border-radius: 12px;
-  background: #4D9EFF;
-  font-size: 20px;
-}
-.kb-topbar-name { font-size: 17px; font-weight: 500; color: #1d2129; letter-spacing: -.02em; }
-.kb-topbar-sub { margin-top: 2px; font-size: 12px; color: #4e5969; }
-/* ====== 数据底座概览（4 张 KPI 卡片） ====== */
+
+/* ====== 数据底座概览（KPI 卡片已随导航重构移除，保留详情面板共用样式） ====== */
 .kb-overview { margin-top: 14px; }
-.kb-overview-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 10px;
-  padding: 0 2px;
-}
-.kb-overview-head span { font-size: 13px; font-weight: 600; color: #1d2129; }
+
 .kb-overview-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 14px;
 }
-.kb-stat-card {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 16px;
-  border: 1px solid rgba(0, 0, 0, 0.05);
-  border-radius: 16px;
-  background: #fff;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
-  text-align: left;
-  cursor: pointer;
-  transition: box-shadow .25s ease, transform .25s ease, border-color .25s ease;
-}
-.kb-stat-card:hover {
-  transform: translateY(-2px);
-  border-color: #1677ff;
-  box-shadow: 0 8px 24px rgba(16, 24, 40, .08);
-}
-.kb-stat-chip {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 44px;
-  height: 44px;
-  border-radius: 12px;
-  flex-shrink: 0;
-  background: #4D9EFF;
-  color: #ffffff;
-}
+
 /* 单表放大弹窗 / 分析主题弹窗复用的图标徽标与字母徽标 */
 .stat-chip {
   display: inline-flex;
@@ -3315,30 +2804,7 @@ watch(() => props.initialScene, (scene) => {
   flex-shrink: 0;
   user-select: none;
 }
-.kb-stat-card-num {
-  display: block;
-  font-size: 26px;
-  line-height: 1.2;
-  font-weight: 600;
-  color: #1d2129;
-  font-family: 'Rajdhani', Consolas, monospace;
-}
-.kb-stat-card-label {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  margin-top: 4px;
-  font-size: 12.5px;
-  color: #4e5969;
-}
-.kb-stat-card-arrow {
-  color: #c9cdd4;
-  transition: transform .2s ease, color .2s ease;
-}
-.kb-stat-card:hover .kb-stat-card-arrow {
-  transform: translateX(2px);
-  color: #4e5969;
-}
+
 @media (max-width: 1080px) {
   .kb-overview-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
@@ -3347,23 +2813,45 @@ watch(() => props.initialScene, (scene) => {
 .kb-tabs {
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 4px;
+  gap: 10px;
+  padding: 6px 10px;
   border: 1px solid #e5e6eb;
-  border-radius: 12px;
+  border-radius: 14px;
   background: #ffffff;
+  box-shadow: 0 6px 20px rgba(16, 24, 40, .06);
+  /* 不铺满整屏：按内容收窄 + 居中（窄屏自动拟合到可用宽度） */
+  width: fit-content;
+  max-width: 100%;
+  margin: 0 auto;
+}
+.kb-tabs-nav {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.kb-tabs-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
 }
 .kb-tab {
-  padding: 8px 16px;
+  padding: 10px 22px;
   border: 0;
-  border-radius: 9px;
+  border-radius: 10px;
   background: transparent;
   color: #4e5969;
-  font-size: 13px;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: .01em;
   transition: all .18s ease;
 }
 .kb-tab:hover { color: #1d2129; background: #f2f3f5; }
-.kb-tab.active { color: #ffffff; background: #4D9EFF; box-shadow: 0 4px 12px rgba(77, 158, 255, .18); }
+.kb-tab.active { color: #ffffff; background: #4D9EFF; box-shadow: 0 6px 16px rgba(77, 158, 255, .35); font-weight: 700; }
 
 /* ====== 加载 / 错误 ====== */
 .kb-state {
@@ -3406,7 +2894,25 @@ watch(() => props.initialScene, (scene) => {
 .kb-scene-roles { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 .kb-role-chip { padding: 1px 7px; border-radius: 99px; background: #f2f3f5; color: #4e5969; font-size: 9px; }
 
-/* ====== 详情面板 ====== */
+/* ====== 详情面板（弹框浮层：点击卡片后弹框展示，不再平铺在场景顶部） ====== */
+.kb-detail-mask {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(20, 26, 20, .4);
+  backdrop-filter: blur(4px);
+  z-index: 250;
+  padding: 24px;
+}
+.kb-detail-modal {
+  width: min(900px, calc(100vw - 48px));
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+  overflow-x: hidden;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, .25);
+}
 .kb-detail {
   border: 1px solid #e5e6eb;
   border-radius: 14px;
@@ -3522,14 +3028,14 @@ watch(() => props.initialScene, (scene) => {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 12px 16px;
+  padding: 13px 16px;
   border-bottom: 1px solid #e5e6eb;
   background: #f7f8fa;
-  font-size: 13px;
-  font-weight: 500;
+  font-size: 16px;
+  font-weight: 700;
   color: #1d2129;
 }
-.kb-card-count, .kb-card-sub { margin-left: auto; font-size: 10px; font-weight: 400; color: #86909c; }
+.kb-card-count, .kb-card-sub { margin-left: auto; font-size: 11px; font-weight: 400; color: #86909c; }
 /* 核心指标卡「管理全部口径」入口：跳指标口径注册表（同源管理视图） */
 .kb-manage-btn {
   display: inline-flex; align-items: center; gap: 3px; margin-left: 10px;
@@ -3588,8 +3094,19 @@ watch(() => props.initialScene, (scene) => {
 .kb-ov-row b { color: #1d2129; font-weight: 500; }
 
 /* ====== 知识图谱视图 ====== */
-.kb-graph-shell { border: 1px solid #e5e6eb; border-radius: 14px; background: #ffffff; box-shadow: 0 6px 20px rgba(16, 24, 40, .04); overflow: hidden; }
-.kb-graph-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; padding: 12px 16px; border-bottom: 1px solid #e5e6eb; background: #f7f8fa; }
+/* 注意：图谱卡片刻意不加 overflow:hidden —— 卡片内下方可能展开「节点中文解释」面板，
+   一旦裁剪（overflow:hidden 会让它成为滚动容器、自动最小高度变 0），
+   卡片高度会被 flex 压到放下面板之前，面板底部直接被裁掉。
+   圆角改为由首个子元素（工具条）与末个子元素（面板）各自声明。 */
+.kb-graph-shell { border: 1px solid #e5e6eb; border-radius: 14px; background: #ffffff; box-shadow: 0 6px 20px rgba(16, 24, 40, .04); }
+/* 撑满主区剩余高度：知识图谱 / 术语词典内容不足一屏时，卡片一直铺到底（2026-10-02）
+   注意：不要加 min-height: 0 —— 空间不够时靠内容撑高、页面滚动，避免裁切内部内容。 */
+.kb-view-fill { flex: 1; display: flex; flex-direction: column; }
+/* 图谱卡片内的节点面板：右内圆角跟卡片对齐（卡片未用 overflow:hidden，靠这里补） */
+.kb-graph-shell :deep(.kb-node-detail) { border-radius: 0 13px 13px 0; }
+/* 图谱 + 节点详情左右分栏：同一屏内展示，不用滚动 */
+.kb-graph-body { flex: 1; display: flex; min-width: 0; }
+.kb-graph-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; padding: 12px 16px; border-bottom: 1px solid #e5e6eb; background: #f7f8fa; border-radius: 13px 13px 0 0; }
 .kb-graph-toolbar-left { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .kb-graph-title { font-size: 13px; font-weight: 500; color: #1d2129; }
 .kb-graph-hint { font-size: 10px; color: #86909c; }
@@ -3606,11 +3123,13 @@ watch(() => props.initialScene, (scene) => {
 .kb-legend-dot { width: 11px; height: 11px; border-radius: 3px; border-width: 1px; border-style: solid; }
 .kb-legend-note { color: #a9aeb8; }
 .kb-legend-warn { color: #a8641d; }
-.kb-graph-canvas { padding: 6px; min-height: 620px; }
+.kb-graph-canvas { flex: 1; min-width: 0; min-height: 420px; padding: 6px; display: flex; }
+.kb-graph-canvas :deep(.lightrag-graph) { flex: 1 1 auto; min-width: 0; }
 .kb-fullscreen { position: fixed; inset: 0; z-index: 100; display: flex; flex-direction: column; background: #f2f3f5; }
 .kb-fullscreen-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 18px; border-bottom: 1px solid #e5e6eb; background: #f7f8fa; font-size: 13px; font-weight: 500; color: #1d2129; }
 .kb-fullscreen-actions { display: flex; gap: 8px; }
-.kb-fullscreen-body { flex: 1; padding: 14px; }
+.kb-fullscreen-body { flex: 1; min-height: 0; padding: 14px; display: flex; overflow: hidden; }
+.kb-fullscreen-body :deep(.lightrag-graph) { flex: 1 1 auto; min-width: 0; }
 .kb-graph-node-detail { margin-top: 14px; padding: 16px 18px; border: 1px solid #e5e6eb; border-radius: 14px; background: #ffffff; }
 .kb-graph-node-detail-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
 .kb-graph-node-title { font-size: 13px; font-weight: 500; color: #1d2129; }
@@ -3661,7 +3180,9 @@ watch(() => props.initialScene, (scene) => {
   font-size: 12px;
   outline: none;
 }
-.kb-terms-body { max-height: 560px; overflow-y: auto; }
+.kb-terms-body { flex: 1; min-height: 0; max-height: none; overflow-y: auto; }
+.kb-rels-body { padding: 16px; }
+.kb-tables-body { padding: 16px; }
 .kb-term-group { border-bottom: 1px solid #e5e6eb; }
 .kb-term-group:last-child { border-bottom: 0; }
 .kb-term-group-head { display: flex; align-items: center; gap: 8px; padding: 9px 16px; background: #f7f8fa; font-size: 12px; font-weight: 500; color: #1d2129; position: sticky; top: 0; z-index: 2; }
@@ -3806,10 +3327,6 @@ watch(() => props.initialScene, (scene) => {
 .kb-tree-node-sub { margin-left: auto; font-size: 9px; color: #a9aeb8; white-space: nowrap; }
 .kb-tree-node.active .kb-tree-node-sub { color: #ffffff; }
 
-.kb-panel-graph { border-top: 1px solid #e5e6eb; padding-top: 10px; }
-.kb-panel-graph-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; padding: 0 4px; font-size: 12px; font-weight: 500; color: #1d2129; }
-.kb-panel-graph-body { border: 1px solid #e5e6eb; border-radius: 10px; background: #ffffff; overflow: hidden; }
-
 /* 响应式：窄屏时右栏折叠为抽屉（场景内容已是单列，无需再塌缩为 1 列） */
 @media (max-width: 1180px) {
   .kb-panel { width: 46px; padding: 14px 8px; }
@@ -3818,13 +3335,7 @@ watch(() => props.initialScene, (scene) => {
   .kb-panel:not(.collapsed) .kb-panel-toggle { right: 10px; transform: none; }
 }
 
-/* ====== 顶栏工具区：搜索 / 健康度 / 导出 ====== */
-.kb-topbar-tools {
-  display: flex;
-  align-items: stretch;
-  gap: 8px;
-  flex-shrink: 0;
-}
+/* ====== 顶栏工具区：搜索 / 导出 ====== */
 .kb-global-search {
   position: relative;
   display: flex;
@@ -3848,6 +3359,13 @@ watch(() => props.initialScene, (scene) => {
   background: transparent;
   font-size: 12px;
   color: #1d2129;
+}
+/* 搜索框不要聚焦高亮：全局 .workspace-content input:focus 会套一层蓝色光圈，这里覆盖掉 */
+.kb-global-search input:focus,
+.kb-global-search input:focus-visible {
+  outline: none !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
 }
 .kb-search-dropdown {
   position: absolute;
@@ -4089,38 +3607,13 @@ watch(() => props.initialScene, (scene) => {
 .kb-fb-done b { font-size: 13.5px; color: #1d2129; }
 .kb-fb-done p { margin: 0; font-size: 11.5px; line-height: 1.65; color: #86909c; }
 
-/* ====== 健康度 ====== */
-.kb-health-score { display: flex; justify-content: center; padding: 6px 0 4px; }
-.kb-health-ring {
-  --pct: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 120px;
-  height: 120px;
-  border-radius: 50%;
-  background: conic-gradient(#4D9EFF calc(var(--pct) * 1%), #f2f3f5 0);
-  position: relative;
-}
-.kb-health-ring::before { content: ""; position: absolute; inset: 12px; border-radius: 50%; background: #ffffff; }
-.kb-health-ring b, .kb-health-ring span { position: relative; z-index: 1; }
-.kb-health-ring b { font-size: 30px; color: #1d2129; }
-.kb-health-ring span { display: block; text-align: center; font-size: 11px; color: #86909c; }
-.kb-health-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 10px; margin-top: 14px; }
-.kb-health-card { padding: 12px; border: 1px solid #f2f3f5; border-radius: 12px; background: #fff; }
-.kb-health-card span { display: block; font-size: 11px; color: #86909c; }
-.kb-health-card b { display: block; margin-top: 3px; font-size: 20px; color: #1d2129; }
-.kb-health-card small { display: block; margin-top: 3px; font-size: 10px; color: #86909c; }
-.kb-health-card small.warn { color: #d9534f; }
-.kb-health-foot { margin-top: 14px; padding: 10px 12px; font-size: 11px; color: #86909c; background: #f7f8fa; border-radius: 10px; line-height: 1.6; }
-
 /* ====== P0（2026-09-03）：场景胶囊 + 概要条 ====== */
 .kb-scene-wrap { display: flex; flex-direction: column; gap: 10px; }
-.kb-scene-pills { display: flex; flex-wrap: wrap; gap: 8px; }
+.kb-scene-pills { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
 .kb-scene-pill {
   display: inline-flex; align-items: center; gap: 7px;
-  padding: 7px 14px; border-radius: 99px; border: 1px solid #e5e6eb;
-  background: #fff; color: #4e5969; font-size: 13px; cursor: pointer;
+  padding: 8px 16px; border-radius: 99px; border: 1px solid #e5e6eb;
+  background: #fff; color: #4e5969; font-size: 14px; font-weight: 500; cursor: pointer;
   transition: all .18s ease;
 }
 .kb-scene-pill:hover { border-color: #c9cdd4; background: #f7f8fa; }
@@ -4132,21 +3625,13 @@ watch(() => props.initialScene, (scene) => {
 }
 .kb-scene-pill.active i { background: rgba(255, 255, 255, .24); color: #fff; }
 .kb-scene-summary {
-  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  display: flex; align-items: stretch; gap: 14px; flex-wrap: wrap;
   padding: 10px 14px; border: 1px solid #e5e6eb; border-radius: 12px;
   background: #fff;
 }
-.kb-summary-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.kb-summary-title b { font-size: 14px; color: #1d2129; white-space: nowrap; }
-.kb-summary-desc { font-size: 11px; color: #86909c; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 380px; }
-.kb-summary-stats { display: flex; align-items: center; gap: 6px; margin-left: auto; flex-wrap: wrap; }
-.kb-summary-stats button {
-  display: inline-flex; align-items: center; gap: 5px;
-  padding: 4px 10px; border-radius: 8px; border: 1px solid transparent;
-  background: #f2f3f5; color: #4e5969; font-size: 11px; cursor: pointer; transition: all .15s ease;
-}
-.kb-summary-stats button:hover { border-color: #c9cdd4; background: #fff; }
-.kb-summary-stats button b { color: #1677ff; font-size: 12px; }
+.kb-summary-title { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1; }
+.kb-summary-title b { font-size: 15px; font-weight: 600; color: #1d2129; white-space: nowrap; }
+.kb-summary-intro { font-size: 12px; color: #4e5969; line-height: 1.7; }
 
 /* ====== P0：业务对象卡片网格 ====== */
 .kb-obj-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; padding: 12px; }
@@ -4250,7 +3735,7 @@ watch(() => props.initialScene, (scene) => {
 .kb-topic-card.active { border-color: #1677ff; background: #f2f8ff; box-shadow: 0 6px 18px rgba(77, 158, 255, .16); }
 .kb-topic-card-head { display: flex; align-items: center; gap: 8px; }
 .kb-topic-icon { flex: none; font-size: 15px; color: #1677ff; display: grid; place-items: center; width: 26px; height: 26px; border-radius: 8px; background: #e8f3ff; }
-.kb-topic-card-name { flex: 1; min-width: 0; font-size: 13.5px; font-weight: 600; color: #1d2129; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kb-topic-card-name { flex: 1; min-width: 0; font-size: 14px; font-weight: 600; color: #1d2129; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .kb-topic-desc { font-size: 11px; color: #4e5969; line-height: 1.55; }
 .kb-topic-metric-group { margin-top: 14px; padding-top: 12px; border-top: 1px dashed #e5e6eb; }
 .kb-topic-group-title-mt { margin-bottom: 6px; color: #4e5969; }
@@ -4277,7 +3762,7 @@ watch(() => props.initialScene, (scene) => {
 .kb-v6 { display: flex; flex-direction: column; gap: 14px; margin-top: 4px; }
 .kb-v6-card { margin: 0; }
 .kb-snap-head { display: flex; align-items: center; gap: 10px; }
-.kb-snap-title { font-size: 14px; font-weight: 800; color: #1d2129; display: flex; align-items: center; gap: 7px; }
+.kb-snap-title { font-size: 16px; font-weight: 700; color: #1d2129; display: flex; align-items: center; gap: 7px; }
 .kb-snap-sub { font-size: 11px; color: #86909c; }
 .kb-snap-head .kb-manage-btn { margin-left: auto; }
 .kb-snap-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
@@ -4289,7 +3774,7 @@ watch(() => props.initialScene, (scene) => {
 .kb-snap-card:hover { box-shadow: 0 4px 14px rgba(31, 70, 140, .09); transform: translateY(-1px); }
 .kb-snap-card.dim { border-top-color: #d0d7e2; }
 .kb-snap-name { font-size: 12px; color: #5c6675; padding-right: 58px; }
-.kb-snap-val { font-size: 30px; font-weight: 800; letter-spacing: -.5px; color: #1d2129; font-variant-numeric: tabular-nums; }
+.kb-snap-val { font-size: 24px; font-weight: 700; letter-spacing: -.5px; color: #1d2129; font-variant-numeric: tabular-nums; }
 .kb-snap-card.dim .kb-snap-val { color: #a8b0bd; }
 .kb-snap-foot { display: flex; align-items: center; gap: 8px; min-height: 16px; }
 .kb-snap-unit { font-size: 11px; color: #a8b0bd; }
@@ -4311,20 +3796,13 @@ watch(() => props.initialScene, (scene) => {
 .kb-fg-item.miss { background: #fbfcfe; }
 .kb-fg-name { font-size: 11px; color: #5c6675; display: flex; align-items: center; gap: 6px; }
 .kb-fg-name em { font-style: normal; font-size: 9px; color: #b45309; background: #fdf3e3; border-radius: 4px; padding: 0 6px; font-weight: 600; }
-.kb-fg-val { font-size: 19px; font-weight: 800; color: #1d2129; font-variant-numeric: tabular-nums; line-height: 1.2; }
+.kb-fg-val { font-size: 17px; font-weight: 700; color: #1d2129; font-variant-numeric: tabular-nums; line-height: 1.2; }
 .kb-fg-item.miss .kb-fg-val { color: #a8b0bd; }
 .kb-fg-unit { font-size: 10px; color: #a8b0bd; }
 .kb-fg-suggest { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; font-size: 11px; color: #86909c; background: #f7f9fd; border: 1px dashed #d9e2f0; border-radius: 9px; padding: 7px 11px; }
 .kb-sg-chip { font-size: 10.5px; background: #fff; border: 1px solid #d8e3f5; color: #55606e; border-radius: 999px; padding: 1px 10px; cursor: pointer; }
 .kb-sg-chip:hover { border-color: #2E7CF0; color: #2E7CF0; }
 .kb-rules-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; }
-.kb-fold summary { list-style: none; cursor: pointer; display: flex; align-items: baseline; gap: 12px; }
-.kb-fold summary::-webkit-details-marker { display: none; }
-.kb-fold summary::before { content: "▸"; color: #2E7CF0; transition: .15s; font-size: 13px; }
-.kb-fold[open] summary::before { transform: rotate(90deg); }
-.kb-fold-title { font-size: 14px; font-weight: 800; display: flex; align-items: center; gap: 7px; }
-.kb-fold-sub { font-size: 11px; color: #86909c; }
-.kb-fold-tip { margin-left: auto; font-size: 10.5px; color: #a8b0bd; }
 
 /* ====== 我的收藏视图 ====== */
 .kb-fav-head { display: flex; align-items: center; gap: 10px; padding: 6px 2px 12px; flex-wrap: wrap; }
@@ -4341,42 +3819,5 @@ watch(() => props.initialScene, (scene) => {
 .kb-fav-actions .kb-term-action { width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center; }
 .kb-fav-actions .kb-term-action.fav { color: #d8a700; }
 
-/* ====== 图谱节点中文解释弹框（点击节点弹出，替代图下方详情块） ====== */
-/* 宽度：覆盖 .kb-modal 默认的 520px；用 min() 保证窄屏不溢出 */
-.kb-modal-node { width: min(780px, calc(100vw - 32px)); }
-.kg-zh { font-size: 12px; color: #1d2129; }
-.kg-zh-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
-.kg-zh-badge { display: inline-flex; align-items: center; padding: 2px 9px; border-radius: 999px; font-size: 11px; font-weight: 500; color: #1677ff; background: #e8f3ff; border: 1px solid #bcd8ff; }
-.kg-zh-id { font-size: 11px; color: #86909c; background: #f2f3f5; border-radius: 6px; padding: 2px 6px; }
-.kg-zh-desc { margin: 0 0 12px; font-size: 12.5px; line-height: 1.75; color: #4e5969; }
-.kg-zh-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; padding: 12px; border: 1px solid #e5e6eb; border-radius: 10px; background: #f7f8fa; }
-.kg-zh-grid span { display: block; color: #86909c; font-size: 10px; margin-bottom: 3px; }
-.kg-zh-grid b { color: #1d2129; font-weight: 500; word-break: break-all; }
-.kg-zh-block { margin-top: 14px; }
-.kg-zh-block-title { display: flex; align-items: center; gap: 5px; margin-bottom: 7px; font-size: 12px; font-weight: 500; color: #1d2129; }
-.kg-zh-code { margin: 0; padding: 10px 12px; border: 1px solid #e5e6eb; border-radius: 10px; background: #f7f8fa; color: #1d2129; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
-.kg-zh-points { margin: 0; padding-left: 18px; color: #4e5969; line-height: 1.85; }
-.kg-zh-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
-.kg-zh-table th { padding: 7px 8px; text-align: left; font-weight: 500; color: #86909c; background: #f7f8fa; border-bottom: 1px solid #e5e6eb; white-space: nowrap; }
-.kg-zh-table td { padding: 7px 8px; border-bottom: 1px solid #f2f3f5; color: #1d2129; vertical-align: top; }
-.kg-zh-table tr:last-child td { border-bottom: 0; }
-.kg-key-badge { display: inline-block; padding: 0 5px; border-radius: 4px; font-size: 10px; font-weight: 600; line-height: 16px; }
-.kg-key-pk { color: #a8641d; background: #fdf6dd; border: 1px solid #efd88a; }
-.kg-key-fk { color: #1677ff; background: #e8f3ff; border: 1px solid #bcd8ff; }
-.kg-zh-ref { margin-left: 6px; color: #86909c; font-size: 10.5px; }
-.kg-zh-chips { display: flex; flex-wrap: wrap; gap: 6px; }
-.kg-zh-chip { padding: 3px 9px; border: 1px solid #c9cdd4; border-radius: 999px; background: #fff; font-size: 11px; color: #4e5969; cursor: pointer; }
-.kg-zh-chip:hover { border-color: #1677ff; color: #1677ff; }
-.kg-zh-rels { display: flex; flex-direction: column; gap: 6px; }
-.kg-zh-rel { display: flex; align-items: center; gap: 8px; width: 100%; padding: 8px 10px; border: 1px solid #e5e6eb; border-radius: 10px; background: #fff; text-align: left; cursor: pointer; }
-.kg-zh-rel:hover { border-color: #1677ff; background: #f7fbff; }
-.kg-zh-rel-dir { color: #ec4899; font-weight: 700; }
-.kg-zh-rel-dir.out { color: #6366f1; }
-.kg-zh-rel-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.kg-zh-rel-main b { font-size: 12px; font-weight: 500; color: #1d2129; }
-.kg-zh-rel-main em { font-style: normal; font-size: 11px; color: #86909c; }
-.kg-zh-rel-id { font-size: 10.5px; color: #a9aeb8; white-space: nowrap; }
-.kg-zh-empty { padding: 10px; color: #a9aeb8; font-size: 11.5px; background: #f7f8fa; border-radius: 8px; }
-.kg-zh-origin { margin-top: 14px; padding: 10px 12px; border: 1px dashed #e5e6eb; border-radius: 10px; background: #fafbfc; color: #86909c; font-size: 11.5px; line-height: 1.65; }
 .kg-zh-origin p { margin: 0; }
 </style>

@@ -6,7 +6,8 @@
     "custom_terms": [],
     "template_use_count": {
       "tpl_002": 1,
-      "tpl_003": 2
+      "tpl_003": 3,
+      "tpl_001": 1
     }
   },
   "admin": {
@@ -40,5 +41,18 @@
     "template_use_count": {
       "tpl_002": 1
     }
+  },
+  "mask_8989@qq.com": {
+    "favorites": [],
+    "feedback": {
+      "met:待生产工单数": {
+        "vote": "up",
+        "reason": "",
+        "ts": "2026-10-01T16:02:56.809328+00:00"
+      }
+    },
+    "overrides": {},
+    "custom_terms": [],
+    "template_use_count": {}
   }
 }

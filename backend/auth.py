@@ -284,8 +284,11 @@ def register_user(email: str, password: str, display_name: str = "") -> dict:
     """
     email = (email or "").strip().lower()
     password = str(password)
-    if not is_valid_email(email):
-        raise ValueError("邮箱格式不正确")
+    # 与发码接口共用同一套面向普通用户的中文提示，避免「前端/发码说 A、注册说 B」
+    from email_codes import email_format_error
+    reason = email_format_error(email)
+    if reason:
+        raise ValueError(reason)
     if len(password) < 6:
         raise ValueError("密码至少 6 位")
     name = str(display_name).strip() or email.split("@")[0]

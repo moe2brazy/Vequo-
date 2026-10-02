@@ -179,9 +179,32 @@ const downloadPng = () => {
 
 defineExpose({ fitView, relayout, downloadPng })
 
-onMounted(draw)
+// 容器尺寸自适应：vis-network 自带的 autoResize 只监听 window resize，
+// 父级布局变化（「节点中文解释」面板展开把图挤小/恢复、右侧面板收起等）不会触发重绘，
+// 画布可能停在旧尺寸甚至变空白。这里用 ResizeObserver 跟随容器尺寸同步画布。
+let ro: ResizeObserver | null = null
+const syncSize = () => {
+  if (disposed || !network) return
+  const w = containerRef.value?.clientWidth || 0
+  const h = containerRef.value?.clientHeight || 0
+  if (w <= 0 || h <= 0) return // 容器暂时不可见：保持原尺寸，等下次尺寸变正再同步
+  try {
+    network.setSize(`${w}px`, `${h}px`)
+    network.redraw()
+  } catch { /* ignore */ }
+}
+
+onMounted(() => {
+  draw()
+  if (typeof ResizeObserver !== 'undefined' && containerRef.value) {
+    ro = new ResizeObserver(() => syncSize())
+    ro.observe(containerRef.value)
+  }
+})
 onBeforeUnmount(() => {
   disposed = true
+  try { ro?.disconnect() } catch { /* ignore */ }
+  ro = null
   try { abortCtrl?.abort() } catch { /* ignore */ }
   abortCtrl = null
   try { network?.destroy() } catch { /* ignore */ }

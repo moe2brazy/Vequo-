@@ -806,6 +806,101 @@ def get_scene_snapshot(scene_key: str, authorization: str = Header(None),
 # ========== 获取术语词典 ==========
 
 
+# 术语中文名映射（参考《制造业生产质量分析数据介绍》字段中文含义；key = 表名.字段名）
+TERM_CN_MAP = {
+    "dim_product.product_id": "产品 ID",
+        "dim_product.product_code": "产品编码",
+        "dim_product.product_name": "产品名称",
+        "dim_product.product_model": "产品型号",
+        "dim_product.product_category": "产品类别",
+        "dim_product.unit": "单位",
+        "dim_product.is_active": "是否启用",
+        "dim_process.process_id": "工序 ID",
+        "dim_process.process_code": "工序编码",
+        "dim_process.process_name": "工序名称",
+        "dim_process.process_seq": "工序顺序",
+        "dim_process.standard_yield_rate": "标准良率",
+        "dim_process.is_key_process": "是否关键工序",
+        "dim_production_line.line_id": "产线 ID",
+        "dim_production_line.line_code": "产线编码",
+        "dim_production_line.line_name": "产线名称",
+        "dim_production_line.workshop_name": "车间名称",
+        "dim_production_line.line_manager": "产线负责人",
+        "dim_production_line.line_status": "产线状态",
+        "dim_equipment.equipment_id": "设备 ID",
+        "dim_equipment.equipment_code": "设备编码",
+        "dim_equipment.equipment_name": "设备名称",
+        "dim_equipment.equipment_type": "设备类型",
+        "dim_equipment.line_id": "所属产线 ID",
+        "dim_equipment.install_date": "安装日期",
+        "dim_equipment.equipment_status": "设备状态",
+        "mes_work_order.work_order_id": "工单 ID",
+        "mes_work_order.work_order_no": "工单编号",
+        "mes_work_order.product_id": "产品 ID",
+        "mes_work_order.line_id": "产线 ID",
+        "mes_work_order.plan_qty": "计划数量",
+        "mes_work_order.start_date": "计划开始日期",
+        "mes_work_order.end_date": "计划结束日期",
+        "mes_work_order.order_status": "工单状态",
+        "mes_process_output.output_id": "产量记录 ID",
+        "mes_process_output.work_order_id": "工单 ID",
+        "mes_process_output.product_id": "产品 ID",
+        "mes_process_output.process_id": "工序 ID",
+        "mes_process_output.line_id": "产线 ID",
+        "mes_process_output.stat_date": "统计日期",
+        "mes_process_output.input_qty": "投入数量",
+        "mes_process_output.good_qty": "合格数量",
+        "mes_process_output.defect_qty": "不良数量",
+        "mes_process_output.rework_qty": "返工数量",
+        "mes_process_output.shift_code": "班次",
+        "qms_inspection.inspection_id": "检验记录 ID",
+        "qms_inspection.inspection_no": "检验单号",
+        "qms_inspection.work_order_id": "工单 ID",
+        "qms_inspection.product_id": "产品 ID",
+        "qms_inspection.process_id": "工序 ID",
+        "qms_inspection.inspection_date": "检验日期",
+        "qms_inspection.sample_qty": "抽检数量",
+        "qms_inspection.defect_qty": "不良数量",
+        "qms_inspection.inspection_result": "检验结果",
+        "qms_defect_detail.defect_id": "不良明细 ID",
+        "qms_defect_detail.inspection_id": "检验记录 ID",
+        "qms_defect_detail.defect_type": "不良类型",
+        "qms_defect_detail.defect_code": "不良代码",
+        "qms_defect_detail.defect_qty": "不良数量",
+        "qms_defect_detail.severity_level": "严重等级",
+        "qms_defect_detail.responsible_process_id": "责任工序 ID",
+        "eqp_downtime_record.downtime_id": "停机记录 ID",
+        "eqp_downtime_record.equipment_id": "设备 ID",
+        "eqp_downtime_record.line_id": "产线 ID",
+        "eqp_downtime_record.start_time": "停机开始时间",
+        "eqp_downtime_record.end_time": "停机结束时间",
+        "eqp_downtime_record.downtime_minutes": "停机分钟",
+        "eqp_downtime_record.downtime_reason": "停机原因",
+        "eqp_downtime_record.is_planned": "是否计划停机",
+        "inv_inventory_snapshot.snapshot_id": "库存快照 ID",
+        "inv_inventory_snapshot.snapshot_date": "快照日期",
+        "inv_inventory_snapshot.product_id": "产品 ID",
+        "inv_inventory_snapshot.warehouse_code": "仓库编码",
+        "inv_inventory_snapshot.available_qty": "可用库存",
+        "inv_inventory_snapshot.frozen_qty": "冻结库存",
+        "inv_inventory_snapshot.safety_stock_qty": "安全库存",
+}
+
+# 表中文名映射（同上，第 2 节文件清单）
+TABLE_CN_MAP = {
+    "dim_product": "产品主数据",
+        "dim_process": "工序主数据",
+        "dim_production_line": "产线主数据",
+        "dim_equipment": "设备主数据",
+        "mes_work_order": "生产工单",
+        "mes_process_output": "工序产量",
+        "qms_inspection": "质量检验",
+        "qms_defect_detail": "不良明细",
+        "eqp_downtime_record": "设备停机记录",
+        "inv_inventory_snapshot": "库存快照",
+}
+
+
 def _normalize_term_name(name: str) -> str:
     return name.replace("_", " ").replace("id", "ID").strip()
 
@@ -1079,6 +1174,10 @@ def _acl_filter_graph(data: dict, authorization: str) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
+# 需从术语词典排除的字段（按英文字段名，用户要求移除，如基础主键）
+EXCLUDED_TERMS = {"product_id"}
+
+
 def _build_terms(db: Session) -> Dict:
     inspector = inspect(db.get_bind())
     terms = []
@@ -1096,6 +1195,8 @@ def _build_terms(db: Session) -> Dict:
         for column in columns:
             comment = (column.get("comment") or "").strip()
             term_name = column["name"]
+            if term_name in EXCLUDED_TERMS:
+                continue
             col_type = str(column["type"])
             ktype = _classify_knowledge_type(term_name, col_type, table_name)
             # 释义优先级：专家级术语词典 > 数据库注释 > 模板生成
@@ -1112,6 +1213,8 @@ def _build_terms(db: Session) -> Dict:
             seen.add(key)
             terms.append({
                 "term": term_name,
+                "term_cn": TERM_CN_MAP.get(f"{table_name}.{term_name}", term_name),
+                "table_cn": TABLE_CN_MAP.get(table_name, table_name),
                 "definition": definition,
                 "category": _infer_term_category(term_name, table_name),
                 "knowledge_type": ktype,
@@ -1124,11 +1227,11 @@ def _build_terms(db: Session) -> Dict:
 
     if not terms:
         terms = [
-            {"term": "工序", "definition": "产品生产过程中经过的加工环节，是生产管理的核心业务对象，每个工序有独立的编号、名称和工艺参数。", "category": "生产", "knowledge_type": "业务对象", "data_type": "VARCHAR", "en": "Process", "abbreviation": "GX", "mapped_table": "dim_process", "mapped_field": "process_id"},
-            {"term": "良率", "definition": "合格产出数量占总产出数量的百分比，是制造业最核心的质量指标。良率越高说明生产过程越稳定，质量控制越有效。", "category": "质量", "knowledge_type": "业务指标", "data_type": "DECIMAL", "en": "Yield Rate", "abbreviation": "LY", "mapped_table": "mes_process_output", "mapped_field": "yield_rate"},
-            {"term": "缺陷", "definition": "产品质量不符合要求的异常项，用于定义和分类生产过程中的不合格现象，是质量分析的基础规则维度。", "category": "质量", "knowledge_type": "业务规则", "data_type": "VARCHAR", "en": "Defect", "abbreviation": "QX", "mapped_table": "qms_defect_detail", "mapped_field": "defect_type"},
-            {"term": "停机时长", "definition": "设备因故障、保养或换模等原因停止运行的时间长度（分钟），是设备效率分析的关键指标，直接影响产能计算。", "category": "设备", "knowledge_type": "业务指标", "data_type": "INTEGER", "en": "Downtime", "abbreviation": "TJSC", "mapped_table": "eqp_downtime_record", "mapped_field": "duration"},
-            {"term": "安全库存", "definition": "为应对需求波动和供应不确定性而设定的最低库存水位，低于该水位将触发补货预警，是库存管理的核心规则。", "category": "库存", "knowledge_type": "业务规则", "data_type": "INTEGER", "en": "Safety Stock", "abbreviation": "AQKC", "mapped_table": "inv_inventory_snapshot", "mapped_field": "safety_stock"},
+            {"term": "工序", "term_cn": "工序", "table_cn": "工序主数据", "definition": "产品生产过程中经过的加工环节，是生产管理的核心业务对象，每个工序有独立的编号、名称和工艺参数。", "category": "生产", "knowledge_type": "业务对象", "data_type": "VARCHAR", "en": "Process", "abbreviation": "GX", "mapped_table": "dim_process", "mapped_field": "process_id"},
+            {"term": "良率", "term_cn": "良率", "table_cn": "工序产量", "definition": "合格产出数量占总产出数量的百分比，是制造业最核心的质量指标。良率越高说明生产过程越稳定，质量控制越有效。", "category": "质量", "knowledge_type": "业务指标", "data_type": "DECIMAL", "en": "Yield Rate", "abbreviation": "LY", "mapped_table": "mes_process_output", "mapped_field": "yield_rate"},
+            {"term": "缺陷", "term_cn": "缺陷", "table_cn": "不良明细", "definition": "产品质量不符合要求的异常项，用于定义和分类生产过程中的不合格现象，是质量分析的基础规则维度。", "category": "质量", "knowledge_type": "业务规则", "data_type": "VARCHAR", "en": "Defect", "abbreviation": "QX", "mapped_table": "qms_defect_detail", "mapped_field": "defect_type"},
+            {"term": "停机时长", "term_cn": "停机时长", "table_cn": "设备停机记录", "definition": "设备因故障、保养或换模等原因停止运行的时间长度（分钟），是设备效率分析的关键指标，直接影响产能计算。", "category": "设备", "knowledge_type": "业务指标", "data_type": "INTEGER", "en": "Downtime", "abbreviation": "TJSC", "mapped_table": "eqp_downtime_record", "mapped_field": "duration"},
+            {"term": "安全库存", "term_cn": "安全库存", "table_cn": "库存快照", "definition": "为应对需求波动和供应不确定性而设定的最低库存水位，低于该水位将触发补货预警，是库存管理的核心规则。", "category": "库存", "knowledge_type": "业务规则", "data_type": "INTEGER", "en": "Safety Stock", "abbreviation": "AQKC", "mapped_table": "inv_inventory_snapshot", "mapped_field": "safety_stock"},
         ]
 
     return {"terms": terms}
@@ -2126,10 +2229,9 @@ def export_knowledge(scope: str = "terms", format: str = "md",
             buf = io.StringIO()
             buf.write("\ufeffterm,en,definition,category,knowledge_type,abbreviation,data_type,mapped_table\n")
             for t in rows:
-                buf.write(",".join(
-                    str(t.get(k, "")).replace(",", "，").replace('"', '""')
-                    for k in ("term", "en", "definition", "category", "knowledge_type", "abbreviation", "data_type", "mapped_table")
-                ) + "\n")
+                vals = [t.get("term_cn") or t.get("term", "")]
+                vals += [t.get(k, "") for k in ("en", "definition", "category", "knowledge_type", "abbreviation", "data_type", "mapped_table")]
+                buf.write(",".join(str(v).replace(",", "，").replace('"', '""') for v in vals) + "\n")
             content = buf.getvalue()
             return StreamingResponse(iter([content]), media_type="text/csv; charset=utf-8",
                                     headers={"Content-Disposition": "attachment; filename=knowledge_terms.csv"})
@@ -2137,7 +2239,7 @@ def export_knowledge(scope: str = "terms", format: str = "md",
         lines.append(f"共 {len(rows)} 个术语")
         lines.append("")
         for t in rows:
-            lines.append(f"## {t.get('term')}")
+            lines.append(f"## {t.get('term_cn') or t.get('term')}")
             if t.get("en"):
                 lines.append(f"- 英文名：{t.get('en')}")
             if t.get("knowledge_type"):
@@ -2149,7 +2251,7 @@ def export_knowledge(scope: str = "terms", format: str = "md",
             if t.get("definition"):
                 lines.append(f"- 定义：{t.get('definition')}")
             if t.get("mapped_table"):
-                lines.append(f"- 来源：{t.get('mapped_table')}{'.' + str(t.get('mapped_field')) if t.get('mapped_field') else ''}")
+                lines.append(f"- 来源：{t.get('table_cn') or t.get('mapped_table')}{'.' + str(t.get('mapped_field')) if t.get('mapped_field') else ''}")
             lines.append("")
         content = "\n".join(lines)
         return StreamingResponse(iter([content]), media_type="text/markdown; charset=utf-8",

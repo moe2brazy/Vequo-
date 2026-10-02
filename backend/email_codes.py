@@ -55,6 +55,17 @@ class EmailCooldownError(EmailCodeError):
     """发送过于频繁（返回 429）"""
 
 
+class EmailRecipientError(EmailCodeError):
+    """收件地址不存在/被拒（SMTP 550）：属于用户填错邮箱，不是服务端配置问题（返回 400）"""
+
+
+# 出现 550 即代表该地址在邮件服务器上不存在——用普通用户能看懂的话说明
+_RECIPIENT_NOT_FOUND = (
+    "该邮箱不存在，请检查邮箱地址是否填写正确"
+    "（常见原因：字母打错、多写或少写字符、域名后缀写错）。"
+)
+
+
 # ── 邮箱格式校验（auth.register_user 也复用）───────────────
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -65,7 +76,83 @@ def is_valid_email(email: str) -> bool:
     return 0 < len(email) <= 254 and bool(_EMAIL_RE.fullmatch(email))
 
 
+# 面向普通用户的中文提示（不暴露正则、状态码、SMTP 术语）
+_EMAIL_HINT = "正确格式示例：name@example.com"
+
+
+def email_format_error(email: str) -> str:
+    """邮箱格式体检：返回可直接展示给普通用户的中文原因；通过则返回空串。
+
+    逐条给出具体原因（而不是笼统的「格式不正确」），避免用户反复试错：
+    中文输入法下极易打出全角 ＠ / ． / 空格，肉眼几乎看不出，是最常见的成因。
+    注意本函数的严格度 ≥ is_valid_email（末尾有 _EMAIL_RE 兜底），
+    因此不会出现「发码放行、注册却报错」的不一致。
+    """
+    raw = (email or "").strip()
+    if not raw:
+        return "请填写邮箱地址"
+    if any(ord(ch) > 0x7F for ch in raw):
+        return f"邮箱地址里有中文或全角字符，请切换到英文输入法重新输入（{_EMAIL_HINT}）"
+    if " " in raw or "\t" in raw:
+        return "邮箱地址中间不能有空格"
+    if "@" not in raw:
+        return f"邮箱地址缺少 @ 符号（{_EMAIL_HINT}）"
+    if raw.count("@") > 1:
+        return "邮箱地址里出现了多个 @ 符号"
+    local, _, domain = raw.partition("@")
+    if not local:
+        return f"@ 前面缺少邮箱名称（{_EMAIL_HINT}）"
+    if not domain:
+        return f"@ 后面缺少邮箱域名（{_EMAIL_HINT}）"
+    if "." not in domain:
+        return f"邮箱域名缺少后缀，如 @qq.com 里的 .com（{_EMAIL_HINT}）"
+    if domain.startswith(".") or domain.endswith(".") or ".." in domain:
+        return "邮箱域名的点号位置不对，请检查域名部分"
+    if local.startswith(".") or local.endswith(".") or ".." in local:
+        return "邮箱名称不能以点号开头或结尾，也不能出现连续两个点号"
+    if any(part.startswith("-") or part.endswith("-") for part in domain.split(".")):
+        return "邮箱域名的连字符位置不对，请检查域名部分"
+    if len(raw) > 254:
+        return "邮箱地址过长，请检查是否多输了内容"
+    if not _EMAIL_RE.fullmatch(raw):
+        return f"邮箱格式不正确（{_EMAIL_HINT}）"
+    return ""
+
+
 # ── 发送 ────────────────────────────────────────────────
+
+def _as_text(value) -> str:
+    """SMTP 服务器响应常以 bytes 形式挂在异常上，直接 str() 会打印成 b'...' 难以阅读。"""
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", "replace")
+    return str(value)
+
+
+def _smtp_detail(exc: Exception) -> str:
+    """把 smtplib 异常转成可读的「状态码 + 服务器原文」。"""
+    if isinstance(exc, smtplib.SMTPRecipientsRefused):
+        return "；".join(f"{code} {_as_text(msg)}" for code, msg in exc.recipients.values())
+    code = getattr(exc, "smtp_code", None)
+    if code is not None:
+        return f"{code} {_as_text(getattr(exc, 'smtp_error', ''))}"
+    return _as_text(exc)
+
+
+def _log_smtp_failure(kind: str, to_email: str, exc: Exception) -> None:
+    """把服务器返回的原始状态码/英文原因写进后端日志。
+
+    排障确实需要这些细节，但**不能**塞进 HTTP 响应——此前 550 的英文原文被直接
+    抛给前端，用户看到 "(550, b'The recipient may contain a non-existent account...')"
+    完全不知道该改什么。响应只给人话，细节留给管理员看日志。
+    """
+    try:
+        import logging
+        logging.getLogger("email_codes").warning(
+            "邮件发送失败 [%s] 收件人=%s 原因=%s", kind, to_email, _smtp_detail(exc)
+        )
+    except Exception:
+        pass
+
 
 def _send_mail(to_email: str, code: str) -> None:
     """发送验证码邮件；未配置 SMTP 或 MAIL_DEBUG=1 时打印到日志（调试模式）。"""
@@ -112,15 +199,42 @@ def _send_mail(to_email: str, code: str) -> None:
                 s.starttls()
                 s.login(user, pwd)
                 s.sendmail(sender, [to_email], msg.as_string())
-    except Exception as e:
-        raise EmailCodeError(f"邮件发送失败：{str(e)[:120]}（请检查 SMTP 配置）") from e
+    # 顺序敏感：SMTPException 自 Python 3.4 起继承 OSError，
+    # 所有 smtplib 分支必须排在 OSError 之前，否则会被 OSError 兜底吞掉。
+    # 文案原则：响应只给普通用户看得懂的中文；服务器原文/状态码只进日志（_log_smtp_failure）。
+    except smtplib.SMTPRecipientsRefused as e:
+        _log_smtp_failure("recipient_refused", to_email, e)
+        raise EmailRecipientError(_RECIPIENT_NOT_FOUND) from e
+    except smtplib.SMTPAuthenticationError as e:
+        _log_smtp_failure("auth_failed", to_email, e)
+        raise EmailCodeError("邮件服务暂时不可用，请联系管理员检查发信邮箱配置。") from e
+    except smtplib.SMTPSenderRefused as e:
+        _log_smtp_failure("sender_refused", to_email, e)
+        raise EmailCodeError("邮件服务暂时不可用，请联系管理员检查发信邮箱配置。") from e
+    except smtplib.SMTPConnectError as e:
+        _log_smtp_failure("connect_error", to_email, e)
+        raise EmailCodeError("暂时无法连接邮件服务，请稍后重试。") from e
+    except smtplib.SMTPResponseException as e:
+        _log_smtp_failure("response_%s" % getattr(e, "smtp_code", "?"), to_email, e)
+        # 550 也可能出现在 DATA 阶段（QQ 把「收件人不存在」的判定推迟到这里）
+        if getattr(e, "smtp_code", None) == 550:
+            raise EmailRecipientError(_RECIPIENT_NOT_FOUND) from e
+        raise EmailCodeError("邮件发送失败，请稍后重试；若多次失败请联系管理员。") from e
+    except smtplib.SMTPServerDisconnected as e:
+        _log_smtp_failure("server_disconnected", to_email, e)
+        raise EmailCodeError("邮件服务连接中断，请稍后重试。") from e
+    except OSError as e:
+        # 含 socket 超时 / DNS 解析失败 / 网络不可达
+        _log_smtp_failure("network", to_email, e)
+        raise EmailCodeError("网络异常，暂时无法发送验证码，请稍后重试。") from e
 
 
 def send_code(email: str) -> dict:
     """生成验证码并发送。返回 {ok, expires_in, cooldown}；失败抛 EmailCodeError/EmailCooldownError。"""
     email = (email or "").strip().lower()
-    if not is_valid_email(email):
-        raise EmailCodeError("邮箱格式不正确")
+    reason = email_format_error(email)
+    if reason:
+        raise EmailCodeError(reason)
     from auth import find_user, find_user_by_email, audit
     if find_user(email) or find_user_by_email(email):
         raise EmailCodeError("该邮箱已注册，请直接登录")
@@ -138,7 +252,18 @@ def send_code(email: str) -> dict:
         _CODES[email] = {"code": code, "expires_at": now + ttl, "attempts": 0, "sent_at": now}
         _SENT_AT[email] = now
 
-    _send_mail(email, code)
+    try:
+        _send_mail(email, code)
+    except Exception:
+        # 发信失败必须回滚占位：否则用户改正邮箱后要白等一整个冷却期（默认 60s），
+        # 且 _CODES 里会留一份永远送不到的死码。
+        with _lock:
+            if _SENT_AT.get(email) == now:
+                _SENT_AT.pop(email, None)
+            rec = _CODES.get(email)
+            if rec and rec.get("code") == code:
+                _CODES.pop(email, None)
+        raise
     audit("email_code_sent", email=email, ttl=ttl)
     return {"ok": True, "expires_in": ttl, "cooldown": cooldown}
 
