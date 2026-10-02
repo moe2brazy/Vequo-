@@ -1,0 +1,2038 @@
+[
+  {
+    "name": "在产工单数",
+    "aliases": [
+      "在产工单",
+      "在制工单",
+      "进行中工单",
+      "正在执行工单",
+      "未完成工单",
+      "执行中的工单"
+    ],
+    "unit": "单",
+    "tables": [
+      "mes_work_order"
+    ],
+    "sql_expression": "SUM(CASE WHEN order_status = 'in_progress' THEN 1 ELSE 0 END)",
+    "formula": "工单状态为 in_progress(进行中) 的工单数",
+    "description": "当前处于「进行中(in_progress)」状态的工单数量（口径：mes_work_order.order_status = 'in_progress'；枚举 closed 已关闭/completed 已完成/in_progress 进行中/released 已下达）",
+    "dims": [
+      "产线",
+      "车间",
+      "产品",
+      "状态",
+      "工单状态",
+      "日期"
+    ],
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "已完成工单数",
+    "aliases": [
+      "已完成工单",
+      "完成工单",
+      "完工工单",
+      "已完成的工单"
+    ],
+    "unit": "单",
+    "tables": [
+      "mes_work_order"
+    ],
+    "sql_expression": "SUM(CASE WHEN order_status = 'completed' THEN 1 ELSE 0 END)",
+    "formula": "工单状态为 completed(已完成) 的工单数",
+    "description": "已完成的工单数量（口径：mes_work_order.order_status = 'completed'）",
+    "dims": [
+      "产线",
+      "车间",
+      "产品",
+      "状态",
+      "工单状态",
+      "日期"
+    ],
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "已取消工单数",
+    "aliases": [
+      "已取消工单",
+      "取消工单",
+      "关闭工单",
+      "已关闭工单"
+    ],
+    "unit": "单",
+    "tables": [
+      "mes_work_order"
+    ],
+    "sql_expression": "SUM(CASE WHEN order_status = 'closed' THEN 1 ELSE 0 END)",
+    "formula": "工单状态为 closed(已取消/已关闭) 的工单数",
+    "description": "已取消/已关闭的工单数量（口径：mes_work_order.order_status = 'closed'；枚举 closed 已取消 72/completed 已完成 207/in_progress 进行中 33/released 已下达 32）",
+    "dims": [
+      "产线",
+      "车间",
+      "产品",
+      "状态",
+      "工单状态",
+      "日期"
+    ],
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "返工数量",
+    "aliases": [
+      "返工量",
+      "返工数",
+      "返工"
+    ],
+    "unit": "件",
+    "tables": [
+      "mes_process_output"
+    ],
+    "sql_expression": "SUM(COALESCE(rework_qty, 0))",
+    "formula": "SUM(rework_qty)",
+    "description": "返工数量合计（口径：mes_process_output.rework_qty 求和；yans 库实测该列存在，个别行可能为空用 COALESCE 兜底）",
+    "dims": [
+      "工序",
+      "产线",
+      "产品",
+      "工单",
+      "日期",
+      "班次"
+    ],
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "库存缺口量",
+    "aliases": [
+      "库存缺口",
+      "缺货量",
+      "缺货数量",
+      "低于安全库存",
+      "缺料多少",
+      "还缺多少"
+    ],
+    "unit": "件",
+    "tables": [
+      "inv_inventory_snapshot"
+    ],
+    "sql_expression": "SUM(CASE WHEN available_qty < safety_stock_qty THEN safety_stock_qty - available_qty ELSE 0 END)",
+    "formula": "仅统计 available_qty < safety_stock_qty 的行，合计 (安全库存 - 可用库存)；不缺货行计 0",
+    "description": "库存缺口合计（口径：对低于安全库存的行求和 safety_stock_qty - available_qty，正值表示缺口；不满足条件的行不计入）",
+    "dims": [
+      "产品",
+      "仓库",
+      "日期"
+    ],
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "库存分档统计",
+    "aliases": [
+      "库存分档",
+      "库存水平分档",
+      "库存档位",
+      "缺货过剩分档",
+      "安全库存分档",
+      "可用量与安全库存的差距分档"
+    ],
+    "unit": "档",
+    "tables": [
+      "inv_inventory_snapshot",
+      "dim_product"
+    ],
+    "sql_expression": "",
+    "formula": "以每个产品最新快照（snapshot_date 最大）为准，库存水平 r = available_qty / safety_stock_qty；分档：r<1 缺货；1≤r<1.5 正常；r≥1.5 过剩（1.5 为默认业务阈值，可调整）。各档产品数 = 档内 COUNT(DISTINCT product_id)。SQL 骨架：WITH last AS (SELECT DISTINCT ON (product_id) * FROM inv_inventory_snapshot ORDER BY product_id, snapshot_date DESC) SELECT CASE WHEN available_qty < safety_stock_qty THEN '缺货' WHEN available_qty < safety_stock_qty * 1.5 THEN '正常' ELSE '过剩' END 档位, COUNT(DISTINCT product_id) 产品数 FROM last GROUP BY 1 ORDER BY 1",
+    "description": "库存水平分档统计：按每产品最新快照的可用量/安全库存比值分 缺货/正常/过剩 三档，统计各档产品数。（演示库 2026-07-15 最新快照 28 个产品比值 2.25~3.57，全部落在『过剩』档。）",
+    "dims": [],
+    "valid_from": "",
+    "valid_to": "",
+    "exec_sql": "WITH last AS (SELECT DISTINCT ON (product_id) * FROM inv_inventory_snapshot ORDER BY product_id, snapshot_date DESC) SELECT CASE WHEN available_qty < safety_stock_qty THEN '缺货' WHEN available_qty < safety_stock_qty * 1.5 THEN '正常' ELSE '过剩' END AS \"档位\", COUNT(DISTINCT product_id) AS \"产品数\" FROM last GROUP BY 1 ORDER BY 1"
+  },
+  {
+    "name": "工单产出缺口",
+    "aliases": [
+      "工单产出缺口",
+      "产出缺口最大的",
+      "产出缺口最大的前",
+      "产出缺口排名",
+      "产出缺口排行",
+      "缺口最大的工单",
+      "生产缺口",
+      "产出不足",
+      "未达产"
+    ],
+    "unit": "件",
+    "tables": [
+      "mes_work_order",
+      "mes_process_output",
+      "dim_process"
+    ],
+    "sql_expression": "",
+    "formula": "完工数量 = 工单在末道工序（dim_process.process_seq 最大的记录，如 PR08 包装入库）的 good_qty；严禁 SUM(good_qty)——mes_process_output 每工单含 8 条工序记录，SUM 会把产出放大约 8 倍。产出缺口 = plan_qty − 完工数量。缺口最大前 N 个工单 = 缺口降序 LIMIT N（正=欠产，≤0=完成/超产）。SQL 骨架：WITH lastp AS (SELECT x.work_order_id, x.good_qty, ROW_NUMBER() OVER (PARTITION BY x.work_order_id ORDER BY pr.process_seq DESC) rn FROM mes_process_output x JOIN dim_process pr ON x.process_id = pr.process_id) SELECT w.work_order_no, w.plan_qty, l.good_qty 完工数量, (w.plan_qty - l.good_qty) 缺口 FROM mes_work_order w JOIN lastp l ON l.work_order_id = w.work_order_id AND l.rn = 1 ORDER BY 缺口 DESC LIMIT N",
+    "description": "工单产出缺口（末工序完工口径）：完工数量取该工单末道工序（process_seq 最大）良品数，缺口 = 计划量 − 完工数量；用于「产出缺口最大的前10个工单」类查询。（演示库 344 张工单全部欠产，缺口 0~535；缺口最大 MO-20260610-0069 = 535。）",
+    "dims": [],
+    "valid_from": "",
+    "valid_to": "",
+    "exec_sql": "WITH lastp AS (SELECT x.work_order_id, x.good_qty, ROW_NUMBER() OVER (PARTITION BY x.work_order_id ORDER BY pr.process_seq DESC) rn FROM mes_process_output x JOIN dim_process pr ON x.process_id = pr.process_id) SELECT w.work_order_no AS \"工单号\", w.plan_qty AS \"计划数量\", l.good_qty AS \"完工数量\", (w.plan_qty - l.good_qty) AS \"产出缺口\" FROM mes_work_order w JOIN lastp l ON l.work_order_id = w.work_order_id AND l.rn = 1 ORDER BY \"产出缺口\" DESC LIMIT {limit}"
+  },
+  {
+    "name": "超产工单数",
+    "aliases": [
+      "超产",
+      "超产工单",
+      "超额完成工单",
+      "超过了计划数量",
+      "超过计划产量"
+    ],
+    "unit": "单",
+    "tables": [
+      "mes_work_order",
+      "mes_process_output",
+      "dim_process"
+    ],
+    "sql_expression": "",
+    "formula": "完工数量 = 工单在末道工序（dim_process.process_seq 最大的记录）的 good_qty（严禁 SUM(good_qty)，每工单 8 条工序记录会放大约 8 倍致全超产假象）。超产工单 = 完工数量 > plan_qty；超产工单数 = 满足条件工单的 COUNT。SQL 骨架：WITH lastp AS (SELECT x.work_order_id, x.good_qty, ROW_NUMBER() OVER (PARTITION BY x.work_order_id ORDER BY pr.process_seq DESC) rn FROM mes_process_output x JOIN dim_process pr ON x.process_id = pr.process_id) SELECT COUNT(*) 超产工单数 FROM mes_work_order w JOIN lastp l ON l.work_order_id = w.work_order_id AND l.rn = 1 WHERE l.good_qty > w.plan_qty",
+    "description": "超产工单数（末工序完工口径）：完工数量超过计划量的工单数，与『工单产出缺口』同源口径。（演示库 344 张工单全部欠产，当前超产工单数 = 0。）",
+    "dims": [],
+    "valid_from": "",
+    "valid_to": "",
+    "exec_sql": "WITH lastp AS (SELECT x.work_order_id, x.good_qty, ROW_NUMBER() OVER (PARTITION BY x.work_order_id ORDER BY pr.process_seq DESC) rn FROM mes_process_output x JOIN dim_process pr ON x.process_id = pr.process_id) SELECT COUNT(*) AS \"超产工单数\" FROM mes_work_order w JOIN lastp l ON l.work_order_id = w.work_order_id AND l.rn = 1 WHERE l.good_qty > w.plan_qty"
+  },
+  {
+    "name": "产线不良数",
+    "aliases": [
+      "产线不良",
+      "产线的不良",
+      "产线不良排行",
+      "产线不良排名",
+      "各产线的不良",
+      "产线的缺陷数"
+    ],
+    "unit": "件",
+    "tables": [
+      "mes_process_output"
+    ],
+    "sql_expression": "SUM(COALESCE(defect_qty, 0))",
+    "formula": "产线不良数 = mes_process_output.defect_qty 按产线求和（产线经 dim_production_line.line_id 关联），排行按不良数降序。",
+    "description": "各产线工序不良数合计与排行（不良来源=mes_process_output.defect_qty 工序不良，非 qms_defect_detail 检验缺陷明细；基准：一车间-4号线 22690 最高）。",
+    "dims": [
+      "产线",
+      "车间",
+      "工序",
+      "产品",
+      "班次",
+      "日期"
+    ],
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "待生产工单数",
+    "aliases": [
+      "等待生产",
+      "待生产",
+      "已下达",
+      "尚未开工",
+      "已下达工单",
+      "已下达状态的工单",
+      "已下达的工单",
+      "等待生产的工单",
+      "等待排产",
+      "released",
+      "已下达工单有多少",
+      "等待生产的工单数量",
+      "处于已下达状态"
+    ],
+    "unit": "单",
+    "tables": [
+      "mes_work_order"
+    ],
+    "sql_expression": "SUM(CASE WHEN order_status = 'released' THEN 1 ELSE 0 END)",
+    "formula": "待生产工单数 = mes_work_order.order_status='released' 的工单数（已下达但尚未开工）。",
+    "description": "已下达/等待生产状态的工单数（order_status='released'；yans 库实测 32 单）。用于「等待生产的工单数量」「处于已下达状态的工单有多少」类问法。",
+    "dims": [
+      "产线",
+      "产品",
+      "日期"
+    ],
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "一次直通率",
+    "aliases": [
+      "直通率",
+      "一次直通率",
+      "一次通过率",
+      "一次性通过率",
+      "首件通过率",
+      "FPY",
+      "fpy",
+      "一次合格率",
+      "一次交验合格率"
+    ],
+    "unit": "%",
+    "tables": [
+      "mes_process_output"
+    ],
+    "sql_expression": "(SUM(COALESCE(input_qty, 0)) - SUM(COALESCE(rework_qty, 0))) * 100.0 / NULLIF(SUM(input_qty), 0)",
+    "formula": "一次直通率 FPY = (投入量 − 返工量) / 投入量 × 100% ＝ 100% − 返工率。与已注册的「良率」(合格数/投入数) 【不是】同一指标，严禁互相冒充。",
+    "description": "一次直通率（FPY）：未经返工直接通过的比例（口径：(input_qty − rework_qty) / input_qty；演示库全期各产线 98.94~99.27，一车间-1号线 99.27 最高）。⚠️ 禁止用 good_qty/input_qty 冒充——那是「良率」(97.05~97.95)，两者相差约 1.2 个百分点。",
+    "dims": [
+      "产线",
+      "车间",
+      "工序",
+      "产品",
+      "日期",
+      "班次"
+    ],
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "计划达成率",
+    "aliases": [
+      "达成率",
+      "计划达成率",
+      "计划达成",
+      "计划完成率",
+      "排产达成率",
+      "生产计划达成率"
+    ],
+    "unit": "%",
+    "tables": [
+      "mes_work_order",
+      "mes_process_output",
+      "dim_process"
+    ],
+    "sql_expression": "",
+    "formula": "计划达成率 = 末道工序完工数量 / 计划数量 × 100%。完工数量 = 工单在末道工序（dim_process.process_seq 最大的记录）的 good_qty，按所选维度（产线/车间/产品/日期/整体）分组聚合。⚠️ 严禁 order_status='completed' 计数当分子，严禁 SUM(good_qty)（8 道工序记录放大约 8 倍）。",
+    "description": "计划达成率（末工序完工口径，确定性执行）：按问题维度自动选择人工验证模板（exec_sql_by_dim）。yans 全期基准：一车间-1号线 80.90 / 二车间-5号线 80.34 / 二车间-2号线 78.77 / 三车间-3号线 76.87 / 一车间-4号线 75.19 / 全厂 78.31。yans 的 mes_work_order **没有 actual_qty 列**，任何引用它的写法都会执行失败。",
+    "dims": [
+      "产线",
+      "车间",
+      "产品",
+      "日期"
+    ],
+    "valid_from": "",
+    "valid_to": "",
+    "exec_sql_by_dim": {
+      "产线": "WITH lastp AS (SELECT x.work_order_id, x.good_qty, ROW_NUMBER() OVER (PARTITION BY x.work_order_id ORDER BY pr.process_seq DESC) rn FROM mes_process_output x JOIN dim_process pr ON x.process_id = pr.process_id) SELECT pl.line_name AS \"产线\", SUM(l.good_qty)*100.0/NULLIF(SUM(w.plan_qty),0) AS \"计划达成率\" FROM mes_work_order w JOIN lastp l ON l.work_order_id=w.work_order_id AND l.rn=1 JOIN dim_production_line pl ON pl.line_id=w.line_id GROUP BY pl.line_name ORDER BY \"计划达成率\" DESC",
+      "车间": "WITH lastp AS (SELECT x.work_order_id, x.good_qty, ROW_NUMBER() OVER (PARTITION BY x.work_order_id ORDER BY pr.process_seq DESC) rn FROM mes_process_output x JOIN dim_process pr ON x.process_id = pr.process_id) SELECT pl.workshop_name AS \"车间\", SUM(l.good_qty)*100.0/NULLIF(SUM(w.plan_qty),0) AS \"计划达成率\" FROM mes_work_order w JOIN lastp l ON l.work_order_id=w.work_order_id AND l.rn=1 JOIN dim_production_line pl ON pl.line_id=w.line_id GROUP BY pl.workshop_name ORDER BY \"计划达成率\" DESC",
+      "产品": "WITH lastp AS (SELECT x.work_order_id, x.good_qty, ROW_NUMBER() OVER (PARTITION BY x.work_order_id ORDER BY pr.process_seq DESC) rn FROM mes_process_output x JOIN dim_process pr ON x.process_id = pr.process_id) SELECT p.product_name AS \"产品\", SUM(l.good_qty)*100.0/NULLIF(SUM(w.plan_qty),0) AS \"计划达成率\" FROM mes_work_order w JOIN lastp l ON l.work_order_id=w.work_order_id AND l.rn=1 JOIN dim_product p ON p.product_id=w.product_id GROUP BY p.product_name ORDER BY \"计划达成率\" DESC",
+      "日期": "WITH lastp AS (SELECT x.work_order_id, x.good_qty, ROW_NUMBER() OVER (PARTITION BY x.work_order_id ORDER BY pr.process_seq DESC) rn FROM mes_process_output x JOIN dim_process pr ON x.process_id = pr.process_id) SELECT to_char(w.end_date,'YYYY-MM') AS \"月份\", SUM(l.good_qty)*100.0/NULLIF(SUM(w.plan_qty),0) AS \"计划达成率\" FROM mes_work_order w JOIN lastp l ON l.work_order_id=w.work_order_id AND l.rn=1 GROUP BY 1 ORDER BY 1",
+      "_default": "WITH lastp AS (SELECT x.work_order_id, x.good_qty, ROW_NUMBER() OVER (PARTITION BY x.work_order_id ORDER BY pr.process_seq DESC) rn FROM mes_process_output x JOIN dim_process pr ON x.process_id = pr.process_id) SELECT SUM(l.good_qty)*100.0/NULLIF(SUM(w.plan_qty),0) AS \"计划达成率\" FROM mes_work_order w JOIN lastp l ON l.work_order_id=w.work_order_id AND l.rn=1"
+    }
+  },
+  {
+    "name": "满足安全库存品种数",
+    "aliases": [
+      "满足安全库存的产品",
+      "满足安全库存的品种",
+      "安全库存达标品种",
+      "达到安全库存的产品",
+      "有多少产品满足安全库存",
+      "几个产品满足安全库存",
+      "哪些产品满足安全库存"
+    ],
+    "unit": "种",
+    "tables": [
+      "inv_inventory_snapshot"
+    ],
+    "sql_expression": "COUNT(DISTINCT CASE WHEN snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) AND available_qty >= safety_stock_qty THEN product_id END)",
+    "formula": "最新快照日 available_qty >= safety_stock_qty 的去重产品数",
+    "description": "当前满足安全库存的品种数（口径：最新快照日达标产品去重计数；yans 基准 20 种，2026-07-15 快照 20 个产品全部达标）。注：v1 按快照行计数(1004) 名实不符，2026-09-25 审计修正为品种口径。",
+    "dims": [
+      "仓库",
+      "产品"
+    ],
+    "exec_sql": "SELECT COUNT(DISTINCT i.product_id) AS \"满足安全库存品种数\" FROM inv_inventory_snapshot i WHERE i.snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) AND i.available_qty >= i.safety_stock_qty",
+    "version": 2
+  },
+  {
+    "name": "当前库存量",
+    "aliases": [
+      "当前库存",
+      "当前可用库存",
+      "现在库存",
+      "现在的库存",
+      "库存还有多少",
+      "还剩多少库存",
+      "还有多少货",
+      "有多少货",
+      "库存水位",
+      "现有库存"
+    ],
+    "unit": "件",
+    "tables": [
+      "inv_inventory_snapshot"
+    ],
+    "sql_expression": "SUM(CASE WHEN snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) THEN available_qty ELSE 0 END)",
+    "formula": "最新快照日的 available_qty 合计（每个产品/仓库各取最新一条快照）",
+    "description": "当前时点可用库存（口径：取最新快照日 available_qty 求和；yans 基准 72961，2026-07-15）。与「库存量」（全历史快照累计 3366671）相差约 46 倍，问「当前/还剩多少库存」必须用本口径。",
+    "dims": [
+      "仓库",
+      "产品"
+    ],
+    "exec_sql": "SELECT p.product_name AS \"产品\", i.available_qty AS \"当前库存\" FROM inv_inventory_snapshot i JOIN dim_product p ON p.product_id = i.product_id WHERE i.snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) ORDER BY i.available_qty DESC",
+    "exec_sql_by_dim": {
+      "仓库": "SELECT i.warehouse_code AS \"仓库\", SUM(i.available_qty) AS \"当前库存\" FROM inv_inventory_snapshot i WHERE i.snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) GROUP BY i.warehouse_code ORDER BY \"当前库存\" DESC",
+      "产品": "SELECT p.product_name AS \"产品\", i.available_qty AS \"当前库存\" FROM inv_inventory_snapshot i JOIN dim_product p ON p.product_id = i.product_id WHERE i.snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) ORDER BY i.available_qty DESC",
+      "_default": "SELECT p.product_name AS \"产品\", i.available_qty AS \"当前库存\" FROM inv_inventory_snapshot i JOIN dim_product p ON p.product_id = i.product_id WHERE i.snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) ORDER BY i.available_qty DESC"
+    }
+  },
+  {
+    "name": "当前总库存量",
+    "aliases": [
+      "当前总库存",
+      "现在总库存",
+      "当前库存总量"
+    ],
+    "unit": "件",
+    "tables": [
+      "inv_inventory_snapshot"
+    ],
+    "sql_expression": "SUM(CASE WHEN snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) THEN available_qty + COALESCE(frozen_qty,0) ELSE 0 END)",
+    "formula": "最新快照日的 (available_qty + frozen_qty) 合计",
+    "description": "当前时点总库存（口径：取最新快照日 可用+冻结 求和；yans 基准 73781，2026-07-15）。与「总库存」（全历史快照累计 3406851）区分。",
+    "dims": [
+      "仓库",
+      "产品"
+    ],
+    "exec_sql": "SELECT SUM(i.available_qty + COALESCE(i.frozen_qty,0)) AS \"当前总库存\" FROM inv_inventory_snapshot i WHERE i.snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot)",
+    "exec_sql_by_dim": {
+      "仓库": "SELECT i.warehouse_code AS \"仓库\", SUM(i.available_qty + COALESCE(i.frozen_qty,0)) AS \"当前总库存\" FROM inv_inventory_snapshot i WHERE i.snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) GROUP BY i.warehouse_code ORDER BY \"当前总库存\" DESC",
+      "产品": "SELECT p.product_name AS \"产品\", SUM(i.available_qty + COALESCE(i.frozen_qty,0)) AS \"当前总库存\" FROM inv_inventory_snapshot i JOIN dim_product p ON p.product_id = i.product_id WHERE i.snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) GROUP BY p.product_name ORDER BY \"当前总库存\" DESC",
+      "_default": "SELECT SUM(i.available_qty + COALESCE(i.frozen_qty,0)) AS \"当前总库存\" FROM inv_inventory_snapshot i WHERE i.snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot)"
+    }
+  },
+  {
+    "name": "完工数量",
+    "aliases": [
+      "完工量",
+      "完工数",
+      "完工产量",
+      "实际完工数量",
+      "完工了多少",
+      "完工产品数量"
+    ],
+    "unit": "件",
+    "tables": [
+      "mes_work_order",
+      "mes_process_output",
+      "dim_process"
+    ],
+    "sql_expression": "",
+    "formula": "完工数量 = 工单在末道工序（dim_process.process_seq 最大的记录）的 good_qty 合计；严禁 SUM(good_qty)（每工单 8 条工序记录会放大约 8 倍）。",
+    "description": "完工数量（末工序完工口径，确定性执行）：yans 全期基准 345198 件；产线最高 三车间-3号线 73721。与「产量」(good+defect 全工序合计) 不是同一指标，严禁互相冒充。",
+    "dims": [
+      "产线",
+      "车间",
+      "产品",
+      "日期"
+    ],
+    "exec_sql_by_dim": {
+      "产线": "WITH lastp AS (SELECT x.work_order_id, x.good_qty, ROW_NUMBER() OVER (PARTITION BY x.work_order_id ORDER BY pr.process_seq DESC) rn FROM mes_process_output x JOIN dim_process pr ON x.process_id = pr.process_id) SELECT pl.line_name AS \"产线\", SUM(l.good_qty) AS \"完工数量\" FROM mes_work_order w JOIN lastp l ON l.work_order_id=w.work_order_id AND l.rn=1 JOIN dim_production_line pl ON pl.line_id=w.line_id GROUP BY pl.line_name ORDER BY \"完工数量\" DESC",
+      "车间": "WITH lastp AS (SELECT x.work_order_id, x.good_qty, ROW_NUMBER() OVER (PARTITION BY x.work_order_id ORDER BY pr.process_seq DESC) rn FROM mes_process_output x JOIN dim_process pr ON x.process_id = pr.process_id) SELECT pl.workshop_name AS \"车间\", SUM(l.good_qty) AS \"完工数量\" FROM mes_work_order w JOIN lastp l ON l.work_order_id=w.work_order_id AND l.rn=1 JOIN dim_production_line pl ON pl.line_id=w.line_id GROUP BY pl.workshop_name ORDER BY \"完工数量\" DESC",
+      "产品": "WITH lastp AS (SELECT x.work_order_id, x.good_qty, ROW_NUMBER() OVER (PARTITION BY x.work_order_id ORDER BY pr.process_seq DESC) rn FROM mes_process_output x JOIN dim_process pr ON x.process_id = pr.process_id) SELECT p.product_name AS \"产品\", SUM(l.good_qty) AS \"完工数量\" FROM mes_work_order w JOIN lastp l ON l.work_order_id=w.work_order_id AND l.rn=1 JOIN dim_product p ON p.product_id=w.product_id GROUP BY p.product_name ORDER BY \"完工数量\" DESC",
+      "日期": "WITH lastp AS (SELECT x.work_order_id, x.good_qty, ROW_NUMBER() OVER (PARTITION BY x.work_order_id ORDER BY pr.process_seq DESC) rn FROM mes_process_output x JOIN dim_process pr ON x.process_id = pr.process_id) SELECT to_char(w.end_date,'YYYY-MM') AS \"月份\", SUM(l.good_qty) AS \"完工数量\" FROM mes_work_order w JOIN lastp l ON l.work_order_id=w.work_order_id AND l.rn=1 GROUP BY 1 ORDER BY 1",
+      "_default": "WITH lastp AS (SELECT x.work_order_id, x.good_qty, ROW_NUMBER() OVER (PARTITION BY x.work_order_id ORDER BY pr.process_seq DESC) rn FROM mes_process_output x JOIN dim_process pr ON x.process_id = pr.process_id) SELECT SUM(l.good_qty) AS \"完工数量\" FROM mes_work_order w JOIN lastp l ON l.work_order_id=w.work_order_id AND l.rn=1"
+    },
+    "valid_from": null,
+    "valid_to": null
+  },
+  {
+    "name": "欠产工单数",
+    "aliases": [
+      "欠产工单",
+      "欠产",
+      "未完成计划的工单",
+      "没完成计划的工单",
+      "低于计划的工单",
+      "未达产工单"
+    ],
+    "unit": "单",
+    "tables": [
+      "mes_work_order",
+      "mes_process_output",
+      "dim_process"
+    ],
+    "sql_expression": "",
+    "formula": "欠产工单 = 末道工序完工数量 < plan_qty 的工单；口径与「超产工单数」互补（完工=计划 既不超也不欠）。",
+    "description": "欠产工单数（末工序完工口径，确定性执行）：yans 全期基准 344 单（全部工单均欠产，超产 0 单）。",
+    "dims": [
+      "产线",
+      "车间",
+      "产品",
+      "日期"
+    ],
+    "exec_sql": "WITH lastp AS (SELECT x.work_order_id, x.good_qty, ROW_NUMBER() OVER (PARTITION BY x.work_order_id ORDER BY pr.process_seq DESC) rn FROM mes_process_output x JOIN dim_process pr ON x.process_id = pr.process_id) SELECT COUNT(*) AS \"欠产工单数\" FROM mes_work_order w JOIN lastp l ON l.work_order_id = w.work_order_id AND l.rn = 1 WHERE l.good_qty < w.plan_qty",
+    "valid_from": null,
+    "valid_to": null
+  },
+  {
+    "name": "漏检工单数",
+    "aliases": [
+      "漏检",
+      "漏检工单",
+      "未检工单",
+      "没有检验的工单",
+      "没检的工单",
+      "未经质检的工单",
+      "未质检工单"
+    ],
+    "unit": "单",
+    "tables": [
+      "mes_work_order",
+      "qms_inspection"
+    ],
+    "sql_expression": "",
+    "formula": "漏检工单 = mes_work_order 中不存在任何 qms_inspection 检验记录（按 work_order_id 关联）的工单。",
+    "description": "漏检工单数（确定性执行）：yans 全期基准 0 单（344 张工单全部有检验记录）；该口径用于「有没有工单没做质检」类问法，换库后未必为 0。",
+    "dims": [
+      "产线",
+      "产品",
+      "日期"
+    ],
+    "exec_sql": "SELECT COUNT(*) AS \"漏检工单数\" FROM mes_work_order w WHERE NOT EXISTS (SELECT 1 FROM qms_inspection q WHERE q.work_order_id = w.work_order_id)",
+    "valid_from": null,
+    "valid_to": null
+  },
+  {
+    "name": "停机设备数",
+    "aliases": [
+      "停机设备",
+      "停过机的设备",
+      "发生停机的设备",
+      "多少台设备停过",
+      "停机了几台设备",
+      "出故障的设备数"
+    ],
+    "unit": "台",
+    "tables": [
+      "eqp_downtime_record"
+    ],
+    "sql_expression": "COUNT(DISTINCT equipment_id)",
+    "formula": "COUNT(DISTINCT equipment_id)",
+    "description": "发生过停机记录的设备台数（口径：eqp_downtime_record 去重 equipment_id；yans 基准 40 台 / 设备台账共 48 台）。",
+    "dims": [
+      "设备",
+      "产线",
+      "停机原因",
+      "计划类型"
+    ],
+    "valid_from": null,
+    "valid_to": null
+  },
+  {
+    "name": "严重缺陷占比",
+    "aliases": [
+      "严重缺陷比例",
+      "重大缺陷占比",
+      "严重不良占比",
+      "严重缺陷占多少",
+      "critical和major占比"
+    ],
+    "unit": "%",
+    "tables": [
+      "qms_defect_detail"
+    ],
+    "required_cols": [
+      "severity_level"
+    ],
+    "sql_expression": "SUM(CASE WHEN severity_level IN ('critical','major') THEN COALESCE(defect_qty, 0) ELSE 0 END) * 100.0 / NULLIF(SUM(COALESCE(defect_qty, 0)), 0)",
+    "formula": "Σ(severity_level ∈ {critical, major} 的 defect_qty) / Σ(全部 defect_qty) × 100%",
+    "description": "严重及以上缺陷件数占比（口径：critical+major 件数 / 全部缺陷件数；yans 基准 63.64%，缺陷件数总计 5273）。2026-09-29 口径统一后，内置「严重缺陷数」已同步改为 critical+major，两者分子口径一致（可直接用 严重缺陷数 ÷ 缺陷件数 复算）；只要 critical 单等级请用「致命缺陷数」。",
+    "dims": [
+      "缺陷类型",
+      "严重度",
+      "工序"
+    ],
+    "valid_from": null,
+    "valid_to": null
+  },
+  {
+    "name": "平均日产量",
+    "aliases": [
+      "日均产量",
+      "平均每日产量",
+      "每天平均产量",
+      "日产均值",
+      "平均每天生产多少"
+    ],
+    "unit": "件",
+    "tables": [
+      "mes_process_output"
+    ],
+    "sql_expression": "SUM(COALESCE(good_qty, 0) + COALESCE(defect_qty, 0)) * 1.0 / NULLIF(COUNT(DISTINCT stat_date), 0)",
+    "formula": "Σ(good_qty + defect_qty) / 去重统计日数（与内置「产量」同分子口径）",
+    "description": "平均每个统计日的产量（口径：与内置「产量」同分子 good+defect，除以 COUNT(DISTINCT stat_date)；yans 基准 71130.16 件/日，统计期 2026-06-01~07-15 共 45 天）。",
+    "dims": [
+      "产线",
+      "产品",
+      "工序"
+    ],
+    "valid_from": null,
+    "valid_to": null
+  },
+  {
+    "name": "平均工单计划量",
+    "aliases": [
+      "平均计划量",
+      "工单平均计划产量",
+      "平均每单计划量",
+      "单均计划量",
+      "平均每张工单计划生产多少"
+    ],
+    "unit": "件",
+    "tables": [
+      "mes_work_order"
+    ],
+    "sql_expression": "AVG(plan_qty)",
+    "formula": "AVG(plan_qty)",
+    "description": "单张工单的平均计划产量（口径：mes_work_order.plan_qty 简单平均；yans 基准 1281.40 件/单，工单共 344 张）。",
+    "dims": [
+      "产线",
+      "产品"
+    ],
+    "valid_from": null,
+    "valid_to": null
+  },
+  {
+    "name": "工单完成率",
+    "aliases": [
+      "工单完成比例",
+      "完成工单占比",
+      "工单完工率"
+    ],
+    "unit": "%",
+    "tables": [
+      "mes_work_order"
+    ],
+    "sql_expression": "SUM(CASE WHEN order_status = 'completed' THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0)",
+    "formula": "已完成工单数 / 工单总数 × 100%",
+    "exec_sql": "SELECT SUM(CASE WHEN order_status = 'completed' THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0) AS \"工单完成率\" FROM mes_work_order",
+    "exec_sql_by_dim": "SELECT {dim} AS \"维度\", SUM(CASE WHEN order_status = 'completed' THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0) AS \"工单完成率\" FROM mes_work_order GROUP BY {dim} ORDER BY \"工单完成率\" DESC",
+    "description": "工单完成率（按工单张数）：order_status='completed' 的工单占全部工单的比例。yans 基准 60.17%（207/344）。与「计划达成率」不同——后者按数量算（78.31%），本口径按工单张数算。只算 completed，不含 closed，与内置「已完成工单数」保持同一分子口径。",
+    "dims": [
+      "产线",
+      "产品",
+      "日期"
+    ],
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "设备可用率",
+    "aliases": [
+      "设备开机率",
+      "可用设备占比",
+      "设备在用率"
+    ],
+    "unit": "%",
+    "tables": [
+      "dim_equipment"
+    ],
+    "sql_expression": "SUM(CASE WHEN equipment_status = 'running' THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0)",
+    "formula": "运行状态设备数 / 设备总数 × 100%",
+    "exec_sql": "SELECT SUM(CASE WHEN equipment_status = 'running' THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0) AS \"设备可用率\" FROM dim_equipment",
+    "exec_sql_by_dim": "SELECT line_id AS \"产线\", SUM(CASE WHEN equipment_status = 'running' THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0) AS \"设备可用率\" FROM dim_equipment GROUP BY line_id ORDER BY \"设备可用率\" DESC",
+    "description": "设备可用率（按设备状态）：equipment_status='running' 的设备占全部设备的比例。yans 基准 75.00%（36/48；36 运行 / 8 空闲 / 4 维护）。⚠ 这是「按状态」的可用率，**不等于 OEE 或设备利用率**——真正的利用率需要理论可用时间/计划开机时长，本库无该字段。",
+    "dims": [
+      "产线",
+      "设备类型"
+    ],
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "设备故障停机占比",
+    "aliases": [
+      "故障停机占比",
+      "设备故障率",
+      "故障停机比例",
+      "故障停机时长占比",
+      "设备故障停机比例"
+    ],
+    "unit": "%",
+    "tables": [
+      "eqp_downtime_record"
+    ],
+    "sql_expression": "SUM(CASE WHEN downtime_reason = '设备故障' THEN downtime_minutes ELSE 0 END) * 100.0 / NULLIF(SUM(downtime_minutes), 0)",
+    "formula": "设备故障停机时长 / 全部停机时长 × 100%",
+    "exec_sql": "SELECT SUM(CASE WHEN downtime_reason = '设备故障' THEN downtime_minutes ELSE 0 END) * 100.0 / NULLIF(SUM(downtime_minutes), 0) AS \"故障停机占比\" FROM eqp_downtime_record",
+    "exec_sql_by_dim": "SELECT {dim} AS \"维度\", SUM(CASE WHEN downtime_reason = '设备故障' THEN downtime_minutes ELSE 0 END) * 100.0 / NULLIF(SUM(downtime_minutes), 0) AS \"故障停机占比\" FROM eqp_downtime_record GROUP BY {dim} ORDER BY \"故障停机占比\" DESC",
+    "description": "设备故障停机占比：downtime_reason 恰为「设备故障」的停机时长占全部停机时长的比例。yans 基准 15.16%（2365/15600 分钟；设备故障 51 次）。⚠ 与「非计划停机占比」(52.72%) 是**两个不同概念**——后者含缺料等待/品质异常停线/换线调机等全部非计划原因，本口径只看「设备故障」单一原因，数值小得多（15.16% vs 52.72%），切勿互相冒充。",
+    "dims": [
+      "产线",
+      "设备",
+      "日期"
+    ],
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "检验批次合格率",
+    "aliases": [
+      "合格批占比",
+      "批合格率",
+      "批检验合格率",
+      "批次合格率",
+      "检验合格了多少批",
+      "检验合格率按批",
+      "检验批合格率",
+      "检验通过率"
+    ],
+    "unit": "%",
+    "tables": [
+      "qms_inspection"
+    ],
+    "sql_expression": "SUM(CASE WHEN inspection_result = 'pass' THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0)",
+    "formula": "合格批数 / 检验总批数 × 100%",
+    "exec_sql": "SELECT SUM(CASE WHEN inspection_result = 'pass' THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0) AS \"检验批次合格率\" FROM qms_inspection",
+    "exec_sql_by_dim": "SELECT {dim} AS \"维度\", SUM(CASE WHEN inspection_result = 'pass' THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0) AS \"检验批次合格率\" FROM qms_inspection GROUP BY {dim} ORDER BY \"检验批次合格率\" DESC",
+    "description": "检验批次合格率（按批）：inspection_result='pass' 的检验批占全部检验批的比例。yans 基准 52.54%（723/1376 批）。⚠ 与「质检合格率」(97.04%) 是**两个不同口径**——后者按抽检件数算 (sample_qty-defect_qty)/sample_qty，本口径按批次算，反映「有多少批整批合格」，通常远低于按件合格率。",
+    "dims": [
+      "工序",
+      "产品",
+      "日期"
+    ],
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "换线调机时长",
+    "aliases": [
+      "因换线调机停机多久",
+      "换型停机",
+      "换型时间",
+      "换线停机",
+      "换线调机",
+      "换线调机停机时长",
+      "换线调机多少分钟",
+      "换线调机时间"
+    ],
+    "unit": "分钟",
+    "tables": [
+      "eqp_downtime_record"
+    ],
+    "sql_expression": "SUM(CASE WHEN downtime_reason = '换线调机' THEN downtime_minutes ELSE 0 END)",
+    "formula": "Σ(停机原因=换线调机 的 downtime_minutes)",
+    "exec_sql": "SELECT SUM(CASE WHEN downtime_reason = '换线调机' THEN downtime_minutes ELSE 0 END) AS \"换线调机时长\" FROM eqp_downtime_record",
+    "exec_sql_by_dim": "SELECT {dim} AS \"维度\", SUM(CASE WHEN downtime_reason = '换线调机' THEN downtime_minutes ELSE 0 END) AS \"换线调机时长\" FROM eqp_downtime_record GROUP BY {dim} ORDER BY \"换线调机时长\" DESC",
+    "description": "换线调机停机时长：downtime_reason='换线调机' 的停机分钟数合计。yans 基准 3000 分钟（59 次，是次数最多的停机原因）。用于评估生产换型对设备可用的影响。",
+    "dims": [
+      "设备",
+      "产线",
+      "日期"
+    ],
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "缺料等待时长",
+    "aliases": [
+      "因缺料停机多久",
+      "待料停机",
+      "待料时长",
+      "等料时间",
+      "缺料停机",
+      "缺料停机时长",
+      "缺料等待",
+      "缺料等待时间"
+    ],
+    "unit": "分钟",
+    "tables": [
+      "eqp_downtime_record"
+    ],
+    "sql_expression": "SUM(CASE WHEN downtime_reason = '缺料等待' THEN downtime_minutes ELSE 0 END)",
+    "formula": "Σ(停机原因=缺料等待 的 downtime_minutes)",
+    "exec_sql": "SELECT SUM(CASE WHEN downtime_reason = '缺料等待' THEN downtime_minutes ELSE 0 END) AS \"缺料等待时长\" FROM eqp_downtime_record",
+    "exec_sql_by_dim": "SELECT {dim} AS \"维度\", SUM(CASE WHEN downtime_reason = '缺料等待' THEN downtime_minutes ELSE 0 END) AS \"缺料等待时长\" FROM eqp_downtime_record GROUP BY {dim} ORDER BY \"缺料等待时长\" DESC",
+    "description": "缺料等待停机时长：downtime_reason='缺料等待' 的停机分钟数合计。yans 基准 1920 分钟（45 次）。反映物料供应不及时造成的产线等待损失。",
+    "dims": [
+      "设备",
+      "产线",
+      "日期"
+    ],
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "品质异常停线时长",
+    "aliases": [
+      "品质异常停机",
+      "品质异常停机时长",
+      "品质异常停线",
+      "品质异常停线时间",
+      "因品质异常停线多久",
+      "质量停线",
+      "质量异常停线时长"
+    ],
+    "unit": "分钟",
+    "tables": [
+      "eqp_downtime_record"
+    ],
+    "sql_expression": "SUM(CASE WHEN downtime_reason = '品质异常停线' THEN downtime_minutes ELSE 0 END)",
+    "formula": "Σ(停机原因=品质异常停线 的 downtime_minutes)",
+    "exec_sql": "SELECT SUM(CASE WHEN downtime_reason = '品质异常停线' THEN downtime_minutes ELSE 0 END) AS \"品质异常停线时长\" FROM eqp_downtime_record",
+    "exec_sql_by_dim": "SELECT {dim} AS \"维度\", SUM(CASE WHEN downtime_reason = '品质异常停线' THEN downtime_minutes ELSE 0 END) AS \"品质异常停线时长\" FROM eqp_downtime_record GROUP BY {dim} ORDER BY \"品质异常停线时长\" DESC",
+    "description": "品质异常停线时长：downtime_reason='品质异常停线' 的停机分钟数合计。yans 基准 2005 分钟（40 次）。反映因质量问题导致的停线损失。",
+    "dims": [
+      "设备",
+      "产线",
+      "日期"
+    ],
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "各仓库库存量",
+    "aliases": [
+      "仓库库存",
+      "仓库库存分布",
+      "各仓库存",
+      "各仓库库存",
+      "各仓库的库存量",
+      "各仓库的库存",
+      "按仓库的库存",
+      "每个仓库库存",
+      "每个仓库库存多少"
+    ],
+    "unit": "件",
+    "tables": [
+      "inv_inventory_snapshot"
+    ],
+    "sql_expression": "SUM(available_qty + frozen_qty) FILTER (WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot))",
+    "formula": "Σ(可用数量 + 冻结数量)，按仓库分组",
+    "exec_sql": "SELECT warehouse_code AS \"仓库\", SUM(available_qty + frozen_qty) AS \"库存量\" FROM inv_inventory_snapshot WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) GROUP BY warehouse_code ORDER BY \"库存量\" DESC",
+    "exec_sql_by_dim": {
+      "仓库": "SELECT warehouse_code AS \"仓库\", SUM(available_qty + frozen_qty) AS \"库存量\" FROM inv_inventory_snapshot WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) GROUP BY warehouse_code ORDER BY \"库存量\" DESC"
+    },
+    "description": "各仓库库存量（最新快照日）：按 warehouse_code 汇总可用+冻结库存。yans 基准（最新快照日）WH-A 43187 / WH-B 21000 / WH-QA 9594 件。⚠ 口径是「最新快照日」而非全历史求和——inv_inventory_snapshot 是每日快照，直接 SUM 会重复累加。",
+    "dims": [
+      "仓库"
+    ],
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "未完工工单数",
+    "aliases": [
+      "在制单",
+      "未完工单",
+      "未完工工单",
+      "未完成的工单",
+      "未结工单数",
+      "没做完的工单",
+      "已下达未完工单",
+      "未完结工单"
+    ],
+    "unit": "单",
+    "tables": [
+      "mes_work_order"
+    ],
+    "sql_expression": "SUM(CASE WHEN order_status IN ('released','in_progress') THEN 1 ELSE 0 END)",
+    "formula": "Σ(状态=已下达/进行中 的工单)",
+    "exec_sql": "SELECT SUM(CASE WHEN order_status IN ('released','in_progress') THEN 1 ELSE 0 END) AS \"未完工工单数\" FROM mes_work_order",
+    "exec_sql_by_dim": "SELECT {dim} AS \"维度\", SUM(CASE WHEN order_status IN ('released','in_progress') THEN 1 ELSE 0 END) AS \"未完工工单数\" FROM mes_work_order GROUP BY {dim} ORDER BY \"未完工工单数\" DESC",
+    "description": "未完工工单数：order_status 为 released（已下达）或 in_progress（进行中）的工单张数。yans 基准 65 单（released 32 + in_progress 33）。工单状态四态互斥且合计=总工单：completed(已完成 207) + closed(已取消/已关闭 72) + in_progress(33) + released(32) = 344。本口径 = released + in_progress，与「已完成工单数」「已取消工单数」互补，三者相加等于工单总数。",
+    "dims": [
+      "产线",
+      "产品"
+    ],
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "缺货品种数",
+    "aliases": [
+      "缺货品种",
+      "缺货产品",
+      "缺货的产品",
+      "产品缺货",
+      "缺货的品种",
+      "低于安全库存的品种",
+      "低于安全库存品种数",
+      "缺货产品数",
+      "哪些产品缺货",
+      "低于安全库存的产品",
+      "哪些产品低于安全库存"
+    ],
+    "unit": "种",
+    "tables": [
+      "inv_inventory_snapshot"
+    ],
+    "sql_expression": "COUNT(DISTINCT CASE WHEN snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) AND available_qty < safety_stock_qty THEN product_id END)",
+    "formula": "最新快照日 available_qty < safety_stock_qty 的去重产品数",
+    "description": "缺货（低于安全库存）的产品品种数（口径：取最新快照日，available_qty < safety_stock_qty 的产品去重计数；yans 实测 2026-09-15 最新快照 20 个品种全部达标，缺货品种数 = 0）。与「满足安全库存品种数」互补，两者相加 = 最新快照覆盖品种数（20）。⚠️ 问「缺了多少件」是「库存缺口量」（件数口径），问「几种产品缺货」才是本口径，两者量纲不同禁止互相冒充。",
+    "dims": [
+      "仓库",
+      "产品"
+    ],
+    "exec_sql": "SELECT COUNT(DISTINCT product_id) AS \"缺货品种数\" FROM inv_inventory_snapshot WHERE snapshot_date=(SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) AND available_qty < safety_stock_qty",
+    "exec_sql_by_dim": {
+      "_default": "SELECT COUNT(DISTINCT product_id) AS \"缺货品种数\" FROM inv_inventory_snapshot WHERE snapshot_date=(SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) AND available_qty < safety_stock_qty",
+      "仓库": "SELECT warehouse_code AS \"仓库\", COUNT(DISTINCT product_id) AS \"缺货品种数\" FROM inv_inventory_snapshot WHERE snapshot_date=(SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) AND available_qty < safety_stock_qty GROUP BY warehouse_code ORDER BY \"缺货品种数\" DESC",
+      "产品": "SELECT p.product_name AS \"产品\", i.available_qty AS \"可用库存\", i.safety_stock_qty AS \"安全库存\", (i.safety_stock_qty - i.available_qty) AS \"缺口\" FROM inv_inventory_snapshot i JOIN dim_product p ON p.product_id=i.product_id WHERE i.snapshot_date=(SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) AND i.available_qty < i.safety_stock_qty ORDER BY \"缺口\" DESC"
+    },
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "安全库存达标率",
+    "aliases": [
+      "安全库存达标率",
+      "库存达标率",
+      "安全库存满足率",
+      "安全库存达标比例",
+      "安全库存达标率是多少",
+      "多少产品达标"
+    ],
+    "unit": "%",
+    "tables": [
+      "inv_inventory_snapshot"
+    ],
+    "sql_expression": "COUNT(DISTINCT CASE WHEN snapshot_date=(SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) AND available_qty >= safety_stock_qty THEN product_id END) * 100.0 / NULLIF(COUNT(DISTINCT CASE WHEN snapshot_date=(SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) THEN product_id END),0)",
+    "formula": "最新快照日达标品种数 / 最新快照覆盖品种数 × 100%",
+    "description": "安全库存达标率（按品种数算）：最新快照日 available_qty >= safety_stock_qty 的品种，占该快照覆盖品种数的比例。yans 实测 2026-09-15 最新快照 20/20 = 100.00%。⚠️ 与「计划达成率」（按产量件数算，78.31%）完全不同，切勿互相冒充；本口径只回答「有几个品种够不够」，不回答「缺多少件」（那是「库存缺口量」）。",
+    "dims": [
+      "仓库"
+    ],
+    "exec_sql": "SELECT ROUND(COUNT(DISTINCT CASE WHEN i.available_qty >= i.safety_stock_qty THEN i.product_id END)*100.0/NULLIF(COUNT(DISTINCT i.product_id),0),2) AS \"安全库存达标率\" FROM inv_inventory_snapshot i WHERE i.snapshot_date=(SELECT MAX(snapshot_date) FROM inv_inventory_snapshot)",
+    "exec_sql_by_dim": {
+      "_default": "SELECT ROUND(COUNT(DISTINCT CASE WHEN i.available_qty >= i.safety_stock_qty THEN i.product_id END)*100.0/NULLIF(COUNT(DISTINCT i.product_id),0),2) AS \"安全库存达标率\" FROM inv_inventory_snapshot i WHERE i.snapshot_date=(SELECT MAX(snapshot_date) FROM inv_inventory_snapshot)",
+      "仓库": "SELECT i.warehouse_code AS \"仓库\", ROUND(COUNT(DISTINCT CASE WHEN i.available_qty >= i.safety_stock_qty THEN i.product_id END)*100.0/NULLIF(COUNT(DISTINCT i.product_id),0),2) AS \"安全库存达标率\" FROM inv_inventory_snapshot i WHERE i.snapshot_date=(SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) GROUP BY i.warehouse_code ORDER BY \"安全库存达标率\" DESC"
+    },
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "平均修复时长(MTTR)",
+    "aliases": [
+      "平均修复时长",
+      "平均修复时间",
+      "MTTR",
+      "mttr",
+      "平均故障修复时长",
+      "故障平均修复时长",
+      "平均维修时长",
+      "平均修复时长是多少",
+      "修复一次平均多久"
+    ],
+    "unit": "分钟",
+    "tables": [
+      "eqp_downtime_record"
+    ],
+    "sql_expression": "SUM(CASE WHEN is_planned = FALSE THEN downtime_minutes ELSE 0 END) * 1.0 / NULLIF(SUM(CASE WHEN is_planned = FALSE THEN 1 ELSE 0 END), 0)",
+    "formula": "非计划停机时长 / 非计划停机次数（即每次非计划停机的平均修复耗时）",
+    "description": "平均修复时长 MTTR（口径：eqp_downtime_record 中 is_planned=FALSE 的停机分钟合计 ÷ 非计划停机次数；yans 实测 8225 ÷ 184 = 44.70 分钟/次）。⚠️ 与内置「平均停机时长」（全部 336 次停机平均 46.43 分钟）不是同一指标——后者含计划内停机（换线调机/计划保养/工装更换），本口径只算非计划（故障类）。",
+    "dims": [
+      "设备",
+      "产线",
+      "停机原因"
+    ],
+    "exec_sql": "SELECT ROUND(SUM(CASE WHEN is_planned=FALSE THEN downtime_minutes ELSE 0 END)::numeric/NULLIF(SUM(CASE WHEN is_planned=FALSE THEN 1 ELSE 0 END),0),2) AS \"平均修复时长\" FROM eqp_downtime_record",
+    "exec_sql_by_dim": {
+      "产线": "SELECT l.line_name AS \"产线\", ROUND(SUM(CASE WHEN d.is_planned=FALSE THEN d.downtime_minutes ELSE 0 END)::numeric/NULLIF(SUM(CASE WHEN d.is_planned=FALSE THEN 1 ELSE 0 END),0),2) AS \"平均修复时长\" FROM eqp_downtime_record d JOIN dim_production_line l ON l.line_id=d.line_id GROUP BY l.line_name ORDER BY \"平均修复时长\" DESC",
+      "设备": "SELECT e.equipment_name AS \"设备\", ROUND(SUM(CASE WHEN d.is_planned=FALSE THEN d.downtime_minutes ELSE 0 END)::numeric/NULLIF(SUM(CASE WHEN d.is_planned=FALSE THEN 1 ELSE 0 END),0),2) AS \"平均修复时长\" FROM eqp_downtime_record d JOIN dim_equipment e ON e.equipment_id=d.equipment_id GROUP BY e.equipment_name ORDER BY \"平均修复时长\" DESC"
+    },
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "设备故障次数",
+    "aliases": [
+      "设备故障次数",
+      "设备故障有多少次",
+      "设备故障了几次",
+      "设备故障几次",
+      "设备出故障几次",
+      "发生故障多少次",
+      "设备发生故障次数",
+      "故障发生次数"
+    ],
+    "unit": "次",
+    "tables": [
+      "eqp_downtime_record"
+    ],
+    "sql_expression": "SUM(CASE WHEN downtime_reason = '设备故障' THEN 1 ELSE 0 END)",
+    "formula": "Σ(停机原因 = 设备故障 的记录数)",
+    "description": "设备故障停机次数（口径：eqp_downtime_record 中 downtime_reason='设备故障' 的记录数；yans 实测 51 次，对应停机时长 2365 分钟，是 7 种停机原因里非计划类次数最多的一种）。⚠️ 与内置「非计划停机次数」（is_planned=FALSE 共 184 次）不同——后者含程序调试/缺料等待/品质异常停线等全部非计划原因；本口径只看「设备故障」这一个原因。",
+    "dims": [
+      "设备",
+      "产线",
+      "日期"
+    ],
+    "exec_sql": "SELECT COUNT(*) AS \"设备故障次数\" FROM eqp_downtime_record WHERE downtime_reason='设备故障'",
+    "exec_sql_by_dim": {
+      "产线": "SELECT l.line_name AS \"产线\", COUNT(*) AS \"设备故障次数\" FROM eqp_downtime_record d JOIN dim_production_line l ON l.line_id=d.line_id WHERE d.downtime_reason='设备故障' GROUP BY l.line_name ORDER BY \"设备故障次数\" DESC",
+      "设备": "SELECT e.equipment_name AS \"设备\", COUNT(*) AS \"设备故障次数\" FROM eqp_downtime_record d JOIN dim_equipment e ON e.equipment_id=d.equipment_id WHERE d.downtime_reason='设备故障' GROUP BY e.equipment_name ORDER BY \"设备故障次数\" DESC"
+    },
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "保养停机时长",
+    "aliases": [
+      "保养停机时长",
+      "保养停机",
+      "保养停机多久",
+      "因保养停机多久",
+      "保养停机多少分钟",
+      "设备保养时长",
+      "保养用了多久",
+      "因计划保养停机多久"
+    ],
+    "unit": "分钟",
+    "tables": [
+      "eqp_downtime_record"
+    ],
+    "sql_expression": "SUM(CASE WHEN downtime_reason = '计划保养' THEN downtime_minutes ELSE 0 END)",
+    "formula": "Σ(停机原因=计划保养 的 downtime_minutes)",
+    "description": "计划保养停机时长（口径：eqp_downtime_record 中 downtime_reason='计划保养' 的停机分钟合计；yans 实测 2585 分钟 / 54 次，是计划内停机里时长第二的原因，仅次于换线调机 3000 分钟）。⚠️ 与内置「计划内停机时长」（is_planned=TRUE 全部原因合计 7375 分钟 = 换线调机 3000 + 计划保养 2585 + 工装更换 1790）是包含关系——本口径只取「计划保养」单一原因。问「计划保养时长」会命中内置口径（7375 分钟），要看单一原因请用本口径。",
+    "dims": [
+      "设备",
+      "产线",
+      "日期"
+    ],
+    "exec_sql": "SELECT SUM(CASE WHEN downtime_reason='计划保养' THEN downtime_minutes ELSE 0 END) AS \"保养停机时长\" FROM eqp_downtime_record",
+    "exec_sql_by_dim": {
+      "产线": "SELECT l.line_name AS \"产线\", SUM(CASE WHEN d.downtime_reason='计划保养' THEN d.downtime_minutes ELSE 0 END) AS \"保养停机时长\" FROM eqp_downtime_record d JOIN dim_production_line l ON l.line_id=d.line_id GROUP BY l.line_name ORDER BY \"保养停机时长\" DESC",
+      "设备": "SELECT e.equipment_name AS \"设备\", SUM(CASE WHEN d.downtime_reason='计划保养' THEN d.downtime_minutes ELSE 0 END) AS \"保养停机时长\" FROM eqp_downtime_record d JOIN dim_equipment e ON e.equipment_id=d.equipment_id GROUP BY e.equipment_name ORDER BY \"保养停机时长\" DESC"
+    },
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "程序调试时长",
+    "aliases": [
+      "程序调试时长",
+      "程序调试多久",
+      "调试停机时长",
+      "调试停机多久",
+      "因程序调试停机多久",
+      "程序调试停机时长",
+      "调试停机多少分钟"
+    ],
+    "unit": "分钟",
+    "tables": [
+      "eqp_downtime_record"
+    ],
+    "sql_expression": "SUM(CASE WHEN downtime_reason = '程序调试' THEN downtime_minutes ELSE 0 END)",
+    "formula": "Σ(停机原因=程序调试 的 downtime_minutes)",
+    "description": "程序调试停机时长（口径：eqp_downtime_record 中 downtime_reason='程序调试' 的停机分钟合计；yans 实测 1935 分钟 / 48 次，属非计划停机）。与已登记的「换线调机时长」「缺料等待时长」「品质异常停线时长」「保养停机时长」「工装更换时长」同为「按停机原因拆分时长」的同族口径，七种原因时长合计 = 全部停机时长 15600 分钟。",
+    "dims": [
+      "设备",
+      "产线",
+      "日期"
+    ],
+    "exec_sql": "SELECT SUM(CASE WHEN downtime_reason='程序调试' THEN downtime_minutes ELSE 0 END) AS \"程序调试时长\" FROM eqp_downtime_record",
+    "exec_sql_by_dim": {
+      "产线": "SELECT l.line_name AS \"产线\", SUM(CASE WHEN d.downtime_reason='程序调试' THEN d.downtime_minutes ELSE 0 END) AS \"程序调试时长\" FROM eqp_downtime_record d JOIN dim_production_line l ON l.line_id=d.line_id GROUP BY l.line_name ORDER BY \"程序调试时长\" DESC",
+      "设备": "SELECT e.equipment_name AS \"设备\", SUM(CASE WHEN d.downtime_reason='程序调试' THEN d.downtime_minutes ELSE 0 END) AS \"程序调试时长\" FROM eqp_downtime_record d JOIN dim_equipment e ON e.equipment_id=d.equipment_id GROUP BY e.equipment_name ORDER BY \"程序调试时长\" DESC"
+    },
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "工装更换时长",
+    "aliases": [
+      "工装更换时长",
+      "换工装时长",
+      "工装更换停机时长",
+      "换工装停机多久",
+      "因工装更换停机多久",
+      "换工装停机时长",
+      "工装更换多久"
+    ],
+    "unit": "分钟",
+    "tables": [
+      "eqp_downtime_record"
+    ],
+    "sql_expression": "SUM(CASE WHEN downtime_reason = '工装更换' THEN downtime_minutes ELSE 0 END)",
+    "formula": "Σ(停机原因=工装更换 的 downtime_minutes)",
+    "description": "工装更换停机时长（口径：eqp_downtime_record 中 downtime_reason='工装更换' 的停机分钟合计；yans 实测 1790 分钟 / 39 次，属计划内停机，是七种原因中时长最短的一种）。与「换线调机时长」（3000 分钟 / 59 次）是不同的停机原因，勿合并计算。",
+    "dims": [
+      "设备",
+      "产线",
+      "日期"
+    ],
+    "exec_sql": "SELECT SUM(CASE WHEN downtime_reason='工装更换' THEN downtime_minutes ELSE 0 END) AS \"工装更换时长\" FROM eqp_downtime_record",
+    "exec_sql_by_dim": {
+      "产线": "SELECT l.line_name AS \"产线\", SUM(CASE WHEN d.downtime_reason='工装更换' THEN d.downtime_minutes ELSE 0 END) AS \"工装更换时长\" FROM eqp_downtime_record d JOIN dim_production_line l ON l.line_id=d.line_id GROUP BY l.line_name ORDER BY \"工装更换时长\" DESC",
+      "设备": "SELECT e.equipment_name AS \"设备\", SUM(CASE WHEN d.downtime_reason='工装更换' THEN d.downtime_minutes ELSE 0 END) AS \"工装更换时长\" FROM eqp_downtime_record d JOIN dim_equipment e ON e.equipment_id=d.equipment_id GROUP BY e.equipment_name ORDER BY \"工装更换时长\" DESC"
+    },
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "低于标准良率工序数",
+    "aliases": [
+      "低于标准良率工序数",
+      "低于标准良率",
+      "良率未达标工序数",
+      "未达标准良率的工序",
+      "没有达到标准良率",
+      "哪些工序良率不达标",
+      "良率不达标",
+      "良率达标",
+      "不达标工序数",
+      "良率低于标准",
+      "有几道工序没有达到标准良率",
+      "有几道工序良率不达标",
+      "良率未达标的工序"
+    ],
+    "unit": "道",
+    "tables": [
+      "mes_process_output",
+      "dim_process"
+    ],
+    "sql_expression": "",
+    "formula": "按工序比对：实际良率 = good_qty / input_qty；标准良率 = dim_process.standard_yield_rate（存储为小数，×100 归一为百分数）；实际 < 标准 即未达标，统计未达标工序道数",
+    "description": "实际良率低于该工序标准良率的工序道数（口径：先按 process_id 分组算实际良率 good_qty/input_qty，再与 dim_process.standard_yield_rate×100 比较，实际 < 标准 计为未达标）。yans 实测共 8 道工序：未达标 6 道（功能测试 95.80<96.50 / 老化测试 96.20<96.80 / 波峰焊 96.57<97.00 / 插件装配 97.11<97.50 / 回流焊 97.94<98.20 / SMT贴片 98.28<98.50），达标 2 道（AOI检测 99.19≥99.00 / 包装入库 99.21≥99.20）。⚠️ 与内置「标准良率」（取各工序标准值的 MAX = 99.20%）不是同一指标，也与内置「良率」（全厂 97.56%）不同——本口径是「工序达标情况」的计数。",
+    "dims": [],
+    "exec_sql": "WITH x AS (SELECT p.process_id, SUM(f.good_qty)*100.0/NULLIF(SUM(f.input_qty),0) AS act, p.standard_yield_rate*100 AS std FROM mes_process_output f JOIN dim_process p ON f.process_id=p.process_id GROUP BY p.process_id, p.standard_yield_rate) SELECT COUNT(*) FILTER (WHERE act < std) AS \"低于标准良率工序数\", COUNT(*) FILTER (WHERE act >= std) AS \"达标工序数\", COUNT(*) AS \"总工序数\" FROM x",
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "平均生产周期",
+    "aliases": [
+      "平均生产周期",
+      "生产周期",
+      "工单平均生产周期",
+      "平均生产周期是多少天",
+      "工单生产周期",
+      "生产周期多长",
+      "平均周期天数",
+      "每张工单平均生产多久"
+    ],
+    "unit": "天",
+    "tables": [
+      "mes_work_order"
+    ],
+    "sql_expression": "AVG(end_date - start_date)",
+    "formula": "AVG(end_date − start_date)，单位天（PostgreSQL 中 date 相减得整数天）",
+    "description": "工单平均生产周期（口径：mes_work_order 的 end_date − start_date 取平均，单位天；yans 实测 0.91 天，区间 0~3 天：0 天 135 单 / 1 天 109 单 / 2 天 96 单 / 3 天 4 单，344 张工单的 start_date 与 end_date 均非空）。⚠️ 本口径按「工单表日期差」算，不是工序实际耗时（mes_process_output 无起止时刻，无法算工序级周期）。",
+    "dims": [
+      "产线",
+      "产品",
+      "日期"
+    ],
+    "exec_sql": "SELECT ROUND(AVG(end_date - start_date),2) AS \"平均生产周期\" FROM mes_work_order",
+    "exec_sql_by_dim": {
+      "产线": "SELECT l.line_name AS \"产线\", ROUND(AVG(w.end_date - w.start_date),2) AS \"平均生产周期\" FROM mes_work_order w JOIN dim_production_line l ON l.line_id=w.line_id GROUP BY l.line_name ORDER BY \"平均生产周期\" DESC",
+      "产品": "SELECT p.product_name AS \"产品\", ROUND(AVG(w.end_date - w.start_date),2) AS \"平均生产周期\" FROM mes_work_order w JOIN dim_product p ON p.product_id=w.product_id GROUP BY p.product_name ORDER BY \"平均生产周期\" DESC"
+    },
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "工序良率",
+    "aliases": [
+      "工序良率",
+      "良率",
+      "各工序良率",
+      "工序合格率",
+      "各工序的良率"
+    ],
+    "unit": "%",
+    "tables": [
+      "mes_process_output"
+    ],
+    "sql_expression": "SUM(good_qty) * 100.0 / NULLIF(SUM(input_qty), 0)",
+    "formula": "Σ(good_qty) / Σ(input_qty) × 100%",
+    "description": "工序良率（口径：Σgood_qty / Σinput_qty × 100%；yans 基准 97.56%，md 第5节权威定义）。⚠️ 与「一次直通率」FPY=(input-rework)/input 不同（良率含返工件）；与「低于标准良率工序数」也不同（本口径是比率，后者是未达标工序计数）。",
+    "dims": [
+      "产线",
+      "车间",
+      "工序",
+      "产品",
+      "班次",
+      "日期"
+    ],
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "工序不良率",
+    "aliases": [
+      "工序不良率",
+      "不良率",
+      "各工序不良率",
+      "工序不良品率"
+    ],
+    "unit": "%",
+    "tables": [
+      "mes_process_output"
+    ],
+    "sql_expression": "SUM(defect_qty) * 100.0 / NULLIF(SUM(input_qty), 0)",
+    "formula": "Σ(defect_qty) / Σ(input_qty) × 100%",
+    "description": "工序不良率（口径：Σdefect_qty / Σinput_qty × 100%；yans 基准 2.88%，md 第5节权威定义）。",
+    "dims": [
+      "产线",
+      "车间",
+      "工序",
+      "产品",
+      "班次",
+      "日期"
+    ],
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "抽检不良率",
+    "aliases": [
+      "抽检不良率",
+      "抽检不合格率",
+      "检验不良率",
+      "抽检不良比例",
+      "抽检不良品率"
+    ],
+    "unit": "%",
+    "tables": [
+      "qms_inspection"
+    ],
+    "sql_expression": "SUM(defect_qty) * 100.0 / NULLIF(SUM(sample_qty), 0)",
+    "formula": "Σ(qms_inspection.defect_qty) / Σ(qms_inspection.sample_qty) × 100%",
+    "description": "抽检不良率（口径：Σqms_inspection.defect_qty / Σqms_inspection.sample_qty × 100%；yans 基准 2.96%，md 第5节权威定义）。⚠️ 来源表是 qms_inspection（按抽检件数），与「工序不良率」(按投入件数) 数值不同，勿混淆。",
+    "dims": [
+      "工序",
+      "产品",
+      "日期"
+    ],
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "不良类型排行",
+    "aliases": [
+      "不良类型",
+      "不良类型数",
+      "各不良类型",
+      "不良类型分布",
+      "不良类型排名",
+      "不良类型排行",
+      "各不良类型的不良数量",
+      "各产线不良类型排行",
+      "各产线的不良类型排行",
+      "各类不良数量",
+      "各缺陷类型的不良数量",
+      "缺陷类型排名",
+      "缺陷类型排行",
+      "缺陷类型数量排行"
+    ],
+    "unit": "件",
+    "tables": [
+      "qms_defect_detail"
+    ],
+    "formula": "Σ(defect_qty) 按 defect_type 分组降序（可叠加 工序 / 产线 维度）",
+    "description": "各不良类型(defect_type)的不良件数(defect_qty)汇总降序排行。数据源 qms_defect_detail（2115 条记录 / 合计 5273 件 / 共 8 类不良类型）。本口径为 exec_sql 确定性口径（生产链路中先于 try_compile 被 render_exec_sql_metric 拦截渲染，不走 LLM）：① 裸词「不良类型排行 / 缺陷类型排行 / 各不良类型的不良数量」等 → 按 defect_type 降序（默认前 10，实际 8 类全显，老化异常 719 居首）；②「各产线不良类型排行」→ 经 inspection_id→qms_inspection→work_order_id→mes_work_order→line_id 桥接 dim_production_line，返回 产线×不良类型（实测 5 条产线、2115/2115 记录 100% 可达产线）。③ 维度说明：exec_sql_by_dim 另含「工序」模板（responsible_process_id→dim_process 返回 工序×不良类型），但 render_exec_sql_metric 的维度路由当前仅识别 产线/车间/产品/日期/仓库，故「各工序不良类型排行」目前回退为整体 defect_type 排行（非按工序拆分，数据仍正确）。注意：qms_defect_detail 本身无 line_id 列，产线归属须经工单桥接，已用真实 SQL 验证通过，不再误吸为「产线不良数」。",
+    "dims": [
+      "缺陷类型",
+      "工序",
+      "产线"
+    ],
+    "exec_sql": "SELECT defect_type AS \"不良类型\", SUM(defect_qty) AS \"不良数量\" FROM qms_defect_detail GROUP BY defect_type ORDER BY 2 DESC LIMIT {limit}",
+    "exec_sql_by_dim": {
+      "_default": "SELECT defect_type AS \"不良类型\", SUM(defect_qty) AS \"不良数量\" FROM qms_defect_detail GROUP BY defect_type ORDER BY 2 DESC LIMIT {limit}",
+      "工序": "SELECT p.process_name AS \"工序\", d.defect_type AS \"不良类型\", SUM(d.defect_qty) AS \"不良数量\" FROM qms_defect_detail d JOIN dim_process p ON p.process_id = d.responsible_process_id GROUP BY p.process_name, d.defect_type ORDER BY 3 DESC LIMIT {limit}",
+      "产线": "SELECT l.line_name AS \"产线\", d.defect_type AS \"不良类型\", SUM(d.defect_qty) AS \"不良数量\" FROM qms_defect_detail d JOIN qms_inspection i ON i.inspection_id = d.inspection_id JOIN mes_work_order w ON w.work_order_id = i.work_order_id JOIN dim_production_line l ON l.line_id = w.line_id GROUP BY l.line_name, d.defect_type ORDER BY 3 DESC LIMIT {limit}"
+    },
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "各设备停机原因分布",
+    "aliases": [
+      "各设备的停机原因",
+      "各设备停机原因",
+      "各台设备的停机原因",
+      "每台设备的停机原因",
+      "各设备停机原因分布",
+      "设备停机原因分布"
+    ],
+    "unit": "分钟",
+    "tables": [
+      "eqp_downtime_record",
+      "dim_equipment"
+    ],
+    "formula": "按设备×停机原因分组，停机时长(downtime_minutes)合计降序",
+    "description": "各设备在各停机原因下的停机时长分布（口径：eqp_downtime_record.downtime_minutes 经 equipment_id→dim_equipment.equipment_name 与 downtime_reason 分组求和，按时长降序）。用于「各设备的停机原因分布」类问法；⚠️ 本口径按「停机时长(分钟)」衡量，若要按「停机次数」看分布需另说明。数据源 eqp_downtime_record 共 7 种停机原因（换线调机/计划保养/程序调试/缺料等待/品质异常停线/设备故障/工装更换）。",
+    "dims": [
+      "设备",
+      "停机原因"
+    ],
+    "exec_sql": "SELECT e.equipment_name AS \"设备\", d.downtime_reason AS \"停机原因\", SUM(d.downtime_minutes) AS \"停机时长\" FROM eqp_downtime_record d JOIN dim_equipment e ON e.equipment_id = d.equipment_id GROUP BY e.equipment_name, d.downtime_reason ORDER BY 3 DESC LIMIT {limit}",
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "各仓库产品种类数",
+    "aliases": [
+      "各仓库产品种类",
+      "各仓库的产品种类",
+      "每个仓库产品种类",
+      "每个仓库的产品种类",
+      "各仓库有多少种产品",
+      "每个仓库有多少种产品",
+      "各仓库品种数",
+      "仓库产品种类数"
+    ],
+    "unit": "种",
+    "tables": [
+      "inv_inventory_snapshot"
+    ],
+    "formula": "最新快照日按仓库分组的去重产品数 COUNT(DISTINCT product_id)",
+    "description": "各仓库存放的产品种类数（口径：取最新快照日，inv_inventory_snapshot 按 warehouse_code 分组去重 product_id）。用于「每个仓库有多少种产品」类问法；⚠️ 口径是「品种数」不是「库存件数」（后者是「各仓库库存量」）。",
+    "dims": [
+      "仓库"
+    ],
+    "exec_sql": "SELECT warehouse_code AS \"仓库\", COUNT(DISTINCT product_id) AS \"产品种类数\" FROM inv_inventory_snapshot WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) GROUP BY warehouse_code ORDER BY 2 DESC",
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
+    "name": "工单实际工序数",
+    "aliases": [
+      "实际完成工序数",
+      "各工单工序数",
+      "工单经过工序数"
+    ],
+    "unit": "道",
+    "tables": [
+      "mes_process_output"
+    ],
+    "sql_expression": "COUNT(DISTINCT process_id)",
+    "formula": "COUNT(DISTINCT process_id)",
+    "description": "按工单统计实际经过的去重工序道数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "产线产品种类数",
+    "aliases": [
+      "各产线产品种类数",
+      "产线生产产品种数",
+      "每条产线生产多少种产品"
+    ],
+    "unit": "种",
+    "tables": [
+      "mes_process_output"
+    ],
+    "sql_expression": "COUNT(DISTINCT product_id)",
+    "formula": "COUNT(DISTINCT product_id)",
+    "description": "每条产线实际生产过的去重产品数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "设备平均服役天数",
+    "aliases": [
+      "平均服役天数",
+      "设备服役时长"
+    ],
+    "unit": "天",
+    "tables": [
+      "dim_equipment"
+    ],
+    "sql_expression": "AVG(CURRENT_DATE - install_date)",
+    "formula": "AVG(CURRENT_DATE - install_date)",
+    "description": "设备自安装日期至今的平均天数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "不合格批次数",
+    "aliases": [
+      "不合格检验批次数",
+      "检验不合格批数"
+    ],
+    "unit": "批",
+    "tables": [
+      "qms_inspection"
+    ],
+    "sql_expression": "SUM(CASE WHEN inspection_result = 'fail' THEN 1 ELSE 0 END)",
+    "formula": "SUM(CASE WHEN inspection_result = 'fail' THEN 1 ELSE 0 END)",
+    "description": "检验结论(inspection_result)为 fail 的批次数量",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "未启用产品数",
+    "aliases": [
+      "停用产品数",
+      "非在售产品数",
+      "未启用数量"
+    ],
+    "unit": "个",
+    "tables": [
+      "dim_product"
+    ],
+    "sql_expression": "SUM(CASE WHEN is_active = FALSE THEN 1 ELSE 0 END)",
+    "formula": "SUM(CASE WHEN is_active = FALSE THEN 1 ELSE 0 END)",
+    "description": "未启用(is_active=false)的产品数量",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "库存快照天数",
+    "aliases": [
+      "各产品库存快照天数",
+      "库存记录天数"
+    ],
+    "unit": "天",
+    "tables": [
+      "inv_inventory_snapshot"
+    ],
+    "sql_expression": "COUNT(DISTINCT snapshot_date)",
+    "formula": "COUNT(DISTINCT snapshot_date)",
+    "description": "每个产品有库存快照记录的去重天数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "无停机记录设备数",
+    "aliases": [
+      "没有停机记录的设备台数",
+      "从未停机的设备数"
+    ],
+    "unit": "台",
+    "tables": [
+      "dim_equipment"
+    ],
+    "sql_expression": "SUM(CASE WHEN equipment_id NOT IN (SELECT DISTINCT equipment_id FROM eqp_downtime_record) THEN 1 ELSE 0 END)",
+    "formula": "SUM(CASE WHEN equipment_id NOT IN (SELECT DISTINCT equipment_id FROM eqp_downtime_record) THEN 1 ELSE 0 END)",
+    "description": "从未发生停机的设备台数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "最近停机距今天数",
+    "aliases": [
+      "最近一次停机几天前",
+      "距最近停机多少天"
+    ],
+    "unit": "天",
+    "tables": [
+      "eqp_downtime_record"
+    ],
+    "sql_expression": "MAX(CURRENT_DATE - CAST(start_time AS DATE))",
+    "formula": "MAX(CURRENT_DATE - CAST(start_time AS DATE))",
+    "description": "最近一次停机发生至今的天数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "最近检验距今天数",
+    "aliases": [
+      "最后一次检验距今天数",
+      "最近一次检验是多久前"
+    ],
+    "unit": "天",
+    "tables": [
+      "qms_inspection"
+    ],
+    "sql_expression": "MAX(CURRENT_DATE - inspection_date)",
+    "formula": "MAX(CURRENT_DATE - inspection_date)",
+    "description": "最近一次检验发生至今的天数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "首次产出日期",
+    "aliases": [
+      "第一次产出日期",
+      "首次产出时间"
+    ],
+    "unit": "",
+    "tables": [
+      "mes_process_output"
+    ],
+    "sql_expression": "MIN(stat_date)",
+    "formula": "MIN(stat_date)",
+    "description": "最早的产出统计日期",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "最近产出日期",
+    "aliases": [
+      "末次产出日期",
+      "最后一次产出时间"
+    ],
+    "unit": "",
+    "tables": [
+      "mes_process_output"
+    ],
+    "sql_expression": "MAX(stat_date)",
+    "formula": "MAX(stat_date)",
+    "description": "最新的产出统计日期",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "抽检合格数量",
+    "aliases": [
+      "抽检合格件数",
+      "检验合格数量"
+    ],
+    "unit": "件",
+    "tables": [
+      "qms_inspection"
+    ],
+    "sql_expression": "SUM(sample_qty - defect_qty)",
+    "formula": "SUM(sample_qty - defect_qty)",
+    "description": "抽检数量减去缺陷数量后的合格件数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "运行中产线数",
+    "aliases": [
+      "运行中的产线条数"
+    ],
+    "unit": "条",
+    "tables": [
+      "dim_production_line"
+    ],
+    "sql_expression": "SUM(CASE WHEN line_status = 'running' THEN 1 ELSE 0 END)",
+    "formula": "SUM(CASE WHEN line_status = 'running' THEN 1 ELSE 0 END)",
+    "description": "状态为运行中(running)的产线条数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "男员工人数",
+    "aliases": [
+      "男性员工数",
+      "男员工数量"
+    ],
+    "unit": "人",
+    "tables": [
+      "factory.employee"
+    ],
+    "sql_expression": "SUM(CASE WHEN gender ILIKE '%男%' OR gender = 'M' THEN 1 ELSE 0 END)",
+    "formula": "SUM(CASE WHEN gender ILIKE '%男%' OR gender = 'M' THEN 1 ELSE 0 END)",
+    "description": "性别为男的在职员工人数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "女员工人数",
+    "aliases": [
+      "女性员工数",
+      "女员工数量"
+    ],
+    "unit": "人",
+    "tables": [
+      "factory.employee"
+    ],
+    "sql_expression": "SUM(CASE WHEN gender ILIKE '%女%' OR gender = 'F' THEN 1 ELSE 0 END)",
+    "formula": "SUM(CASE WHEN gender ILIKE '%女%' OR gender = 'F' THEN 1 ELSE 0 END)",
+    "description": "性别为女的在职员工人数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "高学历员工数",
+    "aliases": [
+      "本科及以上员工数",
+      "高学历人数"
+    ],
+    "unit": "人",
+    "tables": [
+      "factory.employee"
+    ],
+    "sql_expression": "SUM(CASE WHEN education IN ('本科', '硕士', '博士') THEN 1 ELSE 0 END)",
+    "formula": "SUM(CASE WHEN education IN ('本科', '硕士', '博士') THEN 1 ELSE 0 END)",
+    "description": "本科及以上学历的员工人数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "高学历员工占比",
+    "aliases": [
+      "本科及以上占比",
+      "高学历比例"
+    ],
+    "unit": "%",
+    "tables": [
+      "factory.employee"
+    ],
+    "sql_expression": "SUM(CASE WHEN education IN ('本科', '硕士', '博士') THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0)",
+    "formula": "SUM(CASE WHEN education IN ('本科', '硕士', '博士') THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0)",
+    "description": "本科及以上学历员工占全部员工的百分比",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "平均薪资",
+    "aliases": [
+      "员工平均工资",
+      "平均工资"
+    ],
+    "unit": "元",
+    "tables": [
+      "factory.employee"
+    ],
+    "sql_expression": "AVG(salary)",
+    "formula": "AVG(salary)",
+    "description": "员工薪资的平均值",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "生产记录条数",
+    "aliases": [
+      "生产记录数",
+      "生产记录总数"
+    ],
+    "unit": "条",
+    "tables": [
+      "factory.production_record"
+    ],
+    "sql_expression": "COUNT(id)",
+    "formula": "COUNT(id)",
+    "description": "生产记录的条数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "有不良的生产记录数",
+    "aliases": [
+      "不良生产记录条数",
+      "出现不良的生产记录数"
+    ],
+    "unit": "条",
+    "tables": [
+      "factory.production_record"
+    ],
+    "sql_expression": "SUM(CASE WHEN qty_defect > 0 THEN 1 ELSE 0 END)",
+    "formula": "SUM(CASE WHEN qty_defect > 0 THEN 1 ELSE 0 END)",
+    "description": "不良数量大于 0 的生产记录条数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "维护记录数",
+    "aliases": [
+      "维护次数",
+      "设备维护记录数"
+    ],
+    "unit": "条",
+    "tables": [
+      "factory.equipment_maintenance"
+    ],
+    "sql_expression": "COUNT(id)",
+    "formula": "COUNT(id)",
+    "description": "设备维护记录的条数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "平均维护费用",
+    "aliases": [
+      "次均维护费用",
+      "平均每次维护费用"
+    ],
+    "unit": "元",
+    "tables": [
+      "factory.equipment_maintenance"
+    ],
+    "sql_expression": "AVG(cost)",
+    "formula": "AVG(cost)",
+    "description": "平均每次维护的费用",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "平均维护停机时长",
+    "aliases": [
+      "维护平均停机小时",
+      "平均维护停机时间"
+    ],
+    "unit": "小时",
+    "tables": [
+      "factory.equipment_maintenance"
+    ],
+    "sql_expression": "AVG(downtime_hours)",
+    "formula": "AVG(downtime_hours)",
+    "description": "平均每次维护的停机小时数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "采购订单数",
+    "aliases": [
+      "采购单数量",
+      "采购订单总数"
+    ],
+    "unit": "单",
+    "tables": [
+      "factory.purchase_order"
+    ],
+    "sql_expression": "COUNT(id)",
+    "formula": "COUNT(id)",
+    "description": "采购订单的数量",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "平均采购订单金额",
+    "aliases": [
+      "采购订单均额",
+      "平均采购金额"
+    ],
+    "unit": "元",
+    "tables": [
+      "factory.purchase_order"
+    ],
+    "sql_expression": "AVG(total_amount)",
+    "formula": "AVG(total_amount)",
+    "description": "采购订单总金额的平均值",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "采购金额",
+    "aliases": [
+      "采购总金额",
+      "采购金额合计"
+    ],
+    "unit": "元",
+    "tables": [
+      "factory.purchase_order_item"
+    ],
+    "sql_expression": "SUM(amount)",
+    "formula": "SUM(amount)",
+    "description": "采购明细金额的合计",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "平均订单金额",
+    "aliases": [
+      "销售订单均额",
+      "订单平均金额"
+    ],
+    "unit": "元",
+    "tables": [
+      "factory.sales_order"
+    ],
+    "sql_expression": "AVG(total_amount)",
+    "formula": "AVG(total_amount)",
+    "description": "销售订单总金额的平均值",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "实物库存量",
+    "aliases": [
+      "账面库存量",
+      "库存数量合计"
+    ],
+    "unit": "件",
+    "tables": [
+      "factory.inventory"
+    ],
+    "sql_expression": "SUM(quantity)",
+    "formula": "SUM(quantity)",
+    "description": "库存表数量的合计",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "实物安全库存",
+    "aliases": [
+      "安全库存基准量",
+      "安全库存合计"
+    ],
+    "unit": "件",
+    "tables": [
+      "factory.inventory"
+    ],
+    "sql_expression": "SUM(safe_stock)",
+    "formula": "SUM(safe_stock)",
+    "description": "库存表安全库存字段的合计",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "低于安全库存品种数",
+    "aliases": [
+      "低于安全库存的品种数",
+      "安全库存不足品种数"
+    ],
+    "unit": "种",
+    "tables": [
+      "factory.inventory"
+    ],
+    "sql_expression": "SUM(CASE WHEN quantity < safe_stock THEN 1 ELSE 0 END)",
+    "formula": "SUM(CASE WHEN quantity < safe_stock THEN 1 ELSE 0 END)",
+    "description": "库存数量低于安全库存的品种（行）数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "逾期销售订单数",
+    "aliases": [
+      "逾期订单数",
+      "超期销售订单数"
+    ],
+    "unit": "单",
+    "tables": [
+      "factory.sales_order"
+    ],
+    "sql_expression": "SUM(CASE WHEN due_date < CURRENT_DATE AND status NOT IN ('completed', 'shipped') THEN 1 ELSE 0 END)",
+    "formula": "SUM(CASE WHEN due_date < CURRENT_DATE AND status NOT IN ('completed', 'shipped') THEN 1 ELSE 0 END)",
+    "description": "交期已过且尚未完成/发货的销售订单数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "发货中订单金额",
+    "aliases": [
+      "发货中订单总额",
+      "发货中状态订单金额"
+    ],
+    "unit": "元",
+    "tables": [
+      "factory.sales_order"
+    ],
+    "sql_expression": "SUM(CASE WHEN status = '发货中' THEN total_amount ELSE 0 END)",
+    "formula": "SUM(CASE WHEN status = '发货中' THEN total_amount ELSE 0 END)",
+    "description": "发货中状态订单的总金额",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "有质检记录的工单数",
+    "aliases": [
+      "有质检的工单数",
+      "有质检记录工单数"
+    ],
+    "unit": "个",
+    "tables": [
+      "factory.quality_inspection"
+    ],
+    "sql_expression": "COUNT(DISTINCT wo_id)",
+    "formula": "COUNT(DISTINCT wo_id)",
+    "description": "有质检记录的去重工单数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "不合格检验批次数",
+    "aliases": [
+      "质检不合格批次数",
+      "质量不合格批次数"
+    ],
+    "unit": "批",
+    "tables": [
+      "factory.quality_inspection"
+    ],
+    "sql_expression": "SUM(CASE WHEN result = '不合格' THEN 1 ELSE 0 END)",
+    "formula": "SUM(CASE WHEN result = '不合格' THEN 1 ELSE 0 END)",
+    "description": "检验结论(result)为不合格的批次数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "工厂工单数",
+    "aliases": [
+      "工单总数ERP",
+      "ERP工单总数"
+    ],
+    "unit": "个",
+    "tables": [
+      "factory.work_order"
+    ],
+    "sql_expression": "COUNT(DISTINCT id)",
+    "formula": "COUNT(DISTINCT id)",
+    "description": "工单的去重总数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "超产10%以上工单数",
+    "aliases": [
+      "实际产量超计划10%的工单数",
+      "超产10%工单数"
+    ],
+    "unit": "个",
+    "tables": [
+      "factory.work_order"
+    ],
+    "sql_expression": "SUM(CASE WHEN produced_qty >= plan_qty * 1.1 THEN 1 ELSE 0 END)",
+    "formula": "SUM(CASE WHEN produced_qty >= plan_qty * 1.1 THEN 1 ELSE 0 END)",
+    "description": "实际产量超过计划产量 10% 以上的工单数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "工厂平均工单实际产量",
+    "aliases": [
+      "工单平均实际产量",
+      "平均实际量"
+    ],
+    "unit": "件",
+    "tables": [
+      "factory.work_order"
+    ],
+    "sql_expression": "AVG(produced_qty)",
+    "formula": "AVG(produced_qty)",
+    "description": "工单实际产量的平均值",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "工厂平均工单计划量",
+    "aliases": [
+      "工单平均计划产量",
+      "平均计划量ERP"
+    ],
+    "unit": "件",
+    "tables": [
+      "factory.work_order"
+    ],
+    "sql_expression": "AVG(plan_qty)",
+    "formula": "AVG(plan_qty)",
+    "description": "工单计划产量的平均值",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "工厂设备数",
+    "aliases": [
+      "设备台数ERP",
+      "ERP设备数"
+    ],
+    "unit": "台",
+    "tables": [
+      "factory.equipment"
+    ],
+    "sql_expression": "COUNT(DISTINCT id)",
+    "formula": "COUNT(DISTINCT id)",
+    "description": "设备的去重台数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "正常状态设备数",
+    "aliases": [
+      "正常设备台数",
+      "状态正常的设备数"
+    ],
+    "unit": "台",
+    "tables": [
+      "factory.equipment"
+    ],
+    "sql_expression": "SUM(CASE WHEN status = '正常' THEN 1 ELSE 0 END)",
+    "formula": "SUM(CASE WHEN status = '正常' THEN 1 ELSE 0 END)",
+    "description": "状态为正常的设备台数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "平均供应商评级",
+    "aliases": [
+      "供应商平均评级",
+      "平均评级"
+    ],
+    "unit": "级",
+    "tables": [
+      "factory.supplier"
+    ],
+    "sql_expression": "AVG(rating)",
+    "formula": "AVG(rating)",
+    "description": "供应商评级(rating)的平均值",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "未被采购过的物料数",
+    "aliases": [
+      "从未被采购的物料数量",
+      "无采购记录物料数"
+    ],
+    "unit": "种",
+    "tables": [
+      "factory.material"
+    ],
+    "sql_expression": "COUNT(CASE WHEN id NOT IN (SELECT material_id FROM factory.purchase_order_item) THEN 1 END)",
+    "formula": "COUNT(CASE WHEN id NOT IN (SELECT material_id FROM factory.purchase_order_item) THEN 1 END)",
+    "description": "从未出现在采购明细中的物料种数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "考勤记录数",
+    "aliases": [
+      "考勤记录条数",
+      "考勤次数"
+    ],
+    "unit": "条",
+    "tables": [
+      "factory.attendance"
+    ],
+    "sql_expression": "COUNT(id)",
+    "formula": "COUNT(id)",
+    "description": "考勤记录的条数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "迟到记录数",
+    "aliases": [
+      "迟到次数",
+      "迟到考勤记录数"
+    ],
+    "unit": "条",
+    "tables": [
+      "factory.attendance"
+    ],
+    "sql_expression": "SUM(CASE WHEN status = '迟到' THEN 1 ELSE 0 END)",
+    "formula": "SUM(CASE WHEN status = '迟到' THEN 1 ELSE 0 END)",
+    "description": "考勤状态为迟到的记录条数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "缺勤记录数",
+    "aliases": [
+      "缺勤次数",
+      "缺勤考勤记录数"
+    ],
+    "unit": "条",
+    "tables": [
+      "factory.attendance"
+    ],
+    "sql_expression": "SUM(CASE WHEN status = '缺勤' THEN 1 ELSE 0 END)",
+    "formula": "SUM(CASE WHEN status = '缺勤' THEN 1 ELSE 0 END)",
+    "description": "考勤状态为缺勤的记录条数",
+    "dims": [],
+    "version": 1
+  },
+  {
+    "name": "请假记录数",
+    "aliases": [
+      "请假次数",
+      "请假考勤记录数"
+    ],
+    "unit": "条",
+    "tables": [
+      "factory.attendance"
+    ],
+    "sql_expression": "SUM(CASE WHEN status = '请假' THEN 1 ELSE 0 END)",
+    "formula": "SUM(CASE WHEN status = '请假' THEN 1 ELSE 0 END)",
+    "description": "考勤状态为请假的记录条数",
+    "dims": [],
+    "version": 1
+  }
+]
