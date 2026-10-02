@@ -70,3 +70,16 @@ _diag/
 *.njsproj
 *.sln
 *.sw?
+# ── 运行时生成的数据 / 本地环境相关（各自本地生成，不进仓库）──
+backend/.literal_table_index.json
+backend/memory_center.json
+backend/knowledge_heat.json
+backend/auth_approvals.json
+backend/auth_permissions.json
+backend/auth_users.json
+backend/data/metric_candidates.json
+backend/.database_sources.json
+backend/field_cn_ai.json
+backend/report_assets.json
+backend/report_scheduler.json
+backend/knowledge_user_data.json
