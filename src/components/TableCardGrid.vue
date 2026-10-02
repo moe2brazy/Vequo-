@@ -9,7 +9,7 @@
       class="border border-gray-200 rounded-xl overflow-hidden bg-white shadow-sm hover:shadow-md transition"
     >
       <!-- 卡片头 -->
-      <div class="flex items-center gap-2 px-4 py-2.5 bg-gradient-to-r from-slate-50 to-white border-b border-gray-100">
+      <div class="flex items-center gap-2 px-4 py-2.5 bg-gradient-to-r from-slate-50 to-white border-b border-gray-100" style="cursor:pointer" @click="$emit('open', tbl)">
         <span class="text-lg"><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <line x1="8" x2="21" y1="6" y2="6" /> <line x1="8" x2="21" y1="12" y2="12" /> <line x1="8" x2="21" y1="18" y2="18" /> <line x1="3" x2="3.01" y1="6" y2="6" /> <line x1="3" x2="3.01" y1="12" y2="12" /> <line x1="3" x2="3.01" y1="18" y2="18" /> </svg></span></span>
         <div class="min-w-0 flex-1">
           <div class="text-sm font-semibold text-gray-800 truncate">
@@ -23,7 +23,7 @@
         <button
           class="text-[11px] text-gray-500 hover:text-gray-700 font-medium shrink-0 border border-gray-200 rounded px-1.5 py-0.5"
           title="放大查看"
-          @click="$emit('enlarge', tbl)"
+          @click.stop="$emit('enlarge', tbl)"
         >
           <span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <circle cx="11" cy="11" r="8" /> <path d="m21 21-4.3-4.3" /> </svg></span> 放大
         </button>
@@ -58,5 +58,6 @@ defineProps<{
 
 defineEmits<{
   (e: 'enlarge', table: any): void
+  (e: 'open', table: any): void
 }>()
 </script>

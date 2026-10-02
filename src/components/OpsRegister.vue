@@ -95,13 +95,35 @@ const allComplete = computed(() => fields.every(field => isComplete(field.key)))
 function isComplete(key: FieldKey) { return form[key].trim().length > 0 }
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+const EMAIL_HINT = '正确格式示例：name@example.com'
+
+/** 邮箱格式体检：返回可直接展示给普通用户的中文原因，空串表示通过。
+ *  与后端 email_codes.email_format_error 保持一致（本地先拦一道，省一次网络往返），
+ *  逐条说明具体错在哪，避免用户面对笼统的「格式不正确」反复试错。 */
+function emailFormatHint(email: string): string {
+  const raw = email.trim()
+  if (!raw) return '请填写邮箱地址'
+  // 中文输入法下极易打出全角 ＠／．／空格，肉眼几乎看不出
+  if (/[^\x00-\x7F]/.test(raw)) return '邮箱地址里有中文或全角字符，请切换到英文输入法重新输入'
+  if (/\s/.test(raw)) return '邮箱地址中间不能有空格'
+  if (!raw.includes('@')) return `邮箱地址缺少 @ 符号（${EMAIL_HINT}）`
+  if (raw.split('@').length > 2) return '邮箱地址里出现了多个 @ 符号'
+  const [local = '', domain = ''] = raw.split('@')
+  if (!local) return `@ 前面缺少邮箱名称（${EMAIL_HINT}）`
+  if (!domain) return `@ 后面缺少邮箱域名（${EMAIL_HINT}）`
+  if (!domain.includes('.')) return `邮箱域名缺少后缀，如 @qq.com 里的 .com（${EMAIL_HINT}）`
+  if (/\.$|^\.|\.\./.test(domain)) return '邮箱域名的点号位置不对，请检查域名部分'
+  if (/\.$|^\.|\.\./.test(local)) return '邮箱名称不能以点号开头或结尾，也不能出现连续两个点号'
+  if (domain.split('.').some(part => !part || part.startsWith('-') || part.endsWith('-'))) return '邮箱域名的连字符位置不对，请检查域名部分'
+  if (!EMAIL_RE.test(raw)) return `邮箱格式不正确（${EMAIL_HINT}）`
+  return ''
+}
 
 /** 表单校验：返回错误文案，空串表示通过。
  *  邮箱/验证码/密码规则与后端保持一致，避免「前端放过、后端报错」。 */
 function validateForm(): string {
-  const email = form.email.trim()
-  if (!email) return '请填写邮箱'
-  if (!EMAIL_RE.test(email)) return '邮箱格式不正确'
+  const emailHint = emailFormatHint(form.email)
+  if (emailHint) return emailHint
   if (!form.code.trim()) return '请填写验证码'
   if (!/^\d{6}$/.test(form.code.trim())) return '验证码为 6 位数字'
   if (form.password.length < 6) return '密码至少 6 位'
@@ -113,8 +135,9 @@ function validateForm(): string {
 async function handleSendCode() {
   if (sendingCode.value || codeCooldown.value > 0) return
   const email = form.email.trim()
-  if (!EMAIL_RE.test(email)) {
-    registerError.value = '请先填写正确的邮箱再获取验证码'
+  const emailHint = emailFormatHint(email)
+  if (emailHint) {
+    registerError.value = emailHint
     attemptedSubmit.value = true
     activeIndex.value = 0
     return

@@ -1381,6 +1381,25 @@ def search_tables_api(q: str = "", limit: int = 8):
         return {"success": False, "tables": [], "error": str(e)[:120]}
 
 
+# 表间关系业务说明（参考《数据介绍.md》第 3 节常用关联关系；key = 来源表.来源字段 -> 目标表.目标字段）
+RELATION_NOTES = {
+    ("dim_equipment", "line_id", "dim_production_line", "line_id"): "设备所属产线",
+    ("mes_work_order", "product_id", "dim_product", "product_id"): "工单对应产品",
+    ("mes_work_order", "line_id", "dim_production_line", "line_id"): "工单对应产线",
+    ("mes_process_output", "work_order_id", "mes_work_order", "work_order_id"): "工序产量对应工单",
+    ("mes_process_output", "product_id", "dim_product", "product_id"): "工序产量对应产品",
+    ("mes_process_output", "process_id", "dim_process", "process_id"): "工序产量对应工序",
+    ("mes_process_output", "line_id", "dim_production_line", "line_id"): "工序产量对应产线",
+    ("qms_inspection", "work_order_id", "mes_work_order", "work_order_id"): "检验记录对应工单",
+    ("qms_inspection", "product_id", "dim_product", "product_id"): "检验记录对应产品",
+    ("qms_inspection", "process_id", "dim_process", "process_id"): "检验记录对应工序",
+    ("qms_defect_detail", "inspection_id", "qms_inspection", "inspection_id"): "不良明细对应检验单",
+    ("qms_defect_detail", "responsible_process_id", "dim_process", "process_id"): "不良责任工序",
+    ("eqp_downtime_record", "equipment_id", "dim_equipment", "equipment_id"): "停机记录对应设备",
+    ("eqp_downtime_record", "line_id", "dim_production_line", "line_id"): "停机记录对应产线",
+    ("inv_inventory_snapshot", "product_id", "dim_product", "product_id"): "库存快照对应产品",
+}
+
 def _build_relationships(db: Session) -> dict:
     """构建表间关系（供缓存生产）"""
     inspector = inspect(db.get_bind())
@@ -1418,6 +1437,7 @@ def _build_relationships(db: Session) -> dict:
         """))
         
         for row in result:
+            note = RELATION_NOTES.get((row[0], row[1], row[2], row[3]))
             relationships.append({
     "source_table": row[0],
     "source_column": row[1],
@@ -1425,7 +1445,8 @@ def _build_relationships(db: Session) -> dict:
     "target_column": row[3],
     "type": "foreign_key",
     "constraint_name": row[4],
-    "description": f"外键：{row[0]}.{row[1]} → {row[2]}.{row[3]}"
+    "note": note,
+    "description": f"{row[0]}.{row[1]} → {row[2]}.{row[3]}" + (f"（{note}）" if note else "")
 })
     except Exception as e:
         print(f"获取外键关系失败: {e}")
@@ -1444,6 +1465,7 @@ def _build_relationships(db: Session) -> dict:
                 ORDER BY id
             """))
             for row in result:
+                note = RELATION_NOTES.get((row[0], row[1], row[2], row[3]))
                 relationships.append({
                     "source_table": row[0],
                     "source_column": row[1],
@@ -1451,7 +1473,8 @@ def _build_relationships(db: Session) -> dict:
                     "target_column": row[3],
                     "type": row[4] or "business",
                     "constraint_name": None,
-                    "description": f"业务关系：{row[0]}.{row[1]} → {row[2]}.{row[3]}"
+                    "note": note,
+                    "description": f"{row[0]}.{row[1]} → {row[2]}.{row[3]}" + (f"（{note}）" if note else "")
                 })
         except Exception:
             pass
