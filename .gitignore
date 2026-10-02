@@ -53,6 +53,7 @@ backend/auth_permissions.tmp.bak*
 !.env.example
 backend/.env
 backend/.env.*
+!backend/.env.example
 config/secrets*.json
 *.pem
 *.key
