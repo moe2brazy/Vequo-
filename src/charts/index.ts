@@ -26,15 +26,21 @@ const AXIS_COLOR = '#c9d3df'
 const G2PLOT_KEY = '__g2plot_instance__'
 
 const isNumCol = (col: string, rows: any[]): boolean => {
+  // 2026-10-01 修复：原实现扫到第一个非空值就 return，"采样 8 行"形同虚设——
+  // 列前 8 行全 NULL（第 9 行起才有数值）会被误判为类目轴；
+  // 混合列（首行数字、后续 "N/A" 文本）会被误判为数值列。改为整窗多数决（≥70% 可转数字）。
+  let numCount = 0
+  let nonEmpty = 0
   for (const r of rows.slice(0, 8)) {
     const v = r?.[col]
-    if (v === null || v === undefined || v === '') continue
-    if (typeof v === 'number') return true
+    if (v === null || v === undefined || String(v).trim() === '') continue
+    nonEmpty++
+    if (typeof v === 'number' && Number.isFinite(v)) { numCount++; continue }
     const s = String(v).trim().replace(/,/g, '')
-    if (s === '') continue
-    return !isNaN(Number(s))
+    if (s !== '' && !isNaN(Number(s))) numCount++
   }
-  return false
+  if (nonEmpty === 0) return false
+  return numCount / nonEmpty >= 0.7
 }
 
 // 数值解析（P2 修复）：兼容千分位字符串 "1,234"（G2Plot 侧已剥离逗号，
@@ -43,6 +49,17 @@ const toNum = (v: any): number => {
   if (v === null || v === undefined || v === '') return 0
   const n = Number(String(v).replace(/,/g, '').trim())
   return Number.isFinite(n) ? n : 0
+}
+
+/**
+ * 2026-10-01 修复（NULL 画成 0）：折线/面积图此前把 NULL/空值经 toNum 变成 0——
+ * 逐日趋势里某天无数据会被画成"假零产量谷底"，用户读出错误结论。
+ * 改为 NULL → null（ECharts 折线在该点断开，语义正确）；柱/饼仍用 toNum（0 扇区不可见）。
+ */
+const toNumOrNull = (v: any): number | null => {
+  if (v === null || v === undefined || String(v).trim() === '') return null
+  const n = Number(String(v).replace(/,/g, '').trim())
+  return Number.isFinite(n) ? n : null
 }
 
 /**
@@ -205,7 +222,9 @@ export function buildEChartOption(type: string, cols: string[], rows: any[], pal
       base.emphasis = { itemStyle: { color } }
       if (type === 'stacked') base.stack = 'total'
     }
-    base.data = rows.map((r) => toNum(r?.[c]))
+    base.data = isLine
+      ? rows.map((r) => toNumOrNull(r?.[c]))   // 折线/面积：NULL 断线，不画假 0
+      : rows.map((r) => toNum(r?.[c]))
     return base
   })
 

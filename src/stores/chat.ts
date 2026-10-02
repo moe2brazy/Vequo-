@@ -155,7 +155,22 @@ export function flushChatPersist(): void {
     clearTimeout(persistTimer)
     persistTimer = null
   }
-  safeSetItem(STORAGE_KEY, JSON.stringify(data.value))
+  safeSetItem(STORAGE_KEY, JSON.stringify(persistSnapshot()))
+}
+
+/**
+ * 2026-10-01 修复：落盘副本每会话消息封顶 200 条（内存不裁剪）。
+ * 原实现 messages 从不清理、写失败被静默吞掉 → localStorage 无限增长，
+ * 写满配额后最近消息反而丢失。
+ */
+function persistSnapshot(): ChatData {
+  const d = data.value
+  const messages: Record<string, ChatMessage[]> = {}
+  for (const k of Object.keys(d.messages)) {
+    const arr = d.messages[k]
+    messages[k] = arr.length > 200 ? arr.slice(arr.length - 200) : arr
+  }
+  return { ...d, messages }
 }
 
 watch(
@@ -164,7 +179,7 @@ watch(
     if (persistTimer) clearTimeout(persistTimer)
     persistTimer = setTimeout(() => {
       persistTimer = null
-      safeSetItem(STORAGE_KEY, JSON.stringify(data.value))
+      safeSetItem(STORAGE_KEY, JSON.stringify(persistSnapshot()))
     }, 300)
   },
   { deep: true },

@@ -57,6 +57,9 @@ config/secrets*.json
 *.pem
 *.key
 
+# 临时诊断脚本（本地排查用，禁止提交）
+_diag/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

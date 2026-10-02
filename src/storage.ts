@@ -14,7 +14,9 @@ function slimChatHistory(raw: string, keepChats = 6, keepMsgs = 25, resultCap = 
   try {
     const arr = JSON.parse(raw)
     if (!Array.isArray(arr)) return null
-    const out = arr.slice(-keepChats).map((c: any) => {
+    const out = arr.slice(0, keepChats).map((c: any) => {
+      // 2026-10-01 修复：问析历史数组是「最新在前」（unshift 写入），
+      // slice(-keepChats) 保留的其实是最旧的几个会话，改为 slice(0, keepChats)
       const msgs = (c?.messages || []).slice(-keepMsgs).map((m: any) => {
         const n: any = { ...m }
         delete n.thinking // 推理过程可再生成，体积最大
@@ -46,14 +48,23 @@ export function pruneLocalStorage(): void {
         try { localStorage.setItem(k, slim) } catch { /* 忽略单项失败 */ }
       }
     }
-    // 第二轮：仍占最大者整删（尽量少删，先删体积最大的一个）
+    // 第二轮：仍占最大者整删（尽量少删，先删体积最大的一个；太小的 key 删了也无济于事）
+    // 2026-10-01 加固：删除前先把瘦身副本归档到 _last_pruned（尽力而为），
+    // 降低用户整段对话被静默清空的损失；体积 <64KB 的 key 跳过不删
     let biggest = ''
     let biggestLen = 0
     for (const k of keys) {
       const len = (localStorage.getItem(k) || '').length
       if (len > biggestLen) { biggestLen = len; biggest = k }
     }
-    if (biggest && biggestLen > 0) {
+    if (biggest && biggestLen > 65536) {
+      try {
+        const raw = localStorage.getItem(biggest)
+        if (raw) {
+          const archived = slimChatHistory(raw, 2, 10, 8000)
+          if (archived) localStorage.setItem(ASK_HISTORY_PREFIX + '_last_pruned', archived)
+        }
+      } catch { /* 归档失败不阻塞清理 */ }
       try { localStorage.removeItem(biggest) } catch { /* ignore */ }
     }
   } catch { /* 治理本身失败不抛，让调用方感知 */ }

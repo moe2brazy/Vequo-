@@ -19,6 +19,19 @@ import time
 from email.header import Header as EmailHeader
 from email.mime.text import MIMEText
 from email.utils import formataddr
+from pathlib import Path
+
+# 本模块用 os.getenv 直接读配置，而 load_dotenv 原先只在 config.py 里被调用。
+# 一旦本模块先于 config 被导入（脚本、测试），.env 里的 MAIL_* 就读不到，
+# 于是静默退回调试模式——验证码看着「发送成功」却永远收不到。
+# 这里自己补一次加载，指向同目录的 .env；load_dotenv 默认不覆盖已存在的
+# 环境变量，与 config.py 的调用重复也不会互相干扰。
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).with_name(".env"))
+except Exception:
+    pass
 
 # ── 配置读取（每次调用读 env，避免导入顺序问题）────────────
 
@@ -154,25 +167,46 @@ def _log_smtp_failure(kind: str, to_email: str, exc: Exception) -> None:
         pass
 
 
-def _send_mail(to_email: str, code: str) -> None:
-    """发送验证码邮件；未配置 SMTP 或 MAIL_DEBUG=1 时打印到日志（调试模式）。"""
+def mail_status() -> tuple[bool, str]:
+    """邮件是否已配置齐全、可真实发送。返回 (可发送, 不可发送的原因)。
+
+    单独抽出来判定，是因为「只填了 MAIL_SMTP_HOST、漏填授权码」这种情况
+    若直接去连 SMTP，会抛认证失败，用户看到的是「邮件发送失败」，排查方向
+    会被带偏成「邮箱服务商有问题」。提前判定后，提示直接指向缺哪一项。
+    """
     host = _env("MAIL_SMTP_HOST")
+    user = _env("MAIL_SMTP_USER")
+    pwd = _env("MAIL_SMTP_PASSWORD")
+    if not host:
+        return False, "MAIL_SMTP_HOST 未配置"
+    if not user or not pwd:
+        return False, ("MAIL_SMTP_USER / MAIL_SMTP_PASSWORD 未填写完整"
+                       "（QQ 邮箱此处填 16 位授权码，不是登录密码）")
+    if _env_bool("MAIL_DEBUG", default=False):
+        return False, "MAIL_DEBUG=1，已强制调试模式"
+    return True, ""
+
+
+def _send_mail(to_email: str, code: str) -> bool:
+    """发送验证码邮件。返回是否真实投递（False = 调试模式，验证码只打印到后端日志）。"""
     ttl = _env_int("MAIL_CODE_TTL", 600)
     minutes = max(1, ttl // 60)
 
-    # 调试模式：验证码不进邮件，直接打到后端日志，便于本地联调
-    if not host or _env_bool("MAIL_DEBUG", default=not bool(host)):
-        msg = (f"[邮箱验证码·调试模式，未真实发送] 收件人 {to_email} 的注册验证码为：{code}，"
-               f"{minutes} 分钟内有效。配置 backend/.env 的 MAIL_SMTP_HOST/MAIL_SMTP_USER/"
-               f"MAIL_SMTP_PASSWORD 并将 MAIL_DEBUG 置 0 后自动切换为真实发送。")
+    ready, why = mail_status()
+    if not ready:
+        msg = (f"[邮箱验证码·调试模式，未真实发送] 原因：{why}。"
+               f"收件人 {to_email} 的注册验证码为：{code}，{minutes} 分钟内有效。"
+               f"在 backend/.env 补全 MAIL_SMTP_HOST / MAIL_SMTP_USER / MAIL_SMTP_PASSWORD"
+               f"（QQ 邮箱填授权码）并保持 MAIL_DEBUG=0，重启后端后即切换为真实发送。")
         print(msg, flush=True)
         try:
             import logging
             logging.getLogger(__name__).warning(msg)
         except Exception:
             pass
-        return
+        return False
 
+    host = _env("MAIL_SMTP_HOST")
     user = _env("MAIL_SMTP_USER")
     pwd = _env("MAIL_SMTP_PASSWORD")
     sender = _env("MAIL_FROM") or user
@@ -227,10 +261,17 @@ def _send_mail(to_email: str, code: str) -> None:
         # 含 socket 超时 / DNS 解析失败 / 网络不可达
         _log_smtp_failure("network", to_email, e)
         raise EmailCodeError("网络异常，暂时无法发送验证码，请稍后重试。") from e
+    return True
 
 
 def send_code(email: str) -> dict:
-    """生成验证码并发送。返回 {ok, expires_in, cooldown}；失败抛 EmailCodeError/EmailCooldownError。"""
+    """生成验证码并发送。
+
+    返回 {ok, expires_in, cooldown, sent, mail_hint}：
+    - sent=False 表示走的调试模式，验证码只进了后端日志、没有投递到邮箱；
+      mail_hint 说明是哪一项配置没就位。前端据此提示，避免「显示发送成功
+      但收不到邮件」这种无声失败。
+    """
     email = (email or "").strip().lower()
     reason = email_format_error(email)
     if reason:
@@ -253,7 +294,7 @@ def send_code(email: str) -> dict:
         _SENT_AT[email] = now
 
     try:
-        _send_mail(email, code)
+        sent = _send_mail(email, code)
     except Exception:
         # 发信失败必须回滚占位：否则用户改正邮箱后要白等一整个冷却期（默认 60s），
         # 且 _CODES 里会留一份永远送不到的死码。
@@ -264,8 +305,15 @@ def send_code(email: str) -> dict:
             if rec and rec.get("code") == code:
                 _CODES.pop(email, None)
         raise
-    audit("email_code_sent", email=email, ttl=ttl)
-    return {"ok": True, "expires_in": ttl, "cooldown": cooldown}
+    audit("email_code_sent", email=email, ttl=ttl, delivered=sent)
+    _, why = mail_status()
+    return {
+        "ok": True,
+        "expires_in": ttl,
+        "cooldown": cooldown,
+        "sent": sent,
+        "mail_hint": "" if sent else why,
+    }
 
 
 def verify_code(email: str, code: str) -> bool:

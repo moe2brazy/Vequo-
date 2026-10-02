@@ -372,6 +372,10 @@ const onLogout = () => {
 const showPalette = ref(false)
 const onGlobalKeydown = (e: KeyboardEvent) => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+    // 2026-10-01 修复：输入框/文本域内 Ctrl+K 常是用户自定义语义（如 Markdown 链接），
+    // 处于可编辑元素时不拦截，避免误触发命令面板
+    const t = e.target as HTMLElement | null
+    if (t && (t.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName))) return
     e.preventDefault()
     showPalette.value = !showPalette.value
   }

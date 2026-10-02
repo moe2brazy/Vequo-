@@ -178,6 +178,15 @@
                  :class="msg.role === 'user' ? 'ask-bubble-user' : 'ask-bubble-ai'">
               {{ msg.content }}
             </div>
+            <!-- 用户消息复制（2026-10-01）：贴气泡右下的迷你按钮，鼠标悬停消息行才显现，
+                 默认透明但占位（避免悬停时布局跳动），与 AI 回答操作栏同一套胶囊按钮风格 -->
+            <div v-if="msg.role === 'user'" class="ask-actions ask-actions-user">
+              <button
+                @click="copyUserMsg(msg)"
+                class="ask-action-btn ask-action-btn-sm ask-user-copy"
+                title="复制这条提问"
+              ><span v-if="msg.copiedUser"><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <polyline points="20 6 9 17 4 12" /> </svg></span></span><span v-else><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <rect width="14" height="14" x="8" y="8" rx="2" ry="2" /> <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" /> </svg></span></span>{{ msg.copiedUser ? ' 已复制' : ' 复制' }}</button>
+            </div>
             <!-- ===== 结果回答（最显眼：用户第一眼看到结论，溯源类内容在下方默认折叠）===== -->
             <div v-if="msg.result" class="ask-result-card">
               <div class="ask-result-head">
@@ -959,6 +968,7 @@ interface Message {
   answerText?: string            // 纯文本形态的回答（供"复制"按钮使用）
   copiedSql?: boolean            // SQL 复制成功的瞬时提示
   copiedAnswer?: boolean         // 回答复制成功的瞬时提示
+  copiedUser?: boolean           // 用户提问复制成功的瞬时提示（2026-10-01）
   sqlOpen?: boolean              // SQL 卡片展开状态（默认折叠）
   // ---- 口径管理（P1）：未命中反馈条 / 歧义澄清卡 ----
   metricResolution?: { status: string; hints?: string[]; hits?: any[] } | null
@@ -1164,6 +1174,12 @@ const loadChat = (id: string) => {
 // 删除对话
 const deleteChat = (id: string) => {
   if (!confirm('确定要删除这条对话吗？')) return
+  // 若删除的是当前会话：取消在途请求，并关闭可能残留的二次确认弹窗——
+  // 弹窗方案绑定旧会话，currentChatId 切走后确认执行会把结果写进错误会话（串号）
+  if (currentChatId.value === id) {
+    if (isLoading.value) stopGenerating()
+    closeConfirmDialog()
+  }
   history.value = history.value.filter(h => h.id !== id)
   if (currentChatId.value === id) {
     currentChatId.value = history.value.length > 0 ? history.value[0].id : null
@@ -1383,6 +1399,11 @@ const renderAgentResult = (data: any, msg?: any): string => {
       if (mr.join_note) {
         html += `<div class="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1 mb-2">${esc(mr.join_note)}</div>`
       }
+      // 数据说明（如"原始 5000 行，剔除含缺失值记录后剩余 3200 行（缺失最多：xxx）"）：
+      // 建模数据量骤减时给出原因，避免"有效数据不足"类问题无从解释
+      if (mr.data_note) {
+        html += `<div class="text-xs text-gray-600 bg-gray-50 border border-gray-200 rounded px-2 py-1 mb-2">${esc(mr.data_note)}</div>`
+      }
       if (mr.metrics && Object.keys(mr.metrics).length > 0) {
         html += '<div class="text-xs mb-2 flex flex-wrap gap-x-4 gap-y-1">'
         Object.entries(mr.metrics).forEach(([k, v]) => { html += `<span class="bg-blue-50 text-blue-700 px-2 py-0.5 rounded">${esc(k)}: <b>${esc(v)}</b></span>` })
@@ -1477,7 +1498,7 @@ const renderAgentResult = (data: any, msg?: any): string => {
     // 用「无边框 + 柔和底 + 品牌竖标」的结论区承载，弱化描边、强化留白，
     // 让结论成为视觉重心，图表/表格降级为「数据依据」放在其后。
     if (data.analysis) {
-      html += `<div class="anl-conclusion">
+      html += `<div class="anl-conclusion" data-anl="1">
         <div class="anl-conclusion-title">
           <span class="anl-conclusion-dot"></span>
           分析结论
@@ -2001,6 +2022,7 @@ const sendMessage = async (presetText?: string | Event, opts?: { noConfirm?: boo
     let buffer = ''
     let finalData: any = null
     let lastRenderAt = 0   // 高频 token 渲染节流时间戳
+    let rendered = false   // 洞察后置：done 是否已立即渲染（避免流结束二次 applyFinalData）
 
     const updateMsg = () => {
       if (finalData?.type === 'analysis_confirm') {
@@ -2111,6 +2133,23 @@ const sendMessage = async (presetText?: string | Event, opts?: { noConfirm?: boo
           } else if (type === 'done') {
             streamingStep.value = ''
             finalData = payload.response || {}
+            // 洞察后置（2026-10-01）：done 里 analysis 已是规则摘要，立即渲染完整结果
+            // （表格+图表+规则摘要），不等流结束；LLM 洞察由后续 analysis 事件补发。
+            if (finalData) {
+              updateMsg()
+              rendered = true
+            }
+          } else if (type === 'analysis') {
+            // 洞察后置：补发 LLM 业务解读，覆盖 done 里的规则摘要。
+            // 只做 analysis 区块 DOM 局部替换，不重新 applyFinalData（避免图表重复初始化）。
+            if (finalData) {
+              finalData.analysis = payload.text || ''
+              const _mid = msg && msg._mid
+              const _body = _mid
+                ? document.querySelector<HTMLElement>(`.msg-item[data-mid="${_mid}"] [data-anl] .anl-conclusion-body`)
+                : null
+              if (_body) _body.innerHTML = renderAnalysis(finalData.analysis)
+            }
           } else if (type === 'error') {
             streamingStep.value = ''
             throw new Error(payload.message || payload.content || 'Agent 执行失败')
@@ -2161,11 +2200,21 @@ const sendMessage = async (presetText?: string | Event, opts?: { noConfirm?: boo
     // 流结束：仅当收到 done 事件（finalData 非空）才做最终整合——
     // 流被服务端干净关闭但未收到 done 时，保留已流式渲染的表格/图表，
     // 不做 applyFinalData(null) 的空覆盖（否则用户已见的结果瞬间消失，P1 修复）
-    if (finalData) {
+    if (finalData && !rendered) {
       updateMsg()
-    } else if (msg && !msg.result && (!msg.content || msg.content === '正在分析…')) {
+    } else if (!finalData && msg && !msg.result && (!msg.content || msg.content === '正在分析…')) {
       msg.content = '对话已结束'
+    }
+    // 2026-10-01：无论是否收到 done 事件，都必须结束加载态。
+    // 原逻辑只在上面两个分支里复位 thinkingStreaming ——「有 result 但没等到 done」
+    // （服务端正常关闭连接 / 网关中途断开）时两个分支都不进，界面会一直转圈且无任何提示。
+    if (msg) {
       msg.thinkingStreaming = false
+      if (!finalData && msg.result) {
+        msg.content = (msg.content && msg.content !== '正在分析…')
+          ? msg.content
+          : '结果可能不完整：连接在生成答案前已中断，请重试。'
+      }
     }
     const owner = ownerChatOf(msg)
     if (owner) owner.updatedAt = new Date().toISOString()
@@ -2381,6 +2430,13 @@ const copyAnswer = async (msg: any) => {
   const ok = await copyToClipboard(text)
   msg.copiedAnswer = ok
   if (ok) setTimeout(() => { msg.copiedAnswer = false }, 1800)
+}
+
+// 复制用户提问（2026-10-01）：与 copySql/copyAnswer 同一套剪贴板 + 瞬时提示模式
+const copyUserMsg = async (msg: any) => {
+  const ok = await copyToClipboard(msg?.content || '')
+  msg.copiedUser = ok
+  if (ok) setTimeout(() => { msg.copiedUser = false }, 1800)
 }
 
 // 重新回答：截断到本轮提问，用同一个问题重新走完整 Agent 流程
@@ -2765,8 +2821,10 @@ const saveToStorage = () => {
   // 原实现把截断结果赋值回内存 → 会话数 >24 时最旧会话在内存中也被删掉、
   // 长对话第 61 条起消息永久消失（localStorage 里同样已删，无法恢复），
   // 且每次调用都替换整个数组引用，导致整页 computed / v-for 全量重渲染。
+  // 2026-10-01 修复：history 数组是「最新在前」（createNewChat 用 unshift），
+  // slice(-24) 保留的其实是最旧的 24 个、会静默丢弃最新会话，改为 slice(0, 24)
   const payload = history.value
-    .slice(-24)
+    .slice(0, 24)
     .map((c: any) => ({
       ...c,
       // 报告 HTML 一份几十 KB，写进本地存储（总配额 5MB）会把对话历史挤掉：
@@ -2803,7 +2861,7 @@ const saveToStorage = () => {
         try {
           pruneLocalStorage()
           localStorage.setItem(key, JSON.stringify(history.value
-            .slice(-12)
+            .slice(0, 12)
             .map((c: any) => ({ ...c, messages: (c.messages || []).slice(-20) }))))
         } catch {
           console.warn('历史记录超出存储配额，本轮不持久化（内存中仍可用）')
@@ -2845,6 +2903,11 @@ onMounted(() => {
   if (!hasHistory) {
     createNewChat()
   }
+
+  // 初始问题必须在 loadFromStorage 之后消费（原因见 consumeInitialQuestion 上方注释）：
+  // 顺序反了会把本地历史覆盖成单条新会话。
+  mountedReady.value = true
+  consumeInitialQuestion()
 
   scrollToBottom()
 })
@@ -2902,18 +2965,38 @@ watch(currentMessages, (nw, old) => {
 })
 
 // 监听外部传入的初始问题（来自分析模板 / 快捷问题 / 总览建议）
-// immediate：AskPage 首次挂载时就带着 initialQuestion（从知识页点应用模板切过来）
-// 的场景也能消费，避免「首次点应用模板没反应」；问题已自动发送，输入框保持为空
-watch(() => props.initialQuestion, (question) => {
-  if (question && question.trim()) {
-    const q = question.trim()
+//
+// ⚠️ 此处**绝不能用 immediate:true**（2026-10-01 修复）：
+// immediate 的 watcher 在 setup 同步阶段执行，早于 onMounted 里的 loadFromStorage()。
+// 而 consumeInitialQuestion → createNewChat() 会立刻 saveToStorage() 落盘，
+// 把「只有 1 条新会话」的数组写进 localStorage；等 loadFromStorage() 再去读，
+// 读到的就是被自己覆盖后的数据 —— 该用户此前的全部会话永久丢失，且无任何提示。
+// 最常见触发路径：知识页「应用模板」/ Cmd+K 提问（App.vue navigateToAsk）。
+// 因此首次值改由 onMounted 在 loadFromStorage 之后消费，watcher 只处理挂载后的变化。
+const mountedReady = ref(false)
+
+const consumeInitialQuestion = () => {
+  const q = String(props.initialQuestion || '').trim()
+  if (!q) return
+  // 复用当前会话：若它还是刚创建的空会话（只有一条欢迎语），不要再建一个空的
+  // （onMounted 里无历史时会先 createNewChat，否则会留下两条「新对话」）
+  const cur: any = history.value.find((h: any) => h.id === currentChatId.value)
+  const isBlank = !cur || (cur.messages || []).length <= 1
+  if (!isBlank) {
     createNewChat()
-    nextTick(() => {
-      emit('question-consumed')
-      sendMessage(q)
-    })
   }
-}, { immediate: true })
+  nextTick(() => {
+    emit('question-consumed')
+    sendMessage(q)
+  })
+}
+
+watch(() => props.initialQuestion, (question) => {
+  if (!mountedReady.value) return   // 首次值交给 onMounted，避免早于 loadFromStorage
+  if (question && question.trim()) {
+    consumeInitialQuestion()
+  }
+})
 </script>
 
 <style scoped>
@@ -3317,6 +3400,20 @@ watch(() => props.initialQuestion, (question) => {
   font-size: 12px;
   color: var(--ink-400);
 }
+/* ===== 用户消息复制（2026-10-01）：气泡右下迷你胶囊按钮，默认透明、
+   悬停消息行才显现（占位不跳版），比 AI 操作栏更小一号（11px）===== */
+.ask-actions-user {
+  margin-top: 3px;
+  justify-content: flex-end;
+}
+.ask-action-btn-sm {
+  padding: 1px 8px;
+  font-size: 11px;
+  gap: 3px;
+}
+.msg-item .ask-user-copy { opacity: 0; }
+.msg-item:hover .ask-user-copy,
+.ask-user-copy:focus-visible { opacity: 1; }
 .ask-chart-select {
   padding: 4px 10px;
   border-radius: 9999px;

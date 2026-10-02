@@ -5,9 +5,9 @@
     "db_type": "postgresql",
     "host": "localhost",
     "port": 5432,
-    "database": "a07_manufacturing",
+    "database": "yans",
     "user": "postgres",
-    "password": "root",
+    "password": "123456",
     "is_active": true,
     "created_at": 0
   }

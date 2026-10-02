@@ -9025,7 +9025,7 @@ const loadTables = async () => {
 
     const res = await fetch('/api/tables/')
 
-
+    if (!res.ok) throw new Error(`加载表列表失败: HTTP ${res.status}`)
 
     const data = await res.json()
 
@@ -9131,7 +9131,7 @@ const loadTableDetail = async (tableName: string, page: number = 1) => {
 
     if (requestId !== detailRequestSeq) return // 已被更新的请求覆盖
 
-
+    if (!res.ok) throw new Error(`加载表详情失败: HTTP ${res.status}`)
 
     const data = await res.json()
 

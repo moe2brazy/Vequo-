@@ -411,23 +411,31 @@ let suppressClearOnClose = false
 // 常见问答的"模拟思考延迟"定时器：需在关闭/卸载时清理，避免向已清空的会话推送"幽灵答案"
 let faqTimer: number | null = null
 
-// 记忆生命周期 = 面板会话：打开时全新对话，退出时立即清空历史
+// 记忆生命周期 = 面板会话：打开时全新对话，退出时立即清空历史。
+// 2026-10-01 修复：拖动收起（suppressClearOnClose）保留的对话，重开时被无条件清空，
+// 在途回答随后凭空出现（幽灵消息）。改为：重开时若上一次是"保留式收起"则继续原会话。
+let retainOnReopen = false
 watch(open, (v) => {
   if (v) {
-    chat.value = []
-    draft.value = ''
-    loading.value = false
-    loadingStep.value = ''
-    abortCtrl?.abort()
-    abortCtrl = null
+    if (!retainOnReopen) {
+      chat.value = []
+      draft.value = ''
+      loading.value = false
+      loadingStep.value = ''
+      abortCtrl?.abort()
+      abortCtrl = null
+    }
+    retainOnReopen = false
     nextTick(scrollBottom)
   } else {
     // 修复（P0）：因拖动而收起时，只收起悬浮面板，保留对话与在途请求。
     // 原先拖动会命中下面这段"退出即清空"逻辑 → 随手拖一下球就丢失整段多轮对话（不可恢复）。
     if (suppressClearOnClose) {
       suppressClearOnClose = false
+      retainOnReopen = true
       return
     }
+    retainOnReopen = false
     // 退出浮窗：终止在途请求 + 清空问答历史（不写入任何持久化存储）
     abortCtrl?.abort()
     abortCtrl = null

@@ -298,13 +298,15 @@ const saveAsAsset = async () => {
   assetSaving.value = true
   reportError.value = ''
   try {
-    const d = await fetch('/api/overview/report-export', { method: 'POST' }).then((r) => r.json())
-    if (!d.success) throw new Error(d.error || '报告生成失败')
-    const saved = await fetch('/api/reports', {
+    // 2026-10-01 修复：改用 fetchJson（含 res.ok 校验），
+    // 403/500 错误体不再被当成功解析、真实失败原因（权限不足等）不再被吞
+    const d = await fetchJson('/api/overview/report-export', { method: 'POST' })
+    if (!d.success) throw new Error(d.error || d.detail || '报告生成失败')
+    const saved = await fetchJson('/api/reports', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: '数据总览报告', markdown: d.markdown, tables: Object.keys(d.tables || {}) }),
-    }).then((r) => r.json())
+    })
     if (!saved.success) throw new Error(saved.detail || '保存失败')
     reportError.value = ''
     alert('报告已保存为资产，可在「历史报告」中查看/再生成')

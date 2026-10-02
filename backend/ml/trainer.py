@@ -38,7 +38,7 @@ MODEL_TYPES = {
 
 # ML 训练参数白名单 + 取值范围钳制（对齐 ml/executor 的安全约束，防止恶意参数打爆资源）
 _ALLOWED_TRAIN_PARAMS = {
-    "n_clusters": (1, 100),        # KMeans 聚类数：1~100
+    "n_clusters": (2, 100),        # KMeans 聚类数：2~100（k=1 无意义，轮廓系数恒 -1）
     "contamination": (0.01, 0.5),  # IsolationForest 异常比例：(0, 0.5]
 }
 
@@ -140,7 +140,17 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
         df = _load_data_joined(table, features, target, join_spec)
     else:
         df = _load_data(table, all_cols)
+    # 2026-10-01 修复（P1）：dropna 原先无任何提示——某列 NULL 率高时 5000 行可能掉到
+    # 几十行，用户只看到"有效数据不足"，不知道是哪列导致。记录行数变化与缺失最多的列，
+    # 通过 data_note 透出到结果卡。
+    rows_before = len(df)
+    _na_counts = df.isna().sum()
     df = df.dropna()
+    data_note = ""
+    if rows_before - len(df) > 0:
+        _worst = _na_counts.idxmax() if _na_counts.max() > 0 else ""
+        data_note = (f"原始 {rows_before} 行，剔除含缺失值记录后剩余 {len(df)} 行"
+                     + (f"（缺失最多：{_worst}）" if _worst else ""))
     # 脱敏：剥离敏感列（对齐 ml/executor）；目标/特征列涉敏则直接拒绝训练
     dropped = [c for c in df.columns if any(s in c.lower() for s in _SENSITIVE_COLUMNS)]
     if dropped:
@@ -164,21 +174,53 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
             le = LabelEncoder()
             X[col] = le.fit_transform(X[col].astype(str))
             encoders[col] = le
-    X_scaled = scaler.fit_transform(X)
 
     y = None
+    is_clf = False
     if target and task != "clustering":
         y_raw = df[target]
         if task == "classification" or (task == "both" and not pd.api.types.is_numeric_dtype(y_raw)):
             le_target = LabelEncoder()
             y = le_target.fit_transform(y_raw.astype(str))
+            is_clf = True
         else:
             y = y_raw.values
+
+    # 2026-10-01 修复（P0 数据泄漏）：原实现 scaler.fit_transform(X) 在 train_test_split
+    # 之前对全量数据拟合，测试集的均值/方差信息泄漏进训练 → 展示的 R²/准确率系统性虚高，
+    # 现场换一批数据就复现不出来。改为：监督任务先划分原始 X，scaler 只在训练段 fit，
+    # 测试段只 transform；无监督任务（聚类/异常检测）无训练测试之分，保持全量拟合。
+    X_train = X_test = y_train = y_test = None
+    if task in ("clustering", "anomaly"):
+        X_scaled = scaler.fit_transform(X)
+    else:
+        # 2026-10-01 修复（P1）：分类任务分层抽样（每类≥5条才启用，小类别不强切），
+        # 避免类别不均衡时训练集只剩单类 → 逻辑回归直接抛英文堆栈
+        strat = None
+        if is_clf:
+            from collections import Counter as _Counter
+            cnt = _Counter(y)
+            if len(cnt) < 2:
+                raise ValueError(
+                    f"分类目标「{target}」只有 1 个类别（{list(cnt)[0]}），无法训练分类模型，"
+                    f"请换一个取值更丰富的目标字段，或改用回归模型")
+            if min(cnt.values()) >= 5:
+                strat = y
+        try:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.2, random_state=42, stratify=strat)
+        except ValueError:
+            # 极小样本下分层切分仍可能失败（某类样本分不进测试集），回退普通切分
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        if is_clf and len(set(y_train)) < 2:
+            raise ValueError(
+                f"训练集中「{target}」只覆盖到 1 个类别，样本量太少无法训练分类模型，请补充数据后重试")
+        X_train = scaler.fit_transform(X_train)
+        X_test = scaler.transform(X_test)
 
     # 选模型
     if model_type == "linear":
         m = LinearRegression()
-        X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
         m.fit(X_train, y_train)
         y_pred = m.predict(X_test)
         metrics = {"R²": round(r2_score(y_test, y_pred), 4)}
@@ -187,13 +229,11 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
         is_clf = task == "classification" or (le_target is not None)
         if is_clf:
             m = DecisionTreeClassifier(max_depth=5, random_state=42)
-            X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
             m.fit(X_train, y_train)
             y_pred = m.predict(X_test)
             metrics = {"准确率": round(accuracy_score(y_test, y_pred), 4), "F1": round(f1_score(y_test, y_pred, average="weighted"), 4)}
         else:
             m = DecisionTreeRegressor(max_depth=5, random_state=42)
-            X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
             m.fit(X_train, y_train)
             y_pred = m.predict(X_test)
             metrics = {"R²": round(r2_score(y_test, y_pred), 4)}
@@ -202,27 +242,24 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
         is_clf = task == "classification" or (le_target is not None)
         if is_clf:
             m = RandomForestClassifier(n_estimators=100, max_depth=8, random_state=42)
-            X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
             m.fit(X_train, y_train)
             y_pred = m.predict(X_test)
             metrics = {"准确率": round(accuracy_score(y_test, y_pred), 4), "F1": round(f1_score(y_test, y_pred, average="weighted"), 4)}
         else:
             m = RandomForestRegressor(n_estimators=100, max_depth=8, random_state=42)
-            X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
             m.fit(X_train, y_train)
             y_pred = m.predict(X_test)
             metrics = {"R²": round(r2_score(y_test, y_pred), 4)}
 
     elif model_type == "logistic":
         m = LogisticRegression(max_iter=1000, random_state=42)
-        X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
         m.fit(X_train, y_train)
         y_pred = m.predict(X_test)
         metrics = {"准确率": round(accuracy_score(y_test, y_pred), 4), "F1": round(f1_score(y_test, y_pred, average="weighted"), 4)}
 
     elif model_type == "kmeans":
         k = params.get("n_clusters", 3) if params else 3
-        k = max(1, min(int(k), len(X_scaled) - 1))  # 聚类数须 < 样本数（silhouette_score 要求），且避免过大
+        k = max(2, min(int(k), len(X_scaled) - 1))  # 聚类数须 ≥2 且 < 样本数（silhouette_score 要求）
         m = KMeans(n_clusters=k, random_state=42, n_init=10)
         m.fit(X_scaled)
         y_pred = m.labels_
@@ -249,8 +286,12 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
     if hasattr(m, "feature_importances_"):
         importance = {features[i]: round(m.feature_importances_[i], 4) for i in range(len(features))}
     elif hasattr(m, "coef_"):
-        coef = m.coef_[0] if m.coef_.ndim > 1 else m.coef_
-        importance = {features[i]: round(coef[i], 4) for i in range(len(features))}
+        # 2026-10-01 修复（P1）：多分类逻辑回归的 coef_ 形状是 (n_classes, n_features)，
+        # 原实现只取第 0 类系数（=「类0 vs 其余」的判别方向），标题却是「特征重要性」，
+        # 大小和方向都可能误导。多分类按各类系数绝对值取均值聚合。
+        import numpy as _np
+        coef = _np.abs(m.coef_).mean(axis=0) if m.coef_.ndim > 1 else m.coef_
+        importance = {features[i]: round(float(coef[i]), 4) for i in range(len(features))}
 
     # 保存模型（key 按库隔离，切库后旧库模型不可见）
     name = f"{model_type}_{table}_{target or 'nosup'}"
@@ -276,6 +317,8 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
         "target": target,
         "samples": len(df),
         "charts": charts,
+        # 缺失值剔除说明（无剔除为空串）：让"有效数据不足"类问题可解释
+        "data_note": data_note,
         # 跨表取数说明（单表训练为空串）：结果卡上原样展示，方便演示时讲清数据从哪来
         "join_note": (f"跨表取数：{table} ⋈ {join_spec.get('table')}"
                       f"（按 {join_spec.get('on')} 汇总 {join_spec.get('col')}）"
@@ -339,37 +382,48 @@ def predict(model_name: str, data: dict) -> dict:
     features = store["features"]
 
     X = []
+    warnings = []
     for f in features:
-        val = data.get(f, 0)
+        if f not in data:
+            # 2026-10-01 修复（P0）：缺特征原来静默填 0（标准化后≈均值、标签编码后=第一个
+            # 类别），会得到"看似合理"的错误预测且毫无提示。现仍按默认值推理（保证"只给
+            # 部分字段"的问法能出结果），但缺失项记入 warnings 由结果卡透出。
+            val = 0
+            warnings.append(f"缺少输入「{f}」，已按默认值 0 处理")
+        else:
+            val = data[f]
         if f in encoders:
             try:
                 val = encoders[f].transform([str(val)])[0]
             except ValueError:
-                # 训练时未出现的类别：无法编码，回退到该列最常见的类别（而非静默当作 0 类）
+                # 训练时未出现的类别：无法编码，回退到第一个类别，并明确告知（不再静默）
                 le = encoders[f]
+                warnings.append(f"「{f}」的取值 {val!r} 未在训练数据中出现过，已按类别「{le.classes_[0]}」处理")
                 val = le.transform([le.classes_[0]])[0]
         try:
             X.append(float(val) if val is not None else 0)
         except (ValueError, TypeError):
             raise ValueError(f"预测输入字段 '{f}' 的值无法转为数值: {val!r}")
-    X_scaled = scaler.transform([X])
+    # 传 DataFrame 保持与训练时 fit 的特征名一致（传 list 会触发 sklearn 的
+    # "X does not have valid feature names" 警告刷屏控制台）
+    X_scaled = scaler.transform(pd.DataFrame([X], columns=features))
 
     model_type = store["model_type"]
     if model_type == "kmeans":
         pred = int(m.predict(X_scaled)[0])
-        return {"prediction": pred, "label": f"簇 {pred}"}
+        return {"prediction": pred, "label": f"簇 {pred}", "warnings": warnings}
     elif model_type == "isolation":
         pred = int(m.predict(X_scaled)[0])
-        return {"prediction": pred, "label": "正常" if pred == 1 else "异常"}
+        return {"prediction": pred, "label": "正常" if pred == 1 else "异常", "warnings": warnings}
     elif model_type in ("linear",):
         pred = float(m.predict(X_scaled)[0])
-        return {"prediction": round(pred, 4), "label": str(round(pred, 4))}
+        return {"prediction": round(pred, 4), "label": str(round(pred, 4)), "warnings": warnings}
     else:
         y_pred = m.predict(X_scaled)
         if le_target:
             label = le_target.inverse_transform([int(y_pred[0])])[0]
-            return {"prediction": int(y_pred[0]), "label": str(label)}
-        return {"prediction": float(y_pred[0]), "label": str(round(float(y_pred[0]), 4))}
+            return {"prediction": int(y_pred[0]), "label": str(label), "warnings": warnings}
+        return {"prediction": float(y_pred[0]), "label": str(round(float(y_pred[0]), 4)), "warnings": warnings}
 
 def _plot_importance(importance: dict, title: str) -> str:
     if not importance: return ""

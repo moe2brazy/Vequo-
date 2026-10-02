@@ -545,7 +545,13 @@ def _select_tables_by_llm(query: str) -> list[str]:
             "只输出 JSON 数组（不要任何其他内容），如 [\"表1\",\"表2\"]。\n\n"
             f"## 表清单\n{table_list}\n\n## 用户问题\n{query}"
         )
-        llm = _make_llm(temp=None, max_tokens=200, json_mode=True, timeout=10)
+        # 2026-10-01 提速（不降准）：选表是「从粗筛候选里挑 1-4 张」的分类匹配任务（max_tokens=200），
+        # 不是复杂 SQL 生成，不需要思考链。flash 思考链实测 3.9s/reasoning 1255 字（见 _make_llm 注释），
+        # 关思考后 1.3s 且 content 不再被思考 token 吃光。此处**仅选表**显式关思考，不影响 SQL 生成链。
+        # 三重兜底守准确率：①关键词+向量已把候选表排好序 ②返回前做真实表校正 ③选错表会被后续
+        # MQL 编译的列名校验拒掉。若实测选表准确率下降，删掉本行 extra_body 即可回退。
+        llm = _make_llm(temp=None, max_tokens=200, json_mode=True, timeout=10,
+                        extra_body={"enable_thinking": False})
         # P0-性能（2026-09-02）：SDK timeout 对长生成只是「块间空闲」上限，总时长仍可能 30s+。
         # 改流式 + 显式 10s 总 deadline：超时即放弃（返回空 → 调用方回退关键词匹配，绝不拖死推断链）。
         _resp = ""
@@ -3428,9 +3434,14 @@ _INTENT_LLM_PROMPT = """你是意图分类器。判断用户输入属于以下�
 
 
 def _classify_intent_llm(query: str) -> str:
-    """LLM 意图复核（仅在规则低置信时调用，超时/异常返回空串）"""
+    """LLM 意图复核（仅在规则低置信时调用，超时/异常返回空串）
+
+    2026-10-01 提速（不降准）：原调用漏设 timeout/max_retries，吃到 _make_llm 默认
+    timeout=120 + max_retries=2（单次最坏 360s）。意图复核只是对规则低置信的「纠错」，
+    规则本身就是兜底，这里显式收短超时 + 禁重试，避免上游抖动把整条响应拖死。
+    """
     try:
-        llm = _make_llm(temp=None, max_tokens=16)
+        llm = _make_llm(temp=None, max_tokens=16, timeout=10, max_retries=0)
         resp = llm.invoke([SystemMessage(content=_INTENT_LLM_PROMPT.format(query=query[:200]))])
         label = str(resp.content or "").strip().lower()
         label = re.sub(r'[^a-z_]', '', label)
@@ -5026,6 +5037,16 @@ class LLMService:
                 except Exception:
                     pass
             else:
+                # 未注册复合指标缺源数据（人均/周转/稼动率/OEE/单位成本…）：源头拒绝，
+                # 不让 LLM 用无关列冒充指标出"一本正经的错误答案"（2026-09-13 用户实测：
+                # 库存周转天数→MAX(可用库存) 4795 天）。2026-10-01 把此检查从选表之后
+                # 上移到选表之前：命中即毫秒级拒绝，不再白跑一次选表 LLM（省 ~7.6s）。
+                _ud_reason = _underivable_metric_reason(self.query)
+                if _ud_reason:
+                    self.error = _ud_reason
+                    yield _step("口径检查", "该指标所需源数据在当前库不存在，拒绝生成（防冒充）")
+                    yield {"type": "error", "message": self.error}
+                    return
                 # 口径溯源 hint：回退 LLM 时，只要命中注册指标也展示关联口径（白盒可解释）
                 self.metric_hint = self._build_metric_hint()
                 self.matched_tables = self._tables_from_metric_hits() or self._match_tables()
@@ -5153,15 +5174,6 @@ class LLMService:
                         _record_unmatched_query(self.query)
                     except Exception:
                         pass
-                    yield {"type": "error", "message": self.error}
-                    return
-                # 未注册复合指标缺源数据（人均/周转/稼动率…）：源头拒绝，不让 LLM
-                # 用无关列冒充指标出"一本正经的错误答案"（2026-09-13 用户实测：
-                # 库存周转天数→MAX(可用库存) 4795 天、人均产出→AVG(产量) 不除人数）
-                _ud_reason = _underivable_metric_reason(self.query)
-                if _ud_reason:
-                    self.error = _ud_reason
-                    yield _step("口径检查", "该指标所需源数据在当前库不存在，拒绝生成（防冒充）")
                     yield {"type": "error", "message": self.error}
                     return
                 # 主次反转（2026-09-14）：**结构化口径推断（MQL）为主路径**，自由生成 SQL 降为兜底。
@@ -5862,7 +5874,14 @@ class LLMService:
                     _f_analysis = None
                     if getattr(self, "_analysis_future", None) is None:
                         _f_analysis = _ex.submit(self._llm_analysis)
-                    llm_issue, _ev = _f_review.result()
+                    # 2026-10-01 提速（不降准）：原 .result() 无超时，复核链里 Critic/Evaluator
+                    # 若上游抖动会无限阻塞整条响应。加 45s 硬超时兜底（覆盖内部 30s 调用 +
+                    # 串行 Critic→Evaluator 两段），超时视为"无 issue、无评分"——即放行，
+                    # 与 _review_chain 自身 except 的空值语义一致，不改判定正确性。
+                    try:
+                        llm_issue, _ev = _f_review.result(timeout=45)
+                    except Exception:
+                        llm_issue, _ev = "", {}
                     if _f_analysis is not None:
                         self._analysis_future = _f_analysis
                 if llm_issue:
@@ -6010,8 +6029,16 @@ class LLMService:
         # ── 语义缓存沉淀：SQL 执行成功 + 无结果告警 + 规则复核通过才写入。
         # 2026-09-12 修复：此前没有 _validate_result 门，"能跑但答非所问"的 SQL 也会沉淀，
         # 下次同义问法 0.2s 直接复用错误结果（评测 postgres#15/#19 实锤）。
+        # 2026-10-01 补第三道门 _output_quality_reason：前两道漏掉的是「退化输出」——
+        # nl2sql.log 里多例「命中 6 张表却退化成 SELECT t.* LIMIT 100 裸明细」：
+        # _validate_result 只在 _needs_aggregation 为真时才查 SELECT *，非聚合问法绕得过；
+        # _result_warning 也不覆盖。这类条目一旦沉淀，维度表 TTL 长达 86400s，
+        # 且命中侧（run() 的 _semantic_cache_hit）会跳过 LLM 复查直接复用 →
+        # 错误答案此后 0.2s 稳定复现一整天，比慢更难发现。
+        # 只影响"是否沉淀"，不阻断本次结果返回，误伤代价仅为下次不命中缓存。
         if not self.fast and self.sql_result.get("success") and self.sql_result.get("rows") \
-                and not self._result_warning and not self._validate_result():
+                and not self._result_warning and not self._validate_result() \
+                and not _output_quality_reason(self.query, self.sql):
             self._semantic_cache_store()
 
         # ── Step 6: 图表生成（先按真实数据结构校正图表类型）──
@@ -6096,8 +6123,22 @@ class LLMService:
         except Exception:
             pass
 
-        yield {"type": "done", "elapsed_ms": elapsed,
-               "response": self._build_response()}
+        if self.fast:
+            # 评测快速模式：保持原行为（done 同步带 LLM 洞察），不做洞察后置，
+            # 避免评测链路依赖的 analysis 内容从 LLM 洞察退化成规则摘要。
+            yield {"type": "done", "elapsed_ms": elapsed,
+                   "response": self._build_response()}
+        else:
+            # 洞察后置（2026-10-01 提速，零准确率影响）：done 事件里 analysis 先用
+            # 规则摘要占位（同步、不调 LLM），前端收到 done 即能渲染完整结果
+            # （表格 + 图表 + 规则摘要）；LLM 业务解读随后以独立 analysis 事件补发。
+            # _take_analysis 取回上方 _start_analysis 已并行提交的任务结果；
+            # 若尚未完成则在此阻塞等（内部 30s 超时 + 规则摘要兜底）。
+            yield {"type": "done", "elapsed_ms": elapsed,
+                   "response": self._build_response(analysis_deferred=True)}
+            _anl = self._take_analysis()
+            if _anl:
+                yield {"type": "analysis", "text": _anl}
 
     # ── SQL 生成（流式）──────────────────────────────────
 
@@ -6710,7 +6751,10 @@ class LLMService:
                 f"{agg_hint or '（无）'}\n\n"
                 f"## 查询结果\n{result_block}"
             )
-            llm = _make_llm(temp=0.0, max_tokens=140)
+            # 2026-10-01 提速（不降准）：补短超时 + 禁重试（原默认 120s×2 最坏 360s）。
+            # Critic 失败由上层 _review_chain 的 except 兜底返回空 issue（即"放行"），
+            # 收紧超时不会改变判定结果，只防止上游抖动无限拖慢响应。
+            llm = _make_llm(temp=0.0, max_tokens=140, timeout=30, max_retries=0)
             resp = llm.invoke([SystemMessage(content=prompt)])
             verdict = str(resp.content or "").strip()
             if verdict.upper().startswith("OK"):
@@ -6819,7 +6863,9 @@ class LLMService:
                 f"## 业务口径提示（如有）\n{hint or '（无）'}\n\n"
                 f"## 查询结果\n{result_block}"
             )
-            llm = _make_llm(temp=0.0, max_tokens=220, json_mode=True)
+            # 2026-10-01 提速（不降准）：补短超时 + 禁重试（原默认 120s×2 最坏 360s）。
+            # Evaluator 失败返回空 dict → 不触发低分交叉验证，仅少一次兜底重选，无正确性损失。
+            llm = _make_llm(temp=0.0, max_tokens=220, json_mode=True, timeout=30, max_retries=0)
             raw = str(llm.invoke([SystemMessage(content=prompt)]).content or "")
             data = _loads_lenient(raw)
             if not isinstance(data, dict):
@@ -7067,7 +7113,7 @@ class LLMService:
         except Exception:
             return self._quick_analysis()
 
-    def _build_response(self) -> dict:
+    def _build_response(self, analysis_deferred: bool = False) -> dict:
         matched = self.matched_tables
         # 无数值列的结果（纯列表）→ 标记 table 类型展示
         chart_type_final = self.chart.get("type", "none")
@@ -7088,7 +7134,9 @@ class LLMService:
             "chart": {"type": chart_type_final, "svg": self.chart.get("svg", "")},  # SVG 一并带回，前端据此优先渲染图表
             "chart_config": {"type": chart_type_final, "title": self.title},
             # 洞察可能已在 run() 中并行启动，这里取结果（无并行任务时自动回退同步生成）
-            "analysis": self._take_analysis(),
+            # 2026-10-01 洞察后置：done 事件不再阻塞等 LLM 洞察，先用规则摘要占位，
+            # LLM 洞察由 run() 在 done 之后以独立 analysis 事件补发（见 run() 结尾）。
+            "analysis": (self._quick_analysis() if analysis_deferred else self._take_analysis()),
             "recommended": self._quick_recommended(),
             "prediction": [],
             # 规则化归因（Phase 6.1）：环比下跌检测 + 维度贡献（纯计算，无信号为空串）
@@ -7528,7 +7576,9 @@ class LLMService:
                 if corr:
                     prompt += f"\n\n{corr}"
             prompt += "\n\n注意：只依据上面给出的真实数据下结论，不要编造数据中不存在的数字。"
-            llm = _make_llm(temp=0.0, max_tokens=512)
+            # 2026-10-01 提速（不降准）：补短超时 + 禁重试（原默认 120s×2 最坏 360s）。
+            # 洞察失败走 _quick_analysis 规则摘要兜底（本函数 except 分支），收紧无正确性损失。
+            llm = _make_llm(temp=0.0, max_tokens=512, timeout=30, max_retries=0)
             resp = llm.invoke([HumanMessage(content=prompt)])
             text = str(resp.content or "").strip()
             text = text or self._quick_analysis()
@@ -7990,19 +8040,39 @@ class LLMService:
                    "response": {"type": "ml_error", "error": "还没有可用的模型，请先训练。例如：用 XX 表训练模型预测 XX"}}
             return
 
-        # 从用户输入提取 "字段=值" 或 "字段是值"
-        values = {}
-        for m in re.finditer(r'([A-Za-z_][A-Za-z0-9_]*)\s*[=:是]\s*(-?\d+(?:\.\d+)?)', self.query):
-            values[m.group(1)] = float(m.group(2))
+        # 2026-10-01 修复（P0）：原正则只认英文列名，但结果卡上的提示就是「字段=数值」，
+        # 用户照着用中文说法问（「计划数量=1200 时的预测结果」）必然解析失败。
+        # 现在：短语先直接匹配特征列名（英文列名原样可用），匹配不上再走
+        # ml_plan.resolve_column 的中文词表映射（与建模时同一套口径）。
+        from agent.ml_plan import resolve_column
+        feats = model.get("features", [])
+        feat_cols = [{"name": f} for f in feats]
+        values: dict[str, float] = {}
+        for m in re.finditer(
+                r'([\u4e00-\u9fa5A-Za-z_][\u4e00-\u9fa5A-Za-z0-9_]{0,19})\s*[=：:是]\s*(-?\d+(?:\.\d+)?)',
+                self.query):
+            phrase = re.sub(r'^[当把将按照依据基于以看]+', '', m.group(1).strip())
+            if phrase in feats:
+                col = phrase                      # 用户直接写了英文列名
+            else:
+                col, _score = resolve_column(phrase, feat_cols, numeric_only=False, strict=False)
+                if not col:
+                    continue                      # 识别不了的短语跳过（可能不是在描述输入）
+            values[col] = float(m.group(2))
         if not values:
             feats = model.get("features", [])
             sample = "、".join(f"{f}=数值" for f in feats[:3])
             yield {"type": "done",
                    "response": {"type": "ml_error",
-                                "error": f"请提供预测输入，例如：{sample} 时的预测结果"}}
+                                "error": f"请提供预测输入，例如：{sample} 时的预测结果（支持中文字段名，如「计划数量=1200」）"}}
             return
 
         result = predict(model_name, values)
+        row = {"输入": json.dumps(values, ensure_ascii=False),
+               "预测": result.get("label", result.get("prediction"))}
+        if result.get("warnings"):
+            # 2026-10-01：缺特征/未见过的类别不再静默，结果卡「备注」列直接说明
+            row["备注"] = "；".join(result["warnings"])
         yield {"type": "done",
                "response": {
                    "type": "ml_result",
@@ -8010,7 +8080,7 @@ class LLMService:
                        "success": True,
                        "model": {"name": model_name, "label": model.get("label", model_name)},
                        "metrics": {},
-                       "pred_samples": [{"输入": json.dumps(values, ensure_ascii=False), "预测": result.get("label", result.get("prediction"))}],
+                       "pred_samples": [row],
                    },
                    "model_name": model_name,
                }}
@@ -9479,12 +9549,45 @@ _UNDERIVABLE_METRIC_RULES: list[tuple[re.Pattern, re.Pattern, str]] = [
      "周转天数=库存/日均出库）。当前数据库只有库存快照（可用/冻结/安全库存），"
      "没有流量字段，无法计算周转。请接入出入库流水数据，"
      "或在结果卡片「去登记口径」明确周转的计算公式。"),
-    (re.compile(r"稼动率|开动率|产能利用率|设备利用率"),
+    (re.compile(r"稼动率|开动率|产能利用率|设备利用率|设备综合效率|OEE"),
      re.compile(r"运行时长|开机时长|运转|稼动|run_time|uptime|run_hours|operating_hours|"
                 r"runtime", re.I),
      "稼动率/利用率类指标需要「运行/开机时长」字段（稼动率=运行时间/计划时间）。"
      "当前数据库只有停机记录（downtime），缺少计划/日历工时，无法计算稼动率。"
      "请接入设备运行时长数据，或在结果卡片「去登记口径」明确稼动率的计算公式。"),
+    (re.compile(r"单位生产成本|单件成本|生产成本|单位成本"),
+     re.compile(r"成本|cost|amount|金额|price|花费|单价", re.I),
+     "单位生产成本需要「成本金额」字段（单位成本=总成本/产量）。"
+     "当前数据库没有成本类字段，无法计算单位生产成本。"
+     "请接入成本核算数据，或在结果卡片「去登记口径」明确成本的计算公式。"),
+    # ── 2026-10-01 补充：四个「率」类复合指标，全库均缺源字段，一并源头拒绝 ──
+    # 用户实测（三组测试 C 组）：报废率/订单满足率/物料齐套率/停机率走 LLM 直生时，
+    # 会拿无关列冒充（报废率→缺陷数、停机率→停机记录条数），产出"一本正经的错误答案"。
+    # 与上方四条同逻辑：生成前拒绝 + 引导到已注册的替代口径，而不是让 LLM 编一个能跑的 SQL。
+    (re.compile(r"报废率|报废数|报废量|废品率|废品数|报废"),
+     re.compile(r"报废|废品|scrap|waste|reject", re.I),
+     "报废率需要「报废/废品数量」字段（报废率=报废数/投入数）。当前数据库只有"
+     "「不良(defect)」「返工(rework)」数据，报废≠不良，不能用缺陷数冒充。"
+     "已注册口径中「工序不良率」「抽检不良率」「一次直通率」可查良率/不良类指标；"
+     "如需报废率请接入报废数据，或在结果卡片「去登记口径」明确报废的计算公式。"),
+    (re.compile(r"订单满足率|订单交付率|按时交付率|交付率|订单满足"),
+     re.compile(r"交付|发货|出库|delivery|shipment|deliver|ship|fulfill|on_time", re.I),
+     "订单满足率需要「客户订单 + 交付/发货」数据（满足率=按时足量交付订单数/总订单数）。"
+     "当前数据库只有生产工单（计划量/状态），没有客户订单与交付记录。"
+     "已注册口径中「计划达成率」「工单完成率」「超产/欠产工单数」可从生产侧反映完成情况；"
+     "如需订单满足率请接入订单交付数据，或在结果卡片「去登记口径」明确计算公式。"),
+    (re.compile(r"物料齐套率|齐套率|齐套"),
+     re.compile(r"齐套|配套|bom|kitting|套料|物料清单|齐套状态", re.I),
+     "物料齐套率需要「BOM 清单 + 齐套状态」数据（齐套率=齐套工单数/总工单数）。"
+     "当前数据库没有 BOM/齐套相关表字段，无法计算齐套率。"
+     "已注册口径中「库存缺口量」「缺货品种数」可反映缺料情况；"
+     "如需齐套率请接入 BOM/齐套数据，或在结果卡片「去登记口径」明确计算公式。"),
+    (re.compile(r"停机率|停机时间占比"),
+     re.compile(r"计划运行|计划工时|日历|计划时间|scheduled|schedule_time|plan_hours|calendar", re.I),
+     "停机率需要「计划运行时长/日历工时」做分母（停机率=停机时长/计划运行时长）。"
+     "当前数据库只有停机记录（停机时长/原因），没有计划运行时长，无法计算停机率。"
+     "已注册口径中「设备可用率」「设备故障停机占比」及各类停机原因时长可查停机相关情况；"
+     "如需停机率请接入计划工时数据，或在结果卡片「去登记口径」明确计算公式。"),
 ]
 
 
@@ -11612,8 +11715,18 @@ def _sem_persist_load(db_key: str) -> None:
             if db_key not in _SEM_CACHE:
                 _SEM_CACHE[db_key] = []
             existing = {e.get("query") for e in _SEM_CACHE[db_key]}
+            # 维度对齐（2026-10-01）：持久层条目可能来自另一种 embedding 来源
+            # （本地 bge 512 维 / API / ngram 兜底 4096 维）。异维度条目恢复进内存后
+            # 在 _cos_sim 里永远判不出 ≥0.92，却会一直占着每库 200 条的名额，
+            # 把有效条目挤出去。恢复时就按当前 embedding 维度过滤掉。
+            try:
+                _dim_now = len(_embed_query("__dim__") or [])
+            except Exception:
+                _dim_now = 0
             for e in data:
                 if e.get("query") and e["query"] not in existing and "vec" in e:
+                    if _dim_now and len(e.get("vec") or []) != _dim_now:
+                        continue
                     _SEM_CACHE[db_key].append(e)
                     existing.add(e["query"])
     except Exception:
@@ -11647,6 +11760,15 @@ def _cos_sim(a, b) -> float:
     向量模长不一致，直接裸点积会随模长漂移，导致 0.92 阈值判定失真。
     """
     try:
+        # 维度必须一致（2026-10-01 修复）：zip() 会在较短向量处静默截断，
+        # 而下面的模长仍按各自**全长**计算 —— 512 维（bge）条目 vs 4096 维
+        # （ngram 兜底）查询时，分子只累加前 512 维、分母却摊到 4096 维，
+        # 相似度被系统性压低，永远够不到 0.92 阈值 → 语义缓存长期 0 命中、
+        # 每次都重跑整条 LLM 链路（日志里反复出现的 40s+ 即由此而来）。
+        # 混合来源（本地模型 ↔ API ↔ ngram 兜底）与持久层恢复的旧条目都会触发，
+        # 因此这里直接判定为不相似，而不是算出一个失真的低分。
+        if a is None or b is None or len(a) != len(b):
+            return 0.0
         na = math.sqrt(sum(x * x for x in a))
         nb = math.sqrt(sum(x * x for x in b))
         if na == 0 or nb == 0:
@@ -11661,10 +11783,32 @@ def _semantic_lookup(query: str, db_key: str, acl_fp: str):
     if not _SEM_CACHE_ENABLED:
         return None
     _sem_persist_load(db_key)  # 首次访问懒加载持久层条目（重启后不丢缓存）
+    now = time.time()
+    # ── 精确匹配快速路径（2026-10-01 提速，零准确率影响）──
+    # 完全相同的问法（字符串精确相等）直接复用历史 SQL，无需 embedding 推理。
+    # 此前只有 embedding 余弦相似度一条路：每次命中都要跑一遍本地/API embedding
+    # （几十~几百 ms），且一旦 embedding 服务抖动，同问法也会 0 命中、重跑整条 LLM 链。
+    # 精确相等是纯字符串判断：相同问法答案必然相同，且条目沉淀时已过三重质量门
+    # （执行成功 + 无告警 + 规则复核 + 退化闸门），复用零风险。
+    with _SEM_CACHE_LOCK:
+        for e in _SEM_CACHE.get(db_key, []):
+            if now - e.get("ts", 0) > _entry_ttl(e.get("tables")):
+                continue
+            if e.get("acl_fp", "") != acl_fp:
+                continue
+            if e.get("query") == query:
+                return {
+                    "sql": e["sql"],
+                    "matched_tables": e["matched_tables"],
+                    "schema_context": e["schema_context"],
+                    "chart_type": e.get("chart_type", ""),
+                    "similarity": 1.0,
+                    "compiled": e.get("compiled", False),
+                    "mql": e.get("mql"),
+                }
     vec = _embed_query(query)
     if not vec:
         return None
-    now = time.time()
     best, best_sim = None, 0.0
     with _SEM_CACHE_LOCK:
         for e in _SEM_CACHE.get(db_key, []):

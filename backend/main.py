@@ -30,9 +30,9 @@ from agent.llm_service import (
     _make_llm,
 )
 from agent.chart_agent import generate_chart
-from ml.trainer import (
-    MODEL_TYPES, train_model, predict, list_trained_models, get_numeric_tables,
-)
+# 2026-10-01 轻量化：ml.trainer 顶层 import 会连带加载 pandas/sklearn/matplotlib 全家桶，
+# 但 ML 建模只是边缘功能（4 个路由），却让每次启动多付 2~4 秒 + 约 200MB 常驻内存。
+# 改为路由内惰性 import（与下方 feedback/csv_import 的写法一致）。
 import uvicorn
 
 app = FastAPI(title="Vequo 维阔 NL2SQL Agent", version="2.0.0")
@@ -1370,7 +1370,11 @@ async def upload_csv_api(file: UploadFile = File(...), authorization: str = Head
         content = await file.read()
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"读取上传文件失败：{e}")
-    r = import_csv(content, file.filename or "")
+    # 2026-10-01 可靠性修复：import_csv 是同步重 IO（解析最大 5MB CSV + 建表 + 逐行 INSERT），
+    # 在 async 路由里直接调用会阻塞事件循环——导入期间所有 SSE 流式问答全部停摆。
+    # 丢进线程池执行，事件循环保持畅通。
+    import asyncio
+    r = await asyncio.to_thread(import_csv, content, file.filename or "")
     if not r.get("success"):
         raise HTTPException(status_code=400, detail=r.get("error", "导入失败"))
     return {"success": True, **r}
@@ -2172,16 +2176,19 @@ def chart_recommend_type(cfg: RecommendChartRequest):
 
 @app.get("/api/ml/tables")
 def ml_tables():
+    from ml.trainer import get_numeric_tables
     return {"tables": get_numeric_tables()}
 
 
 @app.get("/api/ml/models")
 def ml_models():
+    from ml.trainer import MODEL_TYPES, list_trained_models
     return {"model_types": MODEL_TYPES, "trained": list_trained_models()}
 
 
 @app.post("/api/ml/train", dependencies=[Depends(require_roles("admin"))])
 def ml_train(req: TrainRequest):
+    from ml.trainer import MODEL_TYPES, train_model
     if req.model_type not in MODEL_TYPES:
         raise HTTPException(status_code=400, detail=f"不支持的模型类型: {req.model_type}")
     try:
@@ -2195,6 +2202,7 @@ def ml_train(req: TrainRequest):
 
 @app.post("/api/ml/predict", dependencies=[Depends(require_roles("admin"))])
 def ml_predict(req: PredictRequest):
+    from ml.trainer import predict
     try:
         return predict(req.model_name, req.data)
     except ValueError as e:
@@ -3352,6 +3360,17 @@ def _warmup_knowledge_cache():
                           f"embedding={get_embedding_mode()}（{_t.time()-_t0:.1f}s）")
                 except Exception as _e4:
                     print(f"[预热] 问数链路预热失败（不影响启动）: {_e4}")
+                # ── ML 模块预热（2026-10-01）：ml.trainer 已改为用时懒加载
+                # （启动提速 2~4s / 省 200MB），但演示场景需要 ML 功能首次点击即响应，
+                # 故启动后由本后台线程预先完成 pandas/sklearn/matplotlib 的加载——
+                # 启动速度不受影响，演示时不背首次加载的 3~5s。失败静默不影响其他功能。
+                try:
+                    _t0 = _t.time()
+                    from ml.trainer import list_trained_models  # noqa: F401 — import 即完成重库加载
+                    list_trained_models()
+                    print(f"[预热] ML 模块就绪（{_t.time()-_t0:.1f}s）")
+                except Exception as _e5:
+                    print(f"[预热] ML 模块预热失败（不影响启动，首次使用时会再尝试）: {_e5}")
             finally:
                 try:
                     _db.close()

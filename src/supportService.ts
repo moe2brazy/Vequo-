@@ -11,8 +11,8 @@
  * 人工客服界面位于悬浮球内的「人工客服」视图（AiAssistantFab.vue），不单独成页。
  */
 
-import { ref, computed } from 'vue'
-import { getUser, isAdmin } from './auth'
+import { ref } from 'vue'
+import { getUser } from './auth'
 import { PROFILE_STORAGE_KEY } from './profile'
 
 // ====== 类型 ======
@@ -229,10 +229,12 @@ export async function updateFeedbackStatus(
 
 // ====== 全局未读（浮动球红点 / 页面入口角标）======
 export const supportUnread = ref(0)
-export const supportIsAdmin = computed(() => isAdmin())
+// 2026-10-01 清理：删除死导出 supportIsAdmin——computed 读 localStorage（非响应式）
+// 首次求值后永久缓存，且全项目无消费方，属纯误导性死代码。需要时直接调 isAdmin()。
 
 let pollTimer: number | null = null
 let pollRefs = 0
+let pollGeneration = 0 // 2026-10-01 修复：代次令牌，防止全局 stop 后旧 stopper 误杀新一轮轮询
 const DEFAULT_POLL_MS = 5000
 /**
  * 修复（P0）：token 失效后必须停止轮询。
@@ -257,7 +259,10 @@ async function poll(): Promise<void> {
 /** 停止未读轮询（登出 / token 失效时由认证层显式调用） */
 export function stopSupportPolling(): void {
   pollingDisabled = true
-  pollRefs = 0
+  // 2026-10-01 修复：不再把 pollRefs 清零——存活组件仍持有 stopper，
+  // 清零会导致旧 stopper 递减时把新 start 的引用计数击穿、误杀新定时器；
+  // 改用代次令牌：bump 后旧 stopper 永远无法关闭新开启的定时器
+  pollGeneration += 1
   if (pollTimer !== null) {
     window.clearInterval(pollTimer)
     pollTimer = null
@@ -267,6 +272,8 @@ export function stopSupportPolling(): void {
 /** 重新允许未读轮询（重新登录成功后由认证层调用） */
 export function resetSupportPolling(): void {
   pollingDisabled = false
+  // 2026-10-01 修复：stop 不再清零 refs，仍有组件持有时这里能真正把定时器重启
+  // （原实现 pollRefs 已被 stop 清零，此函数实际是 no-op）
   if (pollRefs > 0 && pollTimer === null) {
     void poll()
     pollTimer = window.setInterval(poll, DEFAULT_POLL_MS)
@@ -276,6 +283,7 @@ export function resetSupportPolling(): void {
 /** 开启未读轮询（引用计数：悬浮球与客服页同时挂载也只跑一个定时器） */
 export function startSupportPolling(intervalMs = DEFAULT_POLL_MS): () => void {
   pollingDisabled = false // 重新挂载视为一次全新的尝试
+  const myGen = pollGeneration
   pollRefs += 1
   if (pollTimer === null) {
     void poll()
@@ -283,7 +291,9 @@ export function startSupportPolling(intervalMs = DEFAULT_POLL_MS): () => void {
   }
   return () => {
     pollRefs = Math.max(0, pollRefs - 1)
-    if (pollRefs === 0 && pollTimer !== null) {
+    // 仅当代次未变（中间没发生过全局 stop）才允许关闭定时器；
+    // 全局 stop 后重启的新定时器属于新代次，旧 stopper 无权关闭
+    if (pollRefs === 0 && pollTimer !== null && myGen === pollGeneration) {
       window.clearInterval(pollTimer)
       pollTimer = null
     }
