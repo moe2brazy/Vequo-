@@ -259,9 +259,52 @@ export function buildEChartOption(type: string, cols: string[], rows: any[], pal
   }
 }
 
+/**
+ * 可渲染性判定/降级（2026-10-02 用户反馈「切换图型后还是柱状图」）：
+ * 目标图型缺数据前置条件时 buildEChartOption 返回 null，调用方回退
+ * data-fallback——那是最初图型的后端 SVG（通常就是柱状图），用户观感
+ * 就是"选了没反应"。这里统一提供判定（供下拉禁用选项）与降级
+ * （供切换失败重试）两个工具。
+ *
+ * ⚠️ 语义约定（2026-10-02 二次修复）：返回 null = 数据形态画不出该图型；
+ * 返回非 null = 可渲染。此前 scatter 单指标返回 'bar'（降级目标），
+ * 而下拉禁用逻辑用「!== null」判定 → 散点没被禁用 → 选中后又被降级回
+ * 柱状，用户看到的正是"选了没反应"。现在：不可渲染一律返回 null，
+ * 降级到 bar 由调用方显式处理（bar 是最通用的兜底图型）。
+ *
+ * 判定规则（与 buildEChartOption 的 null 分支一致）：
+ * - 任何图型都需要 ≥1 个数值列（没有则谁都画不了，返回 null）
+ * - scatter 需要 ≥2 个数值列（x/y），单指标 → null（下拉禁用）
+ * - stacked 需要 ≥2 个数值列：单系列堆叠在视觉上与普通柱状完全相同
+ *   （没有第二个系列可叠），用户会当成"切换没生效"→ null（禁用）
+ * - pie/donut 数值列全 0 画不出扇区 → null（禁用）
+ */
+export function coerceRenderableType(type: string, cols: string[], rows: any[]): string | null {
+  const t = String(type || '').toLowerCase()
+  if (!ECHARTS_TYPES.has(t)) return null
+  const numCols = (cols || []).filter((c) => isNumCol(c, rows || []))
+  if (!numCols.length) return null
+  if (t === 'scatter' && numCols.length < 2) return null
+  if (t === 'stacked' && numCols.length < 2) return null
+  if (t === 'pie' || t === 'donut') {
+    const v = numCols[0]
+    if (rows && rows.length && rows.every((r) => !toNum(r?.[v]))) return null
+  }
+  return t
+}
+
+/**
+ * 切换降级链：目标图型不可渲染时的兜底顺序（供调用方在 coerce 返回 null 后使用）。
+ * bar 是最通用的图型（≥1 个数值列即可画），bar 也画不了（0 数值列）才回 SVG。
+ */
+export function downgradeChartType(type: string, cols: string[], rows: any[]): string | null {
+  if (coerceRenderableType(type, cols, rows)) return String(type || '').toLowerCase()
+  if (type !== 'bar' && coerceRenderableType('bar', cols, rows)) return 'bar'
+  return null
+}
+
 /** 销毁容器上可能存在的两个引擎实例 */
-export function disposeChart(el: HTMLElement) {
-  try {
+export function disposeChart(el: HTMLElement) {  try {
     echarts.getInstanceByDom(el)?.dispose()
   } catch { /* 忽略 */ }
   try {
@@ -311,6 +354,12 @@ export async function renderChart(
   RENDER_SEQ.set(el, seq)
   const isStale = () => RENDER_SEQ.get(el) !== seq
 
+  // 2026-10-02 加固：统一在入口清掉容器上残留的两个引擎旧实例。原先只有 ECharts
+  // 分支内部清、G2 分支依赖调用方先 dispose——契约不一致，未来新调用方一旦漏掉
+  // dispose，G2 canvas 会叠在旧 ECharts canvas 上（双画布残影 + 监听器泄漏）。
+  // disposeChart 幂等，调用方已清过的场景无副作用。
+  disposeChart(el)
+
   const wantG2 = isG2PlotType(t)
   // 首选引擎
   if (wantG2) {
@@ -344,7 +393,7 @@ export async function renderChart(
   const option = buildEChartOption(t, cols, rows, palette)
   if (option) {
     try {
-      disposeChart(el) // 清掉残留旧实例，避免 echarts 在"已销毁实例的 DOM"上复用
+      // 旧实例已由 renderChart 入口的 disposeChart 统一清理（2026-10-02 上移）
       echarts.init(el).setOption(option)
       if (isStale()) return null
       return 'echarts'

@@ -472,7 +472,9 @@
                   title="切换图表类型（不重新查询数据）"
                 >
                   <option value="" disabled>切换图型…</option>
-                  <option v-for="t in chartTypeOptions" :key="t.v" :value="t.v">{{ t.label }}</option>
+                  <option v-for="t in chartTypeOptions" :key="t.v" :value="t.v"
+                          :disabled="!chartTypeRenderable(msg, t.v)"
+                          :title="chartTypeDisabledTip(msg, t.v)">{{ t.label }}</option>
                 </select>
                 <span v-if="msg.feedbackGiven" class="ask-feedback-done">{{ msg.feedbackText }}</span>
               </template>
@@ -699,7 +701,7 @@
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, onActivated, onUnmounted, nextTick, watch, inject } from 'vue'
 // 图表渲染：ECharts（常规图）+ AntV G2Plot（扩展图）双引擎统一入口
-import { renderChart, disposeChart, resizeChart } from '../charts'
+import { renderChart, disposeChart, resizeChart, coerceRenderableType, downgradeChartType } from '../charts'
 import echarts from '../echarts'
 import ModalDialog from '../components/ModalDialog.vue'
 import MetricClarifyCard from '../components/MetricClarifyCard.vue'
@@ -1284,12 +1286,13 @@ const columnLabelsOf = (data: any, msg?: any): Record<string, string> => {
   return out
 }
 
-// 表头文案：英文字段名后附中文翻译 → rework_qty（返工数量）；
+// 表头文案：中文业务名在前、英文字段名括号在后 → 返工数量（rework_qty）
+// （2026-10-02 用户要求统一「中文（英文）」顺序，原先是 rework_qty（返工数量））；
 // 列名本身已是中文（SQL 里已 AS 中文别名）则保持原样，不重复标注。
 const headerText = (name: string, labels?: Record<string, string>): string => {
   const cn = (labels || {})[name]
   if (!cn || /[\u4e00-\u9fff]/.test(name)) return name
-  return `${name}（${cn}）`
+  return `${cn}（${name}）`
 }
 
 // 渲染数据表格（labels：结果列中文名映射，可选）
@@ -1299,7 +1302,7 @@ const renderTable = (columns: string[], rows: any[], labels?: Record<string, str
   html += '<thead><tr>'
   columns.forEach(c => {
     const label = labels && labels[c]
-    const title = label ? ` title="${esc(c)}（${esc(label)}）"` : ''
+    const title = label ? ` title="${esc(label)}（${esc(c)}）"` : ''
     html += `<th${title}>${esc(headerText(c, labels))}</th>`
   })
   html += '</tr></thead><tbody>'
@@ -1620,7 +1623,17 @@ const renderECharts = async () => {
       if (!cols.length || !rows.length) throw new Error('bad chart data')
       // 同一 DOM 重复渲染前先销毁旧实例（两种引擎都要清），防止实例堆积
       disposeChart(el)
-      const engine = await renderChart(el, type, cols, rows)
+      let engine = await renderChart(el, type, cols, rows)
+      if (!engine) {
+        // 目标图型数据形态不满足（如单指标选散点）→ 先降级到最近可渲染图型重试，
+        // 再走 SVG 兜底（2026-10-02：直接弹回初始 SVG 会被用户看成"切换没生效"；
+        // 二次修复：降级链改用 downgradeChartType，coerce 只做可否渲染判定）
+        const alt = downgradeChartType(type, cols, rows)
+        if (alt && alt !== type) {
+          el.dataset.type = alt
+          engine = await renderChart(el, alt, cols, rows)
+        }
+      }
       if (!engine) throw new Error('no engine rendered')
       // 标记实际使用的引擎，便于样式微调与问题排查
       el.dataset.engine = engine
@@ -2483,6 +2496,9 @@ const openFeedbackDialog = (msg: any) => {
 }
 
 // ========== 图表类型切换（P1-2 对标 SpotterViz 简化版：不重跑 SQL）==========
+// 2026-10-02 用户反馈：裁掉非常见图（玫瑰/雷达/漏斗）——普通用户看不懂、
+// 且这些类型走 G2Plot 懒加载渲染链路更长。问答侧只保留 ECharts 常规 8 型；
+// 雷达/热力等仍可在仪表盘看板使用（后端 dashboard_agent 不受影响）。
 const chartTypeOptions = [
   { v: 'bar', label: '柱状图' },
   { v: 'barh', label: '横向柱状' },
@@ -2491,14 +2507,25 @@ const chartTypeOptions = [
   { v: 'area', label: '面积图' },
   { v: 'pie', label: '饼图' },
   { v: 'donut', label: '环形图' },
-  { v: 'rose', label: '玫瑰图' },
-  { v: 'radar', label: '雷达图' },
   { v: 'scatter', label: '散点图' },
-  { v: 'funnel', label: '漏斗图' },
 ]
 
 const hasChartData = (msg: any) =>
   !!(msg && msg.queryType === 'data_query' && msg.chartSvg && msg.columns && msg.columns.length > 0)
+
+// 图型可渲染性（2026-10-02 用户反馈「选了还是柱状图」）：按消息数据形态禁用
+// 不可渲染的选项——单指标数据禁用散点（需要 x/y 两个数值列）与堆叠柱
+// （单系列堆叠=普通柱状，视觉上"没变"）、全 0 数据禁用饼/环。
+// 否则选了会静默弹回初始柱状 SVG，看起来就像切换没生效。
+const chartTypeRenderable = (msg: any, v: string) => {
+  const cols: string[] = msg?.columns || []
+  const rows: any[] = msg?.rows || []
+  if (!cols.length || !rows.length) return true
+  return coerceRenderableType(v, cols, rows) !== null
+}
+// 禁用项的悬停说明（告知用户为何灰掉，而不是让用户反复点击怀疑坏了）
+const chartTypeDisabledTip = (msg: any, v: string) =>
+  chartTypeRenderable(msg, v) ? '' : '当前数据不支持该图型（如散点/堆叠需要两个及以上数值列），请先查询多指标数据'
 
 const switchChartType = (msg: any, type: string) => {
   if (!msg || !type) return
@@ -2516,23 +2543,34 @@ const switchChartType = (msg: any, type: string) => {
     node.dataset.type = type
     delete node.dataset.rendered
     disposeChart(node)
-    renderChart(node, type, cols, rows)
-      .then((engine) => {
-        if (engine) {
-          node.dataset.engine = engine
-        } else if (node.dataset.fallback) {
-          // 引擎返回 null（数据形态不匹配等）→ 回退后端 SVG，不留空白
-          node.innerHTML = node.dataset.fallback
-          node.dataset.engine = 'svg'
+    ;(async () => {
+      let engine = await renderChart(node, type, cols, rows)
+      if (!engine) {
+        // 数据形态不满足（如单指标选散点）→ 降级到最近可渲染图型重试，
+        // 而不是直接弹回初始柱状 SVG（那正是"选了还是柱状图"的观感来源）。
+        // 同步回写下拉值，保证所选=所显。2026-10-02 二次修复：降级链改用
+        // downgradeChartType（coerce 现在只做"可否渲染"判定，null=不可渲染）。
+        const alt = downgradeChartType(type, cols, rows)
+        if (alt && alt !== type) {
+          node.dataset.type = alt
+          msg.chartTypeOverride = alt
+          engine = await renderChart(node, alt, cols, rows)
         }
-      })
-      .catch(() => {
-        // 切换失败：回退到容器里保存的后端 SVG（与 renderECharts 的兜底一致，不留空白）
-        if (node.dataset.fallback) {
-          node.innerHTML = node.dataset.fallback
-          node.dataset.engine = 'svg'
-        }
-      })
+      }
+      if (engine) {
+        node.dataset.engine = engine
+      } else if (node.dataset.fallback) {
+        // 降级后仍失败 → 回退后端 SVG，不留空白
+        node.innerHTML = node.dataset.fallback
+        node.dataset.engine = 'svg'
+      }
+    })().catch(() => {
+      // 切换失败：回退到容器里保存的后端 SVG（与 renderECharts 的兜底一致，不留空白）
+      if (node.dataset.fallback) {
+        node.innerHTML = node.dataset.fallback
+        node.dataset.engine = 'svg'
+      }
+    })
   })
 }
 
@@ -3066,7 +3104,13 @@ watch(() => props.initialQuestion, (question) => {
 /* 独立 SQL 卡片正文：深色代码块，与浅色「分析结果」形成明确视觉区分 */
 .sql-code {
   margin: 0;
+  /* 2026-10-02 修复：此前漏设 color/padding——继承浅色区深灰文字落在
+     #0F172A 深底上几乎不可见，且 SQL 顶格贴边。显式给浅色 + 内边距。 */
+  padding: 12px 14px;
+  color: #D8E4F5;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.7;
   white-space: pre-wrap;
   word-break: break-word;
   max-height: 240px;

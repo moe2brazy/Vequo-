@@ -477,13 +477,23 @@ _PART_CN = {
     "plan": "计划", "planned": "计划", "actual": "实际", "safety": "安全", "available": "可用",
     "scheduled": "排程", "estimated": "预估", "expected": "预期", "target": "目标",
     "snapshot": "快照", "daily": "每日", "monthly": "每月", "weekly": "每周",
-    "line": "产线/行", "machine": "机器", "workshop": "车间", "shift": "班次",
+    "line": "产线", "machine": "机器", "workshop": "车间", "shift": "班次",
     "batch": "批次", "sample": "抽样", "fail": "不合格", "good": "合格",
     "pass": "通过", "qualified": "合格", "unqualified": "不合格", "defective": "不良",
     "normal": "正常", "abnormal": "异常", "department": "部门", "org": "组织",
     "gender": "性别", "age": "年龄", "phone": "电话", "email": "邮箱",
     "address": "地址", "city": "城市", "country": "国家", "currency": "货币",
     "payment": "付款", "delivery": "交货/配送", "shipment": "发货", "transport": "运输",
+    # 2026-10-02（用户反馈）：LLM 直生 SQL 常自造聚合别名（如 COUNT(*) AS inactive_count），
+    # 这类字段不在 schema 里，直译兜底是唯一翻译来源——有一段认不出就整词放弃，裸英文
+    # 直接暴露给用户。补齐高频状态/聚合词根，覆盖 inactive_count / active_num / cnt 等自造名。
+    "inactive": "未启用", "active": "启用", "enabled": "启用", "disabled": "停用",
+    "online": "在线", "offline": "离线", "unused": "未使用", "idle": "闲置",
+    "running": "运行", "stop": "停机", "cnt": "数量", "sum": "合计",
+    "median": "中位数", "pct": "百分比", "percent": "百分比", "percentage": "百分比",
+    "latest": "最新", "first": "首次", "last": "最近", "day": "天", "week": "周",
+    "month": "月", "year": "年", "hour": "小时", "user": "用户", "weight": "重量",
+    "spec": "规格", "version": "版本", "group": "分组", "value": "值", "val": "值",
 }
 
 

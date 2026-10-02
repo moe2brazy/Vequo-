@@ -3978,6 +3978,17 @@ def _upgrade_to_antv(query: str, rows: list[dict], date_cols: list[str],
     return None
 
 
+# ── 问答链路图型白名单（2026-10-02 用户反馈）──────────────────────────
+# 问答结果只出 ECharts 常规 8 型（柱/横柱/堆叠/折线/面积/饼/环/散点）：
+# 非常规图（雷达/玫瑰/热力/漏斗）由仪表盘看板专用——dashboard_agent 仍走
+# 完整 _validate_chart_type 不受影响。问答里这类图用户未必看得懂，且前端
+# 渲染要多走一环 G2Plot 懒加载（失败虽会回退 SVG，但链路越长风险越大）。
+# 映射取「视觉语义最接近」的常规图：雷达→分组柱状、玫瑰→饼图、
+# 热力→横向柱状（行多类目长，横向更可读）、漏斗→横向柱状（阶段对比）。
+_ASK_CHART_COMMON = {"bar", "barh", "stacked", "line", "area", "pie", "donut", "scatter", "table", "none"}
+_ASK_CHART_FALLBACK = {"radar": "bar", "rose": "pie", "heatmap": "barh", "funnel": "barh"}
+
+
 def _sample_rows(table_name: str, limit: int = 2) -> list[dict]:
     """取一张表的样例行（补充字段值语义，单次轻量查询，失败静默返回空）"""
     parts = table_name.split(".")
@@ -6044,12 +6055,17 @@ class LLMService:
         # ── Step 6: 图表生成（先按真实数据结构校正图表类型）──
         # 评测快速模式（fast）跳过图表渲染：评测只需要 SQL + 执行结果，SVG 生成纯属额外耗时
         if not self.fast and self.sql_result.get("rows") and len(self.sql_result["rows"]) >= 2:
-            self.chart_type = _validate_chart_type(
+            _ct = _validate_chart_type(
                 self.chart_type,
                 self.sql_result.get("columns") or [],
                 self.sql_result["rows"],
                 self.query,
             )
+            # 问答链路钳制为常见图型：非常见图映射为最接近的常规图
+            # （仪表盘看板走 dashboard_agent 自行调用，不经此处，不受影响）
+            if _ct not in _ASK_CHART_COMMON:
+                _ct = _ASK_CHART_FALLBACK.get(_ct, "bar")
+            self.chart_type = _ct
             if self.chart_type in ("table", "none"):
                 # 数据结构不适合作图（无数值列/单行）→ 直接以表格展示
                 self.chart = {"type": self.chart_type, "svg": ""}
@@ -7389,10 +7405,11 @@ class LLMService:
             text = detect_and_attribute(self.query, self.sql_result, self.matched_tables)
             if not text:
                 return ""
+            # 2026-10-02：归因文本同样兜底双语化（字段名禁止裸英文）
             # 快速模式（评测）不接 LLM，保持确定性输出
             if self.fast:
-                return text
-            return llm_explain(self.query, text, self.sql_result, self.matched_tables)
+                return _bilingualize(text)
+            return _bilingualize(llm_explain(self.query, text, self.sql_result, self.matched_tables))
         except Exception:
             return ""
 
@@ -7429,7 +7446,8 @@ class LLMService:
                 "\n\n【口径说明】本问按「%s」口径计算；近似口径还有：%s。"
                 "如需改用其中某个，请在追问里点名。"
                 % (_alt.get("chosen"), "、".join(_alt["others"])))
-        return text
+        # 2026-10-02：出口兜底双语化（幂等，规则摘要已在源头用双语标签）
+        return _bilingualize(text)
 
     def _retrieve_docs(self, k: int = 3) -> list[str]:
         """混合问答第一步：检索知识库业务文档（口径说明/SOP/制度）。
@@ -7507,12 +7525,17 @@ class LLMService:
             #（该分支已注入确定性相关证据）。仅对非分析类查询保留编译/缓存/简单 → 规则摘要，
             # 省 2-3s LLM 往返。
             _anal_intent = _is_analysis_intent(self.query)
-            if not _anal_intent and (_compiled or _sem_hit or _simple_rows) and rows:
+            # 2026-10-02（用户反馈「分析不专业不详细、没变化」）：单行结果（TOP1/单值）
+            # 不再短路到规则摘要——「哪个产品未启用最多」这类问法规则版只会复述数字
+            # 「inactive_count为 1」，点不了题；单行数据 prompt 极小，多花一次 2~3s
+            # LLM 换「直接回答 + 业务解读」值得。0 行仍走规则摘要。
+            _single_row = (len(rows) == 1)
+            if not _anal_intent and not _single_row and (_compiled or _sem_hit or _simple_rows) and rows:
                 base = self._quick_analysis()
                 return f"{base}\n\n⚠️ {warn}" if warn else base
         except Exception:
             pass
-        if not rows or len(rows) < 2:
+        if not rows:
             base = self._quick_analysis()
             return f"{base}\n\n⚠️ {warn}" if warn else base
         # 分析类问法：相关性结论确定性生成（零 LLM，秒出）
@@ -7582,6 +7605,8 @@ class LLMService:
             resp = llm.invoke([HumanMessage(content=prompt)])
             text = str(resp.content or "").strip()
             text = text or self._quick_analysis()
+            # 2026-10-02：LLM 仍可能漏出裸英文字段名 → 出口统一兜底双语化（幂等）
+            text = _bilingualize(text)
             _insight_store(self.query, _rc, text)
             if warn:
                 text += f"\n\n⚠️ 结果可靠性提示：{warn}"
@@ -7614,17 +7639,18 @@ class LLMService:
             elif "cat" in kinds and 2 <= len(distinct) <= 30:
                 cat_cols.append(c)
 
+        # 2026-10-02：推荐问题里的字段同样双语化（禁止「按stat_date查看…」这类裸英文）
         recs = []
         if date_cols and num_cols:
-            recs.append(f"按{date_cols[0]}查看{num_cols[0]}的变化趋势")
+            recs.append(f"按{_col_display(date_cols[0])}查看{_col_display(num_cols[0])}的变化趋势")
         if cat_cols and num_cols:
-            recs.append(f"按{cat_cols[0]}拆分对比{num_cols[0]}")
+            recs.append(f"按{_col_display(cat_cols[0])}拆分对比{_col_display(num_cols[0])}")
         if num_cols:
-            recs.append(f"列出{num_cols[0]}最高的 TOP10")
+            recs.append(f"列出{_col_display(num_cols[0])}最高的 TOP10")
         if not recs and date_cols:
-            recs.append(f"按{date_cols[0]}统计最近7天的变化趋势")
+            recs.append(f"按{_col_display(date_cols[0])}统计最近7天的变化趋势")
         if len(recs) < 2 and num_cols:
-            recs.append(f"分析{num_cols[0]}的异常值")
+            recs.append(f"分析{_col_display(num_cols[0])}的异常值")
         if not recs:
             recs.append("查看完整数据的字段分布情况")
         if len(recs) < 2:
@@ -8129,7 +8155,8 @@ def generate_analysis(query: str, sql: str, sql_result: dict) -> Generator[dict,
 
     rows = sql_result["rows"][:15]
     data_json = json.dumps(rows, ensure_ascii=False, default=str)
-    fields_info = ", ".join(sql_result["columns"])
+    # 2026-10-02：字段说明给双语名 + 结束时兜底双语化，杜绝裸英文字段名
+    fields_info = ", ".join(_col_display(c) for c in sql_result["columns"])
 
     prompt = ANALYSIS_SYSTEM_PROMPT.format(
         data_json=data_json[:1500],
@@ -8143,7 +8170,7 @@ def generate_analysis(query: str, sql: str, sql_result: dict) -> Generator[dict,
             t = chunk.content
             full += t
             yield {"type": "thought", "step": "数据分析", "text": t}
-    yield {"type": "done", "content": full}
+    yield {"type": "done", "content": _bilingualize(full)}
 
 
 def _linear_predict(values: list[float], horizon: int = 3) -> list[float]:
@@ -8424,12 +8451,62 @@ def _corr_strength(rv: float) -> str:
     return "较强负相关（此消彼长）"
 
 
+# ── 分析文本字段双语化（2026-10-02 用户要求）──
+# 用户反馈：分析结论里裸露英文字段名（equipment_name、defect_qty）业务用户看不懂，
+# 要求统一「中文（english_field）」格式。复用 field_semantics.field_label
+# （词典 > 内置语义 > 库注释 > 英文直译，与结果表头翻译同源，不另造映射）。
+
+def _col_display(col: str) -> str:
+    """列的展示名：英文字段 → 「中文（english）」；列名本身已是中文或翻不出中文 → 原样。"""
+    c = str(col or "").strip()
+    if not c or c == "*" or _FS_HAS_CN.search(c):
+        return c
+    try:
+        from agent.field_semantics import field_label
+        cn = field_label("", c)          # 表名未知 → 走字段通用语义/词典/直译
+    except Exception:
+        return c
+    return f"{cn}（{c}）" if cn and cn != c else c
+
+
+_FS_HAS_CN = re.compile(r"[\u4e00-\u9fff]")
+_EN_IDENT_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,}")
+
+
+def _bilingualize(text: str) -> str:
+    """后处理兜底：把文本里裸露的英文字段名替换成「中文（english）」。
+
+    用于 LLM 洞察输出——即便 prompt 有要求，模型仍可能漏。幂等：
+    已是「中文（english）」形态的（english 前紧贴「（」）不重复包裹；
+    词典翻不出的 token（如 TOP10、SQL、ID）原样保留。
+    """
+    if not text:
+        return text
+
+    def _sub(m: "re.Match") -> str:
+        tok = m.group(0)
+        try:
+            from agent.field_semantics import field_label
+            cn = field_label("", tok)
+        except Exception:
+            return tok
+        if not cn or cn == tok:
+            return tok
+        prev = text[max(0, m.start() - 1):m.start()]
+        if prev in ("（", "("):
+            return tok
+        return f"{cn}（{tok}）"
+
+    return _EN_IDENT_RE.sub(_sub, text)
+
+
 def _corr_evidence(columns: list[str], rows: list[dict]) -> str:
     """对结果中成对数值列做确定性相关分析，产出中文证据块（供 LLM 引用）。"""
     best = _corr_pair(columns, rows)
     if not best:
         return ""
     rv, a, b, n = best
+    a, b = _col_display(a), _col_display(b)   # 2026-10-02：相关分析文案同样双语化
     return (f"【确定性相关证据】按行配对计算，「{a}」与「{b}」的皮尔逊相关系数 "
             f"r={rv:.2f}（有效样本 n={n}），呈{_corr_strength(rv)}。"
             f"该系数只描述线性共变方向与强弱，不代表因果关系。请以它为依据回答用户问题。")
@@ -8446,6 +8523,7 @@ def _build_deterministic_insight(query: str, columns: list[str], rows: list[dict
     if not best:
         return None
     rv, a, b, n = best
+    a, b = _col_display(a), _col_display(b)   # 2026-10-02：相关分析文案字段双语化
 
     def _stat(col: str):
         vals = []
@@ -8526,7 +8604,9 @@ def _insight_sample(rows: list, cols: list, budget: int = 40) -> tuple[str, str]
     """
     rows = list(rows or [])
     cols = [str(c) for c in (cols or []) if c is not None]
-    fields_info = ", ".join(cols)
+    # 2026-10-02：字段说明直接给「中文（english）」双语名——模型据此用中文字段叙述，
+    # 而不是照抄裸英文字段名（此前 fields_info 只有裸列名，洞察满屏 equipment_name）。
+    fields_info = ", ".join(_col_display(c) for c in cols)
     n = len(rows)
     if n <= budget:
         data_json = json.dumps(rows, ensure_ascii=False, default=str)[:4000]
@@ -8584,6 +8664,8 @@ def _rule_insight(rows: list[dict], cols: list[str]) -> str:
     cols = [str(c) for c in (cols or []) if c is not None]
     if not cols:
         return f"共查询到 {len(rows)} 条记录。"
+    # 2026-10-02 用户要求：分析文本里的字段一律「中文（english）」，禁止裸英文字段名。
+    disp = {c: _col_display(c) for c in cols}
     sample = rows[:500]
 
     # 1) 列角色识别：数值列（度量） / 其余（维度）
@@ -8605,14 +8687,14 @@ def _rule_insight(rows: list[dict], cols: list[str]) -> str:
         else:
             dim_cols.append(col)
 
-    lines = [f"共查询到 {len(rows)} 条记录，覆盖 {len(cols)} 个字段（{'、'.join(cols[:6])}）。"]
+    lines = [f"共查询到 {len(rows)} 条记录，覆盖 {len(cols)} 个字段（{'、'.join(disp[c] for c in cols[:6])}）。"]
 
     # 无任何数值列 → 纯清单型结果，只给概览与前几条，不做统计（避免瞎算）
     if not num_cols:
         lines += ["", "【主要发现】"]
         head = "、".join(str(r.get(cols[0], "")) for r in rows[:5])
-        lines.append(f"· 结果为{'、'.join(cols[:3])}的明细清单，前 5 条为：{head}。" if head
-                     else f"· 结果为{'、'.join(cols[:3])}的明细清单。")
+        lines.append(f"· 结果为{'、'.join(disp[c] for c in cols[:3])}的明细清单，前 5 条为：{head}。" if head
+                     else f"· 结果为{'、'.join(disp[c] for c in cols[:3])}的明细清单。")
         lines += ["", "【建议关注】", "· 如需看汇总口径，可继续追问「按 XX 统计数量」做聚合。"]
         return "\n".join(lines)
 
@@ -8648,17 +8730,22 @@ def _rule_insight(rows: list[dict], cols: list[str]) -> str:
     # 记录数与统计口径不一致必须挑明：实测「共 6 条记录」但「平均 52.38」是按 5 条算的
     # （第 6 行该字段为空，被静默跳过）—— 用户会以为平均值算错了。
     if len(rows) > n:
-        lines.append(f"· {len(rows)} 行中有 {len(rows) - n} 行「{mc}」为空（无该口径数据），未参与统计。")
+        lines.append(f"· {len(rows)} 行中有 {len(rows) - n} 行「{disp[mc]}」为空（无该口径数据），未参与统计。")
     if n == 1:
-        # 单行聚合（如"总缺陷数 1234"）：直接给结论，不报合计/平均/中位数这种同义反复
-        lines.append(f"· {mc}为 {_fmt(vals[0])}。")
+        # 单行结果（TOP1/单值聚合）：点出对象与取值，不复述合计/平均/中位数这种同义反复。
+        # 2026-10-02（用户反馈）：原「inactive_count为 1」太干瘪——把维度对象的取值带上，
+        # 直接回应"哪个 X 最多"式问法（如「产品名称「传感器30」的 未启用数量为 1」）。
+        _obj = "、".join(
+            f"{disp[d]}「{sample[0].get(d, '')}」" for d in dim_cols[:2]
+            if str(sample[0].get(d, "")).strip() != "")
+        lines.append(f"· {_obj + '的' if _obj else ''}{disp[mc]}为 {_fmt(vals[0])}。")
     elif ratio_like:
         # 比率类合并成一行，避免"最高…最低…"在下一行重复一遍
         _gap_txt = (f"，相差 {(mx - mn) * 100:.1f} 个百分点" if pct_mode
                     else f"，相差 {_fmt_num_cn(mx - mn)}")
-        lines.append(f"· {mc}平均 {_fmt(avg)}，最高 {_fmt(mx)}，最低 {_fmt(mn)}{_gap_txt}。")
+        lines.append(f"· {disp[mc]}平均 {_fmt(avg)}，最高 {_fmt(mx)}，最低 {_fmt(mn)}{_gap_txt}。")
     else:
-        lines.append(f"· {mc}合计 {_fmt_num_cn(s)}，平均 {_fmt_num_cn(avg)}，中位数 {_fmt_num_cn(med)}。")
+        lines.append(f"· {disp[mc]}合计 {_fmt_num_cn(s)}，平均 {_fmt_num_cn(avg)}，中位数 {_fmt_num_cn(med)}。")
         lines.append(f"· 最高 {_fmt_num_cn(mx)}，最低 {_fmt_num_cn(mn)}"
                      + (f"，最高约为最低的 {mx / mn:.1f} 倍。" if mn > 0 else "。"))
 
@@ -8684,7 +8771,7 @@ def _rule_insight(rows: list[dict], cols: list[str]) -> str:
             pairs.sort(key=lambda x: -x[1])
             ranked = pairs
             show_pct = (not ratio_like) and bool(s)
-            lines += ["", f"【{dcol}对比】" if is_time_dim else f"【{dcol}排名】"]
+            lines += ["", f"【{disp[dcol]}对比】" if is_time_dim else f"【{disp[dcol]}排名】"]
             for i, (name, v) in enumerate(pairs[:3], 1):
                 pct = f"（占 {v / s * 100:.1f}%）" if show_pct else ""
                 lines.append(f"{i}. {name}：{_fmt(v)}{pct}")
@@ -8706,7 +8793,7 @@ def _rule_insight(rows: list[dict], cols: list[str]) -> str:
         else:
             chg_txt = "基本持平"
         trend = "上升" if delta > 0 else ("下降" if delta < 0 else "基本持平")
-        lines.append(f"· 从 {f_name} 到 {l_name}，{mc}由 {_fmt(f_v)} 变为 {_fmt(l_v)}，整体{trend} {chg_txt}。")
+        lines.append(f"· 从 {f_name} 到 {l_name}，{disp[mc]}由 {_fmt(f_v)} 变为 {_fmt(l_v)}，整体{trend} {chg_txt}。")
         lines.append(f"· 期间最高 {_fmt(mx)}（{ranked[0][0]}），最低 {_fmt(mn)}（{ranked[-1][0]}）。")
     elif n == 1:
         pass                      # 单行聚合没有可比对象，不输出发现段，避免"波动不大"这类废话
@@ -8715,11 +8802,11 @@ def _rule_insight(rows: list[dict], cols: list[str]) -> str:
         top3 = sum(v for _, v in ranked[:3])
         p3 = top3 / s * 100
         if p3 >= 60:
-            lines.append(f"· 前 3 名合计占 {p3:.1f}%，{mc}高度集中在头部少数{dcol}。")
+            lines.append(f"· 前 3 名合计占 {p3:.1f}%，{disp[mc]}高度集中在头部少数{disp[dcol]}。")
         elif p3 >= 35:
-            lines.append(f"· 前 3 名合计占 {p3:.1f}%，{mc}相对集中在头部{dcol}。")
+            lines.append(f"· 前 3 名合计占 {p3:.1f}%，{disp[mc]}相对集中在头部{disp[dcol]}。")
         else:
-            lines.append(f"· 前 3 名合计仅占 {p3:.1f}%，{mc}分布较分散，没有明显的头部{dcol}。")
+            lines.append(f"· 前 3 名合计仅占 {p3:.1f}%，{disp[mc]}分布较分散，没有明显的头部{disp[dcol]}。")
         if mn > 0:
             gap = mx / mn
             if gap >= 3:
@@ -8728,7 +8815,7 @@ def _rule_insight(rows: list[dict], cols: list[str]) -> str:
             elif gap >= 1.5:
                 lines.append(f"· 最高的「{ranked[0][0]}」比最低的「{ranked[-1][0]}」高 {gap:.1f} 倍，存在一定差异。")
             else:
-                lines.append(f"· 各{dcol}之间差距不大（最高约为最低的 {gap:.1f} 倍），整体较为均衡。")
+                lines.append(f"· 各{disp[dcol]}之间差距不大（最高约为最低的 {gap:.1f} 倍），整体较为均衡。")
     elif n > 1:
         lines += ["", "【主要发现】"]
         if ratio_like:
@@ -8737,13 +8824,13 @@ def _rule_insight(rows: list[dict], cols: list[str]) -> str:
             _spread = (f"{(mx - mn) * 100:.1f} 个百分点" if pct_mode
                        else f"{_fmt_num_cn(mx - mn)}")
             _above = sum(1 for v in vals if v > avg)
-            lines.append(f"· {mc}分布在 {_fmt(mn)} ~ {_fmt(mx)} 之间，相差 {_spread}；"
+            lines.append(f"· {disp[mc]}分布在 {_fmt(mn)} ~ {_fmt(mx)} 之间，相差 {_spread}；"
                          f"{n} 条中 {_above} 条高于平均（{_fmt(avg)}）。")
         elif mn > 0 and mx / mn >= 1.2:
-            lines.append(f"· {mc}波动区间为 {_fmt_num_cn(mn)} ~ {_fmt_num_cn(mx)}，"
+            lines.append(f"· {disp[mc]}波动区间为 {_fmt_num_cn(mn)} ~ {_fmt_num_cn(mx)}，"
                          f"最高约为最低的 {mx / mn:.1f} 倍。")
         else:
-            lines.append(f"· {mc}整体波动不大，集中在 {_fmt_num_cn(avg)} 附近。")
+            lines.append(f"· {disp[mc]}整体波动不大，集中在 {_fmt_num_cn(avg)} 附近。")
 
     # 5) 建议关注：只给方向，不编造具体业务动作
     lines += ["", "【建议关注】"]
@@ -8752,14 +8839,14 @@ def _rule_insight(rows: list[dict], cols: list[str]) -> str:
     elif len(ranked) >= 3 and s and not ratio_like:
         p3 = sum(v for _, v in ranked[:3]) / s * 100
         if p3 >= 50:
-            lines.append(f"· 优先跟进 {ranked[0][0]}、{ranked[1][0]} 等头部{dcol}，"
-                         f"它们对整体{mc}的影响最大。")
+            lines.append(f"· 优先跟进 {ranked[0][0]}、{ranked[1][0]} 等头部{disp[dcol]}，"
+                         f"它们对整体{disp[mc]}的影响最大。")
         else:
-            lines.append(f"· {mc}分布较分散，建议按{dcol}逐项排查，避免只看总量漏掉个别异常项。")
+            lines.append(f"· {disp[mc]}分布较分散，建议按{disp[dcol]}逐项排查，避免只看总量漏掉个别异常项。")
     elif dcol:
-        lines.append(f"· 如需定位具体原因，可继续追问「按{dcol}看{mc}」做进一步拆分。")
+        lines.append(f"· 如需定位具体原因，可继续追问「按{disp[dcol]}看{disp[mc]}」做进一步拆分。")
     else:
-        lines.append(f"· 如需看趋势变化，可继续追问「{mc}按月/按周的变化」。")
+        lines.append(f"· 如需看趋势变化，可继续追问「{disp[mc]}按月/按周的变化」。")
     return "\n".join(lines)
 
 
@@ -8889,6 +8976,8 @@ def generate_insight_text(query: str, sql: str, columns: list[str], rows: list[d
             text = ""
         if not text:
             return _quick_rule_summary(rows, cols)
+        # 2026-10-02：LLM 洞察出口兜底双语化（裸英文字段名 → 「中文（english）」）
+        text = _bilingualize(text)
         _insight_store(query, rc, text)
         if warning:
             text += f"\n\n⚠️ 结果可靠性提示：{warning}"

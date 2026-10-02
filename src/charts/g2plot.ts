@@ -145,6 +145,11 @@ function percentOf(rows: any[], valueCol: string): number | null {
   if (!vals.length) return null
   const first = vals[0]
   if (first > 0 && first <= 1) return first
+  // 2026-10-02 修复（潜伏准确性 bug）：值在 (1,100] 区间（如综合良率 97.56）是
+  // 百分比语义，直接 /100 使用。原实现走 first/max 归一——单行数据 first===max
+  // 恒等于 1，仪表盘把 97.56% 画成 100%（"看起来正常但语义错误"，比空白更危险）。
+  // >100 的非比率量（产量/数量等）才按列最大值归一。
+  if (first > 1 && first <= 100) return Math.min(1, Math.max(0, first / 100))
   const max = Math.max(...vals.map(Math.abs))
   if (!max) return null
   return Math.min(1, Math.max(0, first / max))
@@ -498,7 +503,14 @@ export async function renderG2Plot(
   // 折叠面板/Tab 未激活/弹窗刚插入等 0×0 场景下 render() 会抛错，
   // 表现为"扩展图静默降级成柱状图"，且没有任何日志可查。这里等一帧重试，仍为 0 则放弃。
   if (el.clientWidth < 8 || el.clientHeight < 8) {
-    await new Promise((r) => requestAnimationFrame(() => r(null)))
+    // 2026-10-02 修复：后台/隐藏 Tab 里 requestAnimationFrame 不触发，纯 rAF 等待会
+    // 永久挂起——DashboardPanel.renderCards 用 Promise.all 等全部 renderChart，
+    // 用户渲染期间切走 Tab → 看板 loading 永远不结束。改为 rAF 与 setTimeout 竞速
+    // （后台下 setTimeout 被节流到 ≥1s 但仍会触发，保证等待有上界）。
+    await Promise.race([
+      new Promise((r) => requestAnimationFrame(() => r(null))),
+      new Promise((r) => setTimeout(r, 120)),
+    ])
     if (el.clientWidth < 8 || el.clientHeight < 8) return null
   }
 
