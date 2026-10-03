@@ -1562,6 +1562,51 @@ async def agent_stream_api(req: AskRequest, authorization: str = Header(None)):
     )
 
 
+@app.post("/api/agent/orchestrate")
+async def agent_orchestrate_api(req: AskRequest, authorization: str = Header(None)):
+    """多步自主编排端点（P0-A）：把复杂问题拆成任务链顺序执行，产出可审计 flow。
+
+    2026-10-03 接线说明：orchestrator.py 此前已有完整实现与单测
+    （backend/tests/test_orchestrator.py），但**从未被任何路由调用**，文档里承诺的
+    /api/agent/orchestrate 实际 404。本次补上路由与鉴权，并保持与主链路一致的三条红线：
+
+      ① 权限：构建与 /api/agent/ask 完全相同的 ACL 上下文，透传给 orchestrator；
+         内部每个查数节点仍走 LLMService 的「确定性编译优先 + 权限改写 + 二次确认」，
+         越权表会被拒绝或该步标记 skipped。
+      ② 不改变主链路：本端点独立，查数节点复用 LLMService 但不写缓存/不改全局状态，
+         不会影响 /api/agent/ask 与 /api/agent/stream 的行为。
+      ③ 失败不阻断：任一节点异常/弹窗 → 该步 status=failed/skipped，
+         其余步骤继续执行，flow 仍完整返回供前端展示（这是「可审计」的前提）。
+
+    响应：{success, query, chain, flow:[{step,title,status,summary,sql,elapsed_ms}],
+           conclusion, elapsed_ms, error}
+    """
+    t0 = time.time()
+    u = get_current_user(authorization)
+    from security.enforcer import build_acl_context
+    from security.context import set_acl, clear_acl
+    acl = build_acl_context(u)
+    set_acl(acl)
+    try:
+        from agent.orchestrator import orchestrate
+        # orchestrator 内部调用 LLMService（同步、可能耗时数十秒），
+        # 放到线程池跑，避免阻塞事件循环导致其他请求排队。
+        import anyio
+        result = await anyio.to_thread.run_sync(lambda: orchestrate(req.query, acl=acl))
+        result["user"] = u.get("username") if isinstance(u, dict) else None
+        result["elapsed_ms"] = int((time.time() - t0) * 1000)
+        return result
+    except Exception as e:
+        logging.getLogger("api").exception("orchestrate failed")
+        return {
+            "success": False, "query": req.query, "chain": [], "flow": [],
+            "conclusion": "", "elapsed_ms": int((time.time() - t0) * 1000),
+            "error": f"{type(e).__name__}: {str(e)[:200]}",
+        }
+    finally:
+        clear_acl()
+
+
 @app.post("/api/agent/execute_confirm")
 def agent_execute_confirm_api(req: ConfirmRequest, authorization: str = Header(None)):
     """二次确认弹窗：按用户确认的 SQL 直接执行（遵循 LLM 推断 / 按修改后 SQL）。
@@ -2730,7 +2775,14 @@ def overview_charts(authorization: str = Header(None)):
 async def overview_report(authorization: str = Header(None), _req: AnalysisRequest = None):
     """AI 快速生成数据总览报告 — 流式输出（内容按当前用户数据权限过滤）"""
     from security.enforcer import build_acl_context
-    u = get_current_user(authorization)
+    # 2026-10-03 修复（P1·口径对齐）：本端点此前只 get_current_user（仅解析身份），
+    # 而同族另外三个端点（/overview/report-export、/overview/report-download、
+    # /overview/report-html）都走 _require_action(authorization, "export")。
+    # main.py:2902 自己的注释就写明「与同族的三个端点必须同口径，此前只校验了登录，
+    # 漏掉 export 校验」—— 结果三处补了、这第四个（也是被记为 bug 的原型端点）没补。
+    # 它返回同一份报告的完整 Markdown 全文（表清单 + 行数 + 数据样例 + LLM 全量分析），
+    # 信息量与 report-export 完全等价 → 前端「导出」按钮灰着但接口仍能出数据。
+    u = _require_action(authorization, "export")
     acl = build_acl_context(u)
     from agent.report_agent import generate_report_stream
 
@@ -2794,7 +2846,13 @@ async def overview_report_export(authorization: str = Header(None)):
     u = _require_action(authorization, "export")
     acl = build_acl_context(u)
     from agent.report_agent import generate_report_stream
-    context, industry, counts, real_tables = _build_report_context(
+    # 2026-10-03 修复（P1）：_build_report_context 是纯同步重 IO（逐表兜底 COUNT(*) +
+    # 每张表一次统计 + 前 6 张表各一次 SELECT *），在 async 路由里直接调用会独占事件循环
+    # 直到全部完成 → 期间全站 SSE 流式问数（/api/agent/stream）完全停摆，正在流式输出的
+    # 气泡卡住不动。同文件另两个调用点（/api/overview/report 的 2743 行、
+    # regenerate_report_asset 的 2871 行）都已包 to_thread，只有这里漏了。
+    context, industry, counts, real_tables = await asyncio.to_thread(
+        _build_report_context,
         allowed_tables=acl.allowed_tables, row_filters=acl.row_filters or None)
 
     full: list[str] = []

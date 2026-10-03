@@ -535,12 +535,30 @@ def collect(template: Template, req: ReportRequest,
             exec_sql = _wrap_row_filter(raw_sql, rf)
 
         res = execute_sql(exec_sql)
+        acl_degraded = False
+        acl_degraded_note = ""
         if not res.get("success") and rf:
-            # 包了行过滤跑不通（多为字段不在结果列里）→ 退回原语句，
-            # 但这事要在报告里留痕，不能悄悄降级
-            res = execute_sql(raw_sql)
-            if res.get("success"):
-                res["_acl_degraded"] = True
+            # 行级过滤包上去跑不通（多为过滤字段不在结果列里）。
+            # 2026-10-03 修复（P0）：原实现退回**未过滤**的原语句，注释承诺「要在报告里
+            # 留痕」，但 `_acl_degraded` 只写进 section dict、全仓库没有任何消费者
+            # （已 grep 确认）→ 用户在只读本车间账号下看到**全厂口径**数字，
+            # 而封面照常写「取数成功 N/N 章」，且没有任何标记。
+            # 行级权限是安全边界，正确方向是**跳过该章节**（与 skipped 同口径），
+            # 绝不返回未脱敏的数据。
+            acl_degraded = True
+            acl_degraded_note = "行级权限过滤未生效（过滤字段不在结果列中），本节数据未按权限范围收敛，已跳过"
+            out_sections.append({
+                "key": sec.key, "title": sec.title, "ok": False,
+                "sql": exec_sql,
+                "columns": [], "rows": [],
+                "error": acl_degraded_note,
+                "skipped": True,
+                "digest": "",
+                "chart": sec.chart,
+                "dim": sec.dim, "meas": sec.meas, "hint": sec.hint,
+                "acl_degraded": True,
+            })
+            continue
 
         cols = res.get("columns") or []
         rows = res.get("rows") or []

@@ -408,7 +408,24 @@ BUILTIN_METRICS: list[dict] = [
         "aliases": ["库存数量"],
         "unit": "件",
         "tables": ["inv_inventory_snapshot"],
-        "sql_expression": "SUM(available_qty)",
+        # 2026-10-03 修复：原值是 `SUM(available_qty)` —— 已被本条 description 明确
+        # 标注为「已废弃」的全历史口径（yans 实测 3366671，与正确值 73781 差 46 倍），
+        # 但字段本身没跟着改，于是同一个指标并存两套算式：
+        #   · exec_sql / exec_sql_by_dim 走「最新快照日 Σ(available+frozen)」= 73781
+        #   · sql_expression 是全历史 SUM           = 3366671（与 formula/description 自相矛盾）
+        # 而 get_metric_hint(:1509) 注入 LLM prompt 的正是 sql_expression 那个废弃口径：
+        #   「口径算式 SQL = SUM(available_qty)；业务公式 = 最新快照日 Σ(available_qty + frozen_qty)」
+        # 于是：① LLM 拿到的口径提示自相矛盾；② 任何绕过 exec_sql 的路径（多指标并列命中、
+        # 用户手写列名、LLM 直生）都会用旧口径出数，**数值格式完全正常、无任何提示**。
+        # 真库实测（yans，45 个快照日）：全历史 SUM = **3406851**，最新快照日 SUM = **73781**，
+        # 差 46 倍。上面 description 里记的 3366671 是更早一次快照的实测值，同样是同一量级。
+        #
+        # 用 CASE WHEN 表达「只取最新快照日」而不是 `(SELECT MAX(snapshot_date) FROM t)`：
+        # 后者含 SELECT 子句，会被 `_EXPR_FORBIDDEN_RE`（本轮为堵「COUNT(*) WHERE result=…」
+        # 这类坏口径而加入的 WHERE/SELECT 黑名单）判为不安全 → 指标被编译器拒绝、
+        # 静默回退 LLM。前者只含聚合与 CASE，且语义等价（MAX 在子查询外层会被 PG
+        # 当聚合错误，这里用 CASE 是唯一能在表达式位置安全表达快照日的写法）。
+        "sql_expression": "SUM(CASE WHEN snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) THEN available_qty + COALESCE(frozen_qty,0) ELSE 0 END)",
         "exec_sql": "SELECT SUM(available_qty + COALESCE(frozen_qty,0)) AS \"库存量\" FROM inv_inventory_snapshot WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot)",
         "exec_sql_by_dim": {
             "_default": "SELECT SUM(available_qty + COALESCE(frozen_qty,0)) AS \"库存量\" FROM inv_inventory_snapshot WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot)",
@@ -1260,8 +1277,13 @@ def _left_modifier_suspect(q: str, pos: int) -> bool:
     return bool(run)
 
 
-def find_metrics(query: str, limit: int = 3) -> list[dict]:
+def find_metrics(query: str, limit: int | None = 3) -> list[dict]:
     """按用户问题命中指标（最长匹配优先，避免矛盾口径同时注入）。
+
+    limit=None 表示**不截断**，返回全部命中（调用方自行决定上限/回退）。
+    2026-10-03 新增：此前 limit=3 的截断发生在函数内部，导致调用方
+    「超过 3 个指标就回退 LLM」的守卫拿到的是已截断结果 → 守卫恒为假、
+    变成死代码，并列 4 个指标时静默丢掉第一个（见 metric_compiler 调用点注释）。
 
     防 bug 背景：「质检不合格率」会同时命中 良率(别名"合格率")、不良率(别名"不合格率")、
     质检不合格率 三个指标，若同时注入 prompt 会给出互相矛盾的口径。
@@ -1418,7 +1440,8 @@ def find_metrics(query: str, limit: int = 3) -> list[dict]:
                 _old = (str(_pm.get("name")).lower() == _pw, str(_pm.get("name")) in q)
                 if _cur > _old:
                     _dedup[_pi] = (_w, _m)
-            return [m for _, m in _dedup][:limit]
+            _res = [m for _, m in _dedup]
+            return _res if limit is None else _res[:limit]
     # ③ 最长匹配兜底（含 123 库去重）
     scored.sort(key=lambda x: x[0], reverse=True)
     max_len = scored[0][0]
@@ -1436,8 +1459,10 @@ def find_metrics(query: str, limit: int = 3) -> list[dict]:
         _by_name: dict[str, dict] = {}
         for _ln, _w, _m in scored:
             _by_name.setdefault(str(_m.get("name") or ""), _m)
-        return list(_by_name.values())[:limit]
-    return list(seen_word.values())[:limit]
+        _res = list(_by_name.values())
+        return _res if limit is None else _res[:limit]
+    _res = list(seen_word.values())
+    return _res if limit is None else _res[:limit]
 
 
 def _retrieve_for_query(query: str, top_k: int = 3) -> list[dict]:

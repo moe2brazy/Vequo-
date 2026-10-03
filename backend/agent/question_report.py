@@ -395,10 +395,15 @@ def collect_question_data(question: str, sql: str | None = None,
         exec_sql = _wrap_row_filter(sql, rf)
 
     result = execute_sql(exec_sql)
-    if not result.get("success"):
-        # 包了权限过滤失败 → 退回裸 SQL（至少拿到数据，报告里标注口径）
-        if rf:
-            result = execute_sql(sql)
+    # 2026-10-03 修复（P0）：原实现「包了权限过滤失败 → 退回裸 SQL（报告里标注口径）」，
+    # 但实际**没有任何标注代码**（比 report_templates 那条还少一个标志位），
+    # 用户在受限账号下会拿到全厂口径数据且毫无提示。行级权限是安全边界，
+    # 不确定时必须选更严格的一侧：失败即拒绝出数，不退回未过滤语句。
+    acl_degraded = False
+    if not result.get("success") and rf:
+        result = {"success": False, "columns": [], "rows": [],
+                  "error": "行级权限过滤未生效（过滤字段不在结果列中），已拒绝返回未收敛数据"}
+        acl_degraded = True
 
     # ── 执行失败就重新生成 SQL 再试（最多 2 轮）──
     # LLM 生成列名时会凭常识编（把 input_qty 写成 output_qty、把 workshop 编出来），
@@ -417,12 +422,16 @@ def collect_question_data(question: str, sql: str | None = None,
         sql = retry_sql
         exec_sql = _wrap_row_filter(sql, rf) if rf else sql
         result = execute_sql(exec_sql)
+        # 同上：重试路径也不得退回未过滤语句
         if not result.get("success") and rf:
-            result = execute_sql(sql)
+            acl_degraded = True
+            result = {"success": False, "columns": [], "rows": [],
+                      "error": "行级权限过滤未生效（过滤字段不在结果列中），已拒绝返回未收敛数据"}
 
     if not result.get("success"):
         return {"ok": False, "sql": sql, "columns": [], "rows": [],
                 "error": str(result.get("error") or "查询失败")[:200],
+                "acl_degraded": acl_degraded,
                 "table": _guess_table(sql), "row_count": 0}
 
     cols, rows = _norm_rows(result)
@@ -437,6 +446,7 @@ def collect_question_data(question: str, sql: str | None = None,
         "display_columns": labelize_columns(cols, aliases),
         "aliases": aliases,
         "rows": rows, "error": "",
+        "acl_degraded": acl_degraded,
         "table": _guess_table(sql), "row_count": len(rows),
     }
 

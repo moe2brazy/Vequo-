@@ -160,13 +160,18 @@ def _resolve_data(data_request: dict) -> pd.DataFrame:
 
 
 def _get_allowed_tables() -> dict[str, set[str]]:
-    """动态获取所有可用表及其字段（白名单）"""
+    """动态获取所有可用表及其字段（白名单）
+
+    2026-10-03 修复（与 trainer.get_numeric_tables 对齐）：原实现只扫 public schema
+    （MySQL 扫 DATABASE()），而 trainer 侧扫全 search_path —— 同一套库在两条 ML 路径下
+    「表是否存在」的判断不一致，业务 schema 下的表在执行器口径里直接消失。
+    现在不加 schema 限定，与 trainer 一致。
+    """
     try:
-        from database import get_db_type
-        schema_clause = "table_schema=DATABASE()" if get_db_type() == "mysql" else "table_schema='public'"
+        from database import get_db_type  # noqa: F401  (保留：方言判定入口)
         result = execute_sql(
             "SELECT table_name, column_name FROM information_schema.columns "
-            f"WHERE {schema_clause} ORDER BY table_name, ordinal_position"
+            "ORDER BY table_name, ordinal_position"
         )
         if result["success"] and result["rows"]:
             tables = {}
@@ -221,6 +226,10 @@ def _run_feature_engineering(df: pd.DataFrame, steps: list[dict]) -> tuple[pd.Da
                 before = len(df)
                 df = df.dropna()
                 dropped = before - len(df)
+                # 2026-10-03 修复（P1）：before==0 时 dropped/before 直接 ZeroDivisionError
+                # （空表上跑 dropna 必然触发），英文异常被包装后糊到界面。
+                if before <= 0:
+                    raise ValueError("数据集为空，无法执行 dropna")
                 if dropped / before > max_ratio:
                     raise ValueError(f"dropna 删除比例 {dropped/before:.2%} 超过上限 {max_ratio:.0%}，拒绝执行")
                 meta["steps_applied"].append({"op": op, "dropped": dropped, "remaining": len(df)})
@@ -261,9 +270,24 @@ def _run_feature_engineering(df: pd.DataFrame, steps: list[dict]) -> tuple[pd.Da
                     raise ValueError(f"不支持的聚合函数: {agg}")
                 df[date_cols[0]] = pd.to_datetime(df[date_cols[0]])
                 df = df.set_index(date_cols[0])
-                df = df.resample(rule).agg(agg)
+                # 2026-10-03 修复（P1）：resample().agg("mean") 会把**文本列**也喂给
+                # mean → 维度列整列变 NaN，后续聚类/建模直接拒绝（KMeans 不接受 NaN）。
+                # 这里只对数值列聚合，文本列按 first 保留（维度标签不该被重采样丢弃）。
+                _num_cols = [c for c in df.columns
+                             if pd.api.types.is_numeric_dtype(df[c])
+                             and not str(c).startswith("_")]
+                _obj_cols = [c for c in df.columns if c not in _num_cols]
+                if not _num_cols:
+                    raise ValueError("resample 需要至少一个数值列进行聚合")
+                _aggs = {c: agg for c in _num_cols}
+                for c in _obj_cols:
+                    _aggs[c] = "first"
+                df = df.resample(rule).agg(_aggs)
                 df = df.reset_index()
-                meta["steps_applied"].append({"op": op, "rule": rule, "agg": agg, "date_col": date_cols[0]})
+                df = df.dropna(axis=1, how="all").reset_index(drop=True)
+                meta["steps_applied"].append({"op": op, "rule": rule, "agg": agg,
+                                              "date_col": date_cols[0],
+                                              "num_cols": len(_num_cols)})
 
             _audit("fe_step", {"step": i, "op": op, "before": before_rows, "after": len(df)})
 
@@ -394,11 +418,23 @@ def _train_model_safe(df: pd.DataFrame, model_spec: dict) -> dict:
             return m, metrics, y_test, y_pred, None
 
         elif model_name == "KMeans":
-            n_clusters = int(params.get("n_clusters", 3))
+            # 2026-10-03 修复（P1·与 trainer.py:277 对齐）：聚类数必须收敛到
+            # 2 ~ n_samples-1，否则 silhouette_score 抛
+            # ValueError: Number of labels is N. Valid values are 2 to n_samples - 1
+            # （实测 sklearn 1.9.0），英文异常经 llm_service 直接糊到界面。
+            # trainer 侧早已有 `max(2, min(int(k), len(X_scaled)-1))`，此处漏改 →
+            # 同一问题在仓库里有两个答案。
+            n_samples = len(X)
+            k_req = int(params.get("n_clusters", 3) or 3)
+            n_clusters = max(2, min(k_req, n_samples - 1)) if n_samples >= 3 else 1
+            if n_samples < 3:
+                raise ValueError("聚类至少需要 3 行样本")
             m = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
             m.fit(X)
             labels = m.labels_
-            sil = silhouette_score(X, labels) if len(set(labels)) > 1 else -1
+            n_labels = len(set(labels))
+            # 上界守卫与 trainer 一致：标签数须落在 2 ~ n_samples-1，否则取 -1
+            sil = silhouette_score(X, labels) if 1 < n_labels < len(labels) else -1
             metrics = {"轮廓系数": round(sil, 4), "聚类数": n_clusters}
             df["_cluster"] = labels
             return m, metrics, None, labels, df["_cluster"].value_counts().to_dict()
@@ -425,8 +461,13 @@ def _train_model_safe(df: pd.DataFrame, model_spec: dict) -> dict:
     if hasattr(model, "feature_importances_"):
         importance = {feature_cols[i]: round(model.feature_importances_[i], 4) for i in range(len(feature_cols))}
     elif hasattr(model, "coef_"):
-        coef = model.coef_[0] if model.coef_.ndim > 1 else model.coef_
-        importance = {feature_cols[i]: round(coef[i], 4) for i in range(len(feature_cols))}
+        # 2026-10-03 修复（与 trainer.py:315-316 对齐）：多分类的 coef_ 形状是
+        # (n_classes, n_features)，取 coef_[0] 只会拿到「第 0 类」的系数，
+        # 导致同一问题在 executor 与 trainer 里给出两个不同的特征重要性。
+        # 二分类 coef_ 是 (n_features,)，此时 ndim == 1。
+        _coef = model.coef_
+        coef = abs(_coef).mean(axis=0) if getattr(_coef, "ndim", 1) > 1 else abs(_coef)
+        importance = {feature_cols[i]: round(float(coef[i]), 4) for i in range(len(feature_cols))}
 
     # 预测结果（前50条，脱敏）
     pred_samples = []

@@ -131,22 +131,29 @@ def sandbox_capabilities() -> dict:
 
 
 def _kill_tree(p: subprocess.Popen) -> None:
-    """尽力终止进程树（Windows 下 kill() 只杀直接子进程，必要时 taskkill /T）。"""
+    """尽力终止进程树（Windows 下 kill() 只杀直接子进程，必要时 taskkill /T）。
+
+    2026-10-03 修复（P0）：原实现里 `p.wait(timeout=3)` 成功后紧跟一个 `return`，
+    而 `p.kill()` 发出后子进程数秒内必然退出 → wait **正常返回** → 下面的
+    `taskkill /F /T` 是**永远执行不到的死代码**，「杀进程树」实际只杀直接子进程，
+    孙进程（模型自己 spawn 的）会存活并继续占用 CPU/内存。
+    现在：无论 wait 成功与否，只要进程还活着就走 taskkill /T。
+    """
     try:
         p.kill()
     except Exception:
         pass
     try:
         p.wait(timeout=3)
-        return
     except Exception:
         pass
-    if os.name == "nt":
-        try:
+    # 复查：只有确实还活着（或退出码拿不到）才需要 taskkill /T
+    try:
+        if p.poll() is None and os.name == "nt":
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)],
                            capture_output=True, timeout=5)
-        except Exception:
-            pass
+    except Exception:
+        pass
 
 
 def run_python(code: str, columns: list, rows: list,
@@ -202,6 +209,14 @@ def run_python(code: str, columns: list, rows: list,
         out, err = p.communicate(payload, timeout=timeout)
     except subprocess.TimeoutExpired:
         _kill_tree(p)
+        # 2026-10-03 修复（P0）：超时路径不回收 PIPE —— 实测每次超时泄漏 2 个
+        # 管道句柄（stdout/stderr），反复触发「执行超时」会单调增长。
+        for _s in (p.stdin, p.stdout, p.stderr):
+            try:
+                if _s is not None:
+                    _s.close()
+            except Exception:
+                pass
         return {"success": False, "stdout": "", "result": None,
                 "error": "执行超时（超过 %.0f 秒），已强制终止。请简化计算或减少数据量。" % timeout,
                 "timeout": True, "elapsed_ms": int((time.time() - t0) * 1000)}

@@ -90,7 +90,20 @@ def _conclusion(columns: List[str], rows: List[dict]) -> str:
         except Exception:
             pass
     # 排行/分组：Top1 与 Top2（并列可容忍）
-    top = sorted(rows, key=lambda r: float(r.get(last_col) or 0), reverse=True)
+    # 2026-10-03 修复（P1）：原实现 `float(r.get(last_col) or 0)` 无兜底，而同文件
+    # :412-429 会主动把布尔列转成中文字符串（is_planned → 「计划内/计划外」）。
+    # 一旦该列落在**最后一列**（SELECT equipment_name, is_planned … 这类分组查询即会），
+    # float("计划内") 直接 ValueError，且 run_template_report 无异常捕获 →
+    # **整份模板报告 500**（设备停机类模板命中 eqp_downtime_record 极易触发）。
+    # 现在统一走 _sort_num：非数值行排到末尾而不是让整份报告崩掉。
+    def _sort_num(r):
+        v = r.get(last_col)
+        try:
+            return float(v) if v not in (None, "") else float("-inf")
+        except (TypeError, ValueError):
+            return float("-inf")
+
+    top = sorted(rows, key=_sort_num, reverse=True)
     t1, t2 = top[0], top[1] if len(top) > 1 else None
     v1 = _fmt(t1.get(last_col), last_col)
     share = (float(t1.get(last_col) or 0) / total * 100) if total else 0.0

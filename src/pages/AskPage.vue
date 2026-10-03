@@ -187,6 +187,23 @@
                 title="复制这条提问"
               ><span v-if="msg.copiedUser"><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <polyline points="20 6 9 17 4 12" /> </svg></span></span><span v-else><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <rect width="14" height="14" x="8" y="8" rx="2" ry="2" /> <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" /> </svg></span></span>{{ msg.copiedUser ? ' 已复制' : ' 复制' }}</button>
             </div>
+            <!-- ===== 思考过程（2026-10-03 调整位置：放在结果回答**上方**）=====
+                 为什么挪上来：思考是「怎么得出这个答案的」，天然是结论的前置说明。
+                 放在结果下方时用户先看到结论、再往下翻才能看到依据，
+                 反而像"补充说明"；放上方则是"先看推理、再看结论"，
+                 与 DeepSeek / ChatGPT 的对话阅读顺序一致。
+                 样式也一并改成 DeepSeek 风格：灰底圆角块、低调标题、浅灰正文、无闪烁。 -->
+            <div v-if="msg.thinking" class="ask-collapse">
+              <div class="ask-collapse-head" @click="msg.thinkingOpen = !msg.thinkingOpen">
+                <span class="ask-collapse-mark"><span v-if="msg.thinkingStreaming" class="ask-collapse-spin"></span><span v-else class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <path d="M12 2a10 10 0 1 0 10 10" /></svg></span></span>
+                <span class="ask-collapse-name">{{ msg.thinkingStreaming ? '正在思考' : '已思考' }}</span>
+                <span class="ask-collapse-state">{{ msg.thinkingStreaming ? '' : (msg.thinkingOpen === true ? '收起' : '展开') }}</span>
+              </div>
+              <div v-show="msg.thinkingStreaming || msg.thinkingOpen === true" class="ask-collapse-body tk-panel">
+                <div v-html="formatThinking(msg.thinking)"></div>
+              </div>
+            </div>
+
             <!-- ===== 结果回答（最显眼：用户第一眼看到结论，溯源类内容在下方默认折叠）===== -->
             <div v-if="msg.result" class="ask-result-card">
               <div class="ask-result-head">
@@ -227,15 +244,8 @@
               </div>
             </div>
 
-            <!-- 思考过程（流式；生成中自动展开，完成后默认折叠——溯源内容不抢结果版面） -->
-            <div v-if="msg.thinking" class="ask-collapse">
-              <div class="ask-collapse-head" @click="msg.thinkingOpen = !msg.thinkingOpen">
-                <span class="ask-collapse-mark"><span v-if="msg.thinkingStreaming" class="inline-block w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse"></span><span v-else class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <path d="M12 2a10 10 0 1 0 10 10" /> </svg></span></span>
-                <span class="ask-collapse-name">AI 思考过程</span>
-                <span class="ask-collapse-state">{{ msg.thinkingStreaming ? '生成中' : (msg.thinkingOpen === true ? '收起' : '展开') }}</span>
-              </div>
-              <div v-show="msg.thinkingStreaming || msg.thinkingOpen === true" class="ask-collapse-body tk-panel" v-html="formatThinking(msg.thinking)"></div>
-            </div>
+            <!-- 思考过程已上移到「结果回答」上方（见本文件上方 ask-collapse 块） -->
+            <!-- SQL 语句：独立深色卡片；默认折叠（溯源类不抢结果版面），点击表头展开 -->
             <!-- SQL 语句：独立深色卡片；默认折叠（溯源类不抢结果版面），点击表头展开 -->
             <div v-if="msg.sql" class="ask-sql-card">
               <div class="ask-sql-head" @click="msg.sqlOpen = !msg.sqlOpen">
@@ -937,6 +947,11 @@ interface Message {
   thinking?: string
   thinkingOpen?: boolean
   thinkingStreaming?: boolean
+  /** token 级思考流是否正在写入（决定 ⟦T⟧ 气泡末尾是否显示打字机光标） */
+  thinkingLive?: boolean
+  // 当前正在流式输出的思考步骤名（后端 thought 事件的 step 字段）。
+  // 用于「换步骤时先换行」——否则上一句和下一句会黏成一行。
+  thinkingStep?: string
   // ---- 以下为结果闭环相关字段（供多轮上下文 + 反馈使用）----
   query?: string                 // 本轮用户问题（反馈时回传后端）
   queryType?: string             // 结果类型（data_query / general_chat ...）
@@ -1265,7 +1280,20 @@ const sanitizeSvg = (svg: string): string => {
   }
 }
 
-// 把后端推送的思考日志（▶ 步骤 / 📌 SQL / 推理文本）渲染为结构化时间线
+// 把后端推送的思考日志渲染为结构化时间线（2026-10-03 增强：聊天式思考过程）
+//
+// 五种行形态：
+//   ▶ 步骤名：detail   → 旧格式（保留兼容，历史消息仍按这个渲染）
+//   **动词**　依据：…   → 新格式：后端 _agent_thought_line() 产出的可读决策句
+//   ⟦T⟧…        → token 级思考流：模型真实 reasoning_content，**连续一段**
+//   ⟦T-END⟧      → 上述这段的收尾标记
+//   📌 SQL：…          → SQL 单独成块
+//   其余                → 纯文本
+//
+// 2026-10-03 简化：去掉了 `live` 参数与 .is-writing 打字机光标 ——
+// 用户反馈"太闪了"。DeepSeek 的思考区是**静态灰底 + 文字逐段浮现**，
+// 没有闪烁光标、没有脉冲圆点，视觉上是安静的（靠内容本身吸引注意，
+// 而不是靠动效）。这里对齐那个观感。
 const formatThinking = (text: string): string => {
   if (!text) return ''
   const e = (s: string) => esc(s)
@@ -1277,6 +1305,32 @@ const formatThinking = (text: string): string => {
     }
     if (line.startsWith('📌 SQL：')) {
       return `<pre class="tk-sql">${e(line.slice(6))}</pre>`
+    }
+    // ── token 级思考流（2026-10-03）────────────────────────────────
+    // 后端旁路直连模型拿到的真实 reasoning_content，按 token 逐片推来。
+    // 用 ⟦T⟧ 包裹：这类文本是**连续的一段**（没有换行、可能半句），
+    // 单独渲染成一个「正在写…」的气泡，末尾跟打字机光标 —— 这才像聊天。
+    if (line.startsWith('⟦T⟧')) {
+      return `<div class="tk-live">` +
+             `<span class="tk-live-tag">AI 思考</span>` +
+             `<span class="tk-live-text">${e(line.slice(3))}</span></div>`
+    }
+    if (line === '⟦T-END⟧') {
+      return ''
+    }
+    // 新格式：**动作**　依据：… → 动作加粗成标签，依据正文
+    const bold = line.match(/^\*\*(.+?)\*\*(.*)$/)
+    if (bold) {
+      const act = e(bold[1])
+      const rest = bold[2] || ''
+      // 「依据 / 涉及表 / 命中口径 / 原因 / 编译方式」等标签单独着色，便于扫读
+      const tagged = rest.replace(
+        /(依据|涉及表|命中口径|原因|编译方式|结果行数|候选表|备注)(：)/g,
+        '<span class="tk-tag">$1$2</span>')
+      return `<div class="tk-line">` +
+        `<span class="tk-act">${act}</span>` +
+        (tagged.trim() ? `<span class="tk-rest">${tagged.trim()}</span>` : '') +
+        `</div>`
     }
     return `<div class="tk-reason">${e(line)}</div>`
   }).join('')
@@ -1589,6 +1643,14 @@ const renderAgentResult = (data: any, msg?: any): string => {
 // 共享 ResizeObserver：观察所有图表容器尺寸变化，替代「每个图表一个 window resize 监听器」，
 // 避免监听器与图表实例随消息累积而泄漏（AskPage 被 KeepAlive 缓存，长期使用会越积越多）。
 let chartResizeObserver: ResizeObserver | null = null
+// 2026-10-03 修复（P1）：尺寸记忆表必须与 observer 同为**模块级**。
+// 原实现把 chartSizes 建在 renderECharts() 函数体内，而 observer 回调闭包只在
+// 第一次创建时捕获了那张 map → 第 2 次及以后的调用（每次新回答、切页回来、切会话
+// 都会触发）把新图表尺寸写进新 map，observer 却去查旧 map（无记录）→ prev 为
+// undefined → 无条件 resizeChart(node) → 09-28 修复的「入场动画被掐断」缺陷
+// **只对第一张图生效，从第二张起全部复现**（表现为「第一个问题的图有动画、
+// 后面的都没有」，极难归因）。
+let chartSizes = new WeakMap<HTMLElement, { w: number; h: number }>()
 
 // P0-4 层级钻取联动：ECharts 图表点击分类值 → 构造「{值}各{下一级}的{指标}」下钻问题重查。
 // 仅当图表节点携带 data-drill（后端编译器返回 drillable）时绑定，其余图表零打扰。
@@ -1661,7 +1723,7 @@ const renderECharts = async () => {
   // 刚起跑的入场动画当场被掐断——仪表盘指针直接落在终值、柱线图没有长出来的过程。
   // 所以按容器记下上次尺寸，只在尺寸真的变了才 resize；同时改用 entries（谁变给谁 resize），
   // 不再一有风吹草动就把页面里所有图表都重画一遍。
-  const chartSizes = new WeakMap<HTMLElement, { w: number; h: number }>()
+  // 尺寸表已是模块级（见上方 chartSizes 声明），与 observer 共享同一生命周期
   if (!chartResizeObserver) {
     chartResizeObserver = new ResizeObserver((entries) => {
       entries.forEach((entry) => {
@@ -2113,6 +2175,14 @@ const sendMessage = async (presetText?: string | Event, opts?: { noConfirm?: boo
             if (payload.name !== '意图理解') {
               msg.thinking = (msg.thinking ? msg.thinking + '\n' : '') + `▶ ${payload.name || ''}${payload.detail ? '：' + payload.detail : ''}`
             }
+            // 2026-10-03：后端在 step 事件里带 thought 字段（可读的「做了什么 + 为什么」）。
+            // 它已经把 evidence 里的依据/涉及表/命中口径都拼进去了，信息量比 ▶ 那一行大得多，
+            // 所以单独起一行展示；旧格式的 ▶ 行保留（作为步骤标题 + 兼容未升级的后端）。
+            if (payload.thought) {
+              msg.thinking = (msg.thinking ? msg.thinking + '\n' : '') + payload.thought
+              // 首次出现思考内容 → 标记为流式生成中（驱动折叠面板自动展开 + 光标动画）
+              msg.thinkingStreaming = true
+            }
             // 实时更新底部「思考中…」占位为当前步骤动作
             const stepLabel: Record<string, string> = {
               '意图理解': '理解意图', '表匹配': '匹配数据表', '读取表结构': '读取表结构',
@@ -2129,14 +2199,53 @@ const sendMessage = async (presetText?: string | Event, opts?: { noConfirm?: boo
               streamingStep.value = '正在生成查询方案（AI 推断中），可点「停止」中止…'
             }
           } else if (type === 'thought') {
-            // 流式思考内容（LLM token 逐字输出）
-            msg.thinking = (msg.thinking ? msg.thinking : '') + (payload.text || '')
-            highFreq = true
-            if (!streamingStep.value || streamingStep.value === '正在生成 SQL…') {
-              streamingStep.value = '正在生成 SQL…'
+            // 流式思考内容（LLM token 逐字输出 / 后端推送的思考句）
+            // 后端 step 事件已带整句 thought（见上），这里处理的是**逐 token 增量**：
+            // 追加到当前未换行的最后一行里，形成打字机效果。
+            const piece = payload.text || ''
+            // ── 2026-10-03：token 级思考流（模型的真实 reasoning_content）──
+            // 后端旁路直连模型、按 token 推来（payload.kind === 'reasoning'）。
+            // 这类文本是**连续的一段**（可能半句、没有换行），不能按行追加 ——
+            // 那样每来一个 token 都会换行，屏幕上是一堆碎片。
+            // 正确做法：单独开一个 ⟦T⟧ 区块，后续 token 全部追加到它内部，
+            // 形成一个「AI 正在写…」的气泡 + 打字机光标（真正的聊天气泡感）。
+            if (payload.kind === 'reasoning') {
+              if (!msg.thinkingLive) {
+                msg.thinkingLive = true
+                msg.thinking = (msg.thinking ? msg.thinking : '') +
+                  (msg.thinking && !msg.thinking.endsWith('\n') ? '\n' : '') + '⟦T⟧'
+              }
+              msg.thinking = msg.thinking + piece
+              highFreq = true
+              msg.thinkingStreaming = true
+              if (!streamingStep.value) streamingStep.value = 'AI 正在思考…'
+              // ⚠️ 这里**不能** return：下面的 `if (handled) { if (highFreq) {节流渲染} }`
+              // 才是真正让 Vue 重渲染 + 自动滚动的出口。提前 return 会让数据在累积
+              // 但 DOM 停在第一个 token（实测：气泡出现但长度卡在 34 不动）。
+              // 所以走「不 return、继续往下走」的路子——后面的分支都是 else-if，
+              // 不会误处理，这里等价于「处理完了，去渲染」。
+            } else {
+              if (payload.step && msg.thinkingStep !== payload.step) {
+                // 换步骤：先把上一行收尾换行，再起新行
+                msg.thinking = (msg.thinking ? msg.thinking : '') + (msg.thinking && !msg.thinking.endsWith('\n') ? '\n' : '')
+                msg.thinkingStep = payload.step
+              }
+              msg.thinking = (msg.thinking ? msg.thinking : '') + piece
+              highFreq = true
+              msg.thinkingStreaming = true
+              if (!streamingStep.value || streamingStep.value === '正在生成 SQL…') {
+                streamingStep.value = '正在生成 SQL…'
+              }
             }
           } else if (type === 'thought_done') {
+            // token 流收尾：闭合「正在写」气泡（后端对同一 step 只补发一次 done，
+            // 这里按 step 判空，避免重复插入收尾标记）
+            if (msg.thinkingLive) {
+              msg.thinkingLive = false
+              msg.thinking = (msg.thinking || '') + '\n⟦T-END⟧\n'
+            }
             msg.thinking = (msg.thinking || '') + '\n'
+            msg.thinkingStep = ''
           } else if (type === 'sql') {
             msg.thinking = (msg.thinking ? msg.thinking : '') + (msg.thinking && !msg.thinking.endsWith('\n') ? '\n' : '') + `📌 SQL：${payload.sql || ''}`
             // 实时写入独立 SQL 卡片：SQL 一生成用户立刻可见，不用等整轮结束
@@ -2189,9 +2298,12 @@ const sendMessage = async (presetText?: string | Event, opts?: { noConfirm?: boo
           }
         if (handled) {
           if (highFreq) {
-            // 逐 token 高频事件：节流到 ~80ms 一次渲染，避免每个字都强制一帧拖垮页面
+            // 逐 token 高频事件：节流渲染，避免每个字都强制一帧拖垮页面。
+            // 2026-10-03 从 30ms 放宽到 90ms：上游 token 间隔中位 0.18s，
+            // 30ms 节流等于几乎每帧都重排，用户反馈"太闪" —— 视觉抖动
+            // 比信息更新更抢眼。90ms 既有"陆续浮现"的感觉，又足够稳。
             const now = Date.now()
-            if (now - lastRenderAt > 80) {
+            if (now - lastRenderAt > 90) {
               lastRenderAt = now
               await nextTick()
               await scrollToBottom()
@@ -2567,9 +2679,31 @@ const switchChartType = (msg: any, type: string) => {
       : null
     if (!node) return
     // 复用容器里已有的全量数据（dataset.cols/rows），改类型重渲，不重新查询
-    const cols = JSON.parse(node.dataset.cols || '[]')
-    const rows = JSON.parse(node.dataset.rows || '[]')
-    if (!cols.length || !rows.length) return
+    let cols: any[] = []
+    let rows: any[] = []
+    try {
+      cols = JSON.parse(node.dataset.cols || '[]')
+      rows = JSON.parse(node.dataset.rows || '[]')
+    } catch {
+      cols = []
+      rows = []
+    }
+    if (!cols.length || !rows.length) {
+      // 2026-10-03 修复（P1）：原实现直接静默 return。落盘瘦身（防 localStorage 配额爆掉）
+      // 会把 data-rows 剥成 "[]"，但 data-cols 保留 → 刷新后下拉框正常渲染、用户选中
+      // 「折线图」→ msg.chartTypeOverride 已写、UI 显示已切换，但这里早退 → 图表纹丝不动，
+      // 且没有任何一行提示。这正是「切换图型后还是柱状图」在另一条路径上复活，
+      // 比修复前更隐蔽（下拉框与图表互相矛盾）。
+      // 现在：明确回退到容器里已有的 SVG，并恢复下拉框为初始图型，保证「所选=所显」。
+      const fb = node.dataset.fallback || ''
+      node.dataset.engine = 'svg'
+      node.innerHTML = fb
+      delete node.dataset.rendered
+      // 下拉框是 :value="msg.chartTypeOverride || msg.chartType || ''" 响应式绑定，
+      // 清空 override 即自动回到初始图型，无需手工改 DOM（保证「所选=所显」）
+      msg.chartTypeOverride = ''
+      return
+    }
     node.dataset.type = type
     delete node.dataset.rendered
     disposeChart(node)
@@ -3147,12 +3281,68 @@ watch(() => props.initialQuestion, (question) => {
 .ask-send-btn:active:not(:disabled) {
   transform: translateY(0) scale(.98);
 }
+/* 思考面板正文。⚠️ 面板内容全部由 `v-html`（formatThinking）注入，
+   而本组件是 `<style scoped>` —— v-html 动态插入的元素不带 [data-v-xxx] 属性，
+   scoped 选择器对它们**完全失效**（2026-10-03 实测：.tk-act 的背景色算出来是
+   transparent、圆角 0px，整段思考是纯文本无样式）。
+   因此凡是作用于面板**内部**元素的选择器都必须用 :deep() 穿透。 */
 .tk-panel { color: #4b5563; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-.tk-step { display: flex; align-items: flex-start; gap: 6px; padding: 3px 0; }
-.tk-dot { flex: none; width: 6px; height: 6px; margin-top: 5px; border-radius: 9999px; background: #4D9EFF; }
-.tk-step-name { font-weight: 600; color: #1f2937; white-space: pre-wrap; word-break: break-word; }
-.tk-reason { padding: 2px 0 2px 12px; color: #6b7280; white-space: pre-wrap; word-break: break-word; }
-.tk-sql {
+.tk-panel :deep(.tk-step) { display: flex; align-items: flex-start; gap: 6px; padding: 3px 0; }
+.tk-panel :deep(.tk-dot) { flex: none; width: 6px; height: 6px; margin-top: 5px; border-radius: 9999px; background: #4D9EFF; }
+.tk-panel :deep(.tk-step-name) { font-weight: 600; color: #1f2937; white-space: pre-wrap; word-break: break-word; }
+.tk-panel :deep(.tk-reason) { padding: 2px 0 2px 12px; color: #6b7280; white-space: pre-wrap; word-break: break-word; }
+
+/* ===== 思考过程：DeepSeek 风格（2026-10-03 改版）=====
+   用户反馈上一版"太闪了"。对照 DeepSeek 的实际观感重做，核心是**把动效全部拿掉**：
+     ✗ 打字机光标（1s 闪烁）      ✗ 标题栏脉冲圆点（animate-pulse）
+     ✗ 左侧蓝色竖条（视线锚点太抢）  ✗ 渐变底 + 上浮淡入动画
+   改成的形态（对齐 DeepSeek「已深度思考（用时 8 秒）」那种块）：
+     · 整块浅灰底 + 圆角，无边框色条
+     · 标题行低调：小图标 + 灰色小字「已思考 / 正在思考」
+     · 正文浅灰、等宽以外的常规字重，靠**内容**而非动效吸引注意
+   动效只保留一处：标题前的 8px 小圆点用极慢呼吸（2.4s）表示"在跑"，
+   因为完全静止会让用户以为卡死 —— 但绝不闪烁。
+   ⚠️ 下面作用于面板**内部**的选择器都必须带 :deep()（v-html 不带 scoped 属性）。 */
+.tk-panel :deep(.tk-line) {
+  display: flex; align-items: baseline; gap: 6px;
+  padding: 3px 0 3px 2px; line-height: 1.6;
+}
+.tk-panel :deep(.tk-act) {
+  flex: none;
+  font-weight: 600; font-size: 11px; color: #6b7280;
+  background: #EEF1F5; border: 1px solid #E3E8EF;
+  padding: 1px 7px; border-radius: 5px; white-space: nowrap;
+}
+/* .tk-rest / .tk-tag 在 v-html 内，同样要 :deep 穿透 */
+.tk-panel :deep(.tk-rest) { color: #8A94A3; white-space: pre-wrap; word-break: break-word; }
+.tk-panel :deep(.tk-rest .tk-tag) { color: #A3ABB8; font-weight: 500; }
+
+/* token 级思考流：模型的真实 reasoning_content。
+   DeepSeek 式的处理——**不加任何边框与底色块**，直接作为一段浅灰正文
+   接在决策链下面，靠「AI 思考」这个小标题区分段落即可。
+   之前做成带蓝竖条的"气泡"，视觉上跳出来太多，盯着看会晃。 */
+.tk-panel :deep(.tk-live) {
+  display: block;
+  margin: 8px 0 4px; padding: 0 0 0 2px;
+  line-height: 1.8; color: #7A8494;
+  font-size: 12px;
+  white-space: pre-wrap; word-break: break-word;
+}
+.tk-panel :deep(.tk-live-tag) {
+  display: block; margin-bottom: 2px;
+  font-size: 10.5px; font-weight: 600; color: #AAB2BF;
+  letter-spacing: .4px;
+}
+.tk-panel :deep(.tk-live-text) { color: #7A8494; }
+
+@keyframes tk-breathe { 0%, 100% { opacity: .35; } 50% { opacity: 1; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .ask-collapse-spin { animation: none !important; }
+}
+
+/* .tk-sql 同样在 v-html 内，需 :deep 穿透（见上方 .tk-step 处的说明） */
+.tk-panel :deep(.tk-sql) {
   margin: 4px 0 4px 12px; padding: 6px 8px; background: #0f172a; color: #e2e8f0;
   border-radius: 6px; font-size: 10.5px; line-height: 1.45; white-space: pre-wrap;
   word-break: break-word; overflow-x: auto; max-height: 180px;
@@ -3356,12 +3546,22 @@ watch(() => props.initialQuestion, (question) => {
 
 /* ===== 折叠卡统一语言（思考过程 / 溯源 / Show Work / 引用文档）=====
    一套「浅灰底 + 统一表头（图标 + 名称 + 状态）」的折叠卡，替代原先深浅不一的散卡 */
+/* ===== 思考过程折叠块（2026-10-03 改 DeepSeek 风格）=====
+   这一组 .ask-collapse-* 也被「数据溯源（血缘）」复用，所以只改视觉、
+   不动结构。DeepSeek 的思考区是**一块柔和的浅灰圆角块**，标题行更轻，
+   与下面的白色结果卡形成"底色分层"而不是"边框分层"。 */
 .ask-collapse {
   margin-top: 10px;
+  margin-bottom: 10px;            /* 2026-10-03：上移到结果上方后给下方结果卡留间距 */
   border-radius: 10px;
   border: 1px solid var(--line-200);
   background: #FBFCFE;
   overflow: hidden;
+}
+/* 思考块本体：浅灰底，DeepSeek 式无色条 */
+.ask-collapse:has(.tk-panel) {
+  background: #F7F8FA;
+  border-color: #EDEFF3;
 }
 .ask-collapse-head {
   display: flex;
@@ -3372,7 +3572,7 @@ watch(() => props.initialQuestion, (question) => {
   user-select: none;
   transition: background .15s ease;
 }
-.ask-collapse-head:hover { background: #F4F7FB; }
+.ask-collapse-head:hover { background: #F0F2F6; }
 .ask-collapse-mark {
   display: inline-flex;
   align-items: center;
@@ -3383,6 +3583,12 @@ watch(() => props.initialQuestion, (question) => {
   background: var(--brand-100);
   color: var(--brand-600);
   flex: none;
+}
+/* 生成中：极慢呼吸的小圆点（2.4s 一次），只表示"在跑"，不闪烁 */
+.ask-collapse-spin {
+  width: 6px; height: 6px; border-radius: 9999px;
+  background: #9AA4B2;
+  animation: tk-breathe 2.4s ease-in-out infinite;
 }
 .ask-collapse-name {
   font-size: 12px;

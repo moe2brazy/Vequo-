@@ -234,7 +234,12 @@ def _normalize_policy(raw) -> dict:
                 # 「denied」「禁止」等拼写问题都会把「禁止访问」变成「明文可见」，
                 # 保存成功、界面回显正常、引擎层却完全没拦，且无任何报错。
                 # 现在：先strip()；未知值按 deny 处理（收紧方向，宁可多挡）。
-                mode = str(rule.get("mode") or "visible").strip().lower()
+                # 追加修复（同一 fail-open 的另一条路径）：原 `or "visible"` 兜住了
+                # 「mode 键整个缺失」的情形（{} / {"mask":"hash"} / {"mode":null} /
+                # {"mode":0}）→ 落成 "visible" ∈ COLUMN_MODES → 同样明文可见。
+                # mode 缺失/为空 与 未知值 一律按 deny 处理。
+                raw_mode = rule.get("mode")
+                mode = str(raw_mode).strip().lower() if raw_mode not in (None, "") else "deny"
                 if mode not in COLUMN_MODES:
                     mode = "deny"
                 item = {"mode": mode, "note": str(rule.get("note") or "")}
@@ -261,7 +266,10 @@ def _normalize_policy(raw) -> dict:
             # 原实现只lower() 没 strip()，且无法识别的 mode 一律回落成 allow——
             # 同样 是 fail-open：「deny 」（表单尾随空格）、「denied」会把「禁止访问」
             # 变成「完全放行」，引擎层不拦、界面回显正常、无任何报错。
-            mode = str(rule.get("mode") or "allow").strip().lower()
+            # 追加修复：`or "allow"` 同样兜住了「mode 键缺失」（{} / {"mode":null}），
+            # 与 columns 段是同一个 fail-open，缺失一律按 deny。
+            raw_mode = rule.get("mode")
+            mode = str(raw_mode).strip().lower() if raw_mode not in (None, "") else "deny"
             if mode not in METRIC_MODES:
                 mode = "deny"
             item = {"mode": mode, "note": str(rule.get("note") or "")}
@@ -306,7 +314,17 @@ def _migrate(raw: dict) -> dict:
 def _write(model: dict) -> None:
     # 2026-10-03 修复：原来是裸 write_text（先 truncate 再写），写入途中崩溃会留下
     # 半截 JSON → 下次 load_model 读失败 → 又触发种子覆写 → 整套权限被永久抹掉。
-    # 改用「同目录临时文件 + 原子替换」，与 database.py 的 _write_text_atomic 同一思路。
+    # 改用「同目录临时文件 + 原子替换」，并复用 database._write_text_atomic 的
+    # PermissionError 退避（Windows 上 Defender 实时扫描会瞬时锁文件，
+    # database.py:228-231 明确记录这是本项目真实发生过的现象）。
+    try:
+        from database import _write_text_atomic
+        _write_text_atomic(_PERM_FILE, json.dumps(model, ensure_ascii=False, indent=2))
+        return
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"[perm-model] 原子写 {_PERM_FILE} 失败（{e}），退回 tmp+replace")
     tmp = _PERM_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(model, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, _PERM_FILE)
@@ -336,13 +354,16 @@ def load_model(refresh: bool = False) -> dict:
                 read_failed = True
                 print(f"[perm-model] 读取 {_PERM_FILE} 失败（{e}）：沿用内存缓存，不覆写权限文件")
         if read_failed:
-            model = _cache if _cache is not None else _seed_model()
+            # 追加修复（2026-10-03）：原实现 `_cache = model` 把**种子模型驻留**进缓存，
+            # 于是 load_model() 开头的 `if _cache is not None: return _cache` 让真实
+            # 配置文件在整个进程生命周期内永远不再被读取；随后管理员改任意一项权限并
+            # 保存，_write() 就把「种子 + 这一项改动」写回磁盘 —— 用户文件里配置的
+            # 三个岗位角色、全部 user_grants、全部列脱敏规则被永久覆盖掉。
+            # 现在：读失败且无可用缓存时返回种子供本次调用，**不写 _cache**，
+            # 让文件恢复后能重新读到真实配置。
             if _cache is not None:
                 return _cache
-            # 没有任何可用模型：返回种子供本次请求使用，但**不落盘**，
-            # 避免把用户文件覆盖成种子
-            _cache = model
-            return model
+            return _seed_model()
         if not isinstance(raw, dict) or not raw:
             # 仅在「文件确实不存在/为空」时播种
             model = _seed_model()

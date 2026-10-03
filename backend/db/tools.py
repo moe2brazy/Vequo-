@@ -250,14 +250,30 @@ def get_foreign_keys() -> dict[str, list[dict]]:
     返回: { "表名": [{"column": 外键列, "ref_table": 引用表, "ref_column": 引用列}, ...] }
     表名按当前 get_real_tables() 的命名规则（非 public 带 schema 前缀）。
     失败时返回 {}（不影响主流程）。
+
+    2026-10-03 修复（与 get_real_tables 的 _trusted 范式对齐）：
+    原实现无条件把 `_load_foreign_keys_uncached()` 的结果写入缓存并刷新 TTL，
+    而该函数在**两种失败**下都返回 {}（success=False、以及 except）→
+    一次 EXPLAIN 闸门拦下 / statement_timeout / 连接池忙，就把**空外键图钉住 60 秒**。
+    期间所有并发请求的 LLM 都拿到「这些表之间没有任何关系」→ JOIN 推理失效 →
+    要么不 JOIN（跨表指标算不出来），要么凭字段名硬凑 JOIN（生成错 SQL）。
+    这正是 get_real_tables 那条注释描述的同一场景，只是当时只修了一处。
+    现在：查询失败 → 不落缓存、不刷 TTL，降级返回上一次好结果；
+    真空键图（success=True 且 0 行）→ 是可信结论，可缓存。
     """
     now = time.time()
     key = _real_tables_cache_key()
     with _real_tables_lock:
         if key is not None and _fk_cache["key"] == key and now - _fk_cache["ts"] < _META_TTL:
             return _fk_cache["value"]
-    result = _load_foreign_keys_uncached()
+    result, trusted = _load_foreign_keys_uncached()
     if key is not None:
+        if not trusted:
+            # 查询失败：沿用上一次好结果（同一库）且不刷新 TTL，让下一次能重新探测
+            with _real_tables_lock:
+                if _fk_cache["key"] == key and _fk_cache["value"]:
+                    return _fk_cache["value"]
+            return result
         with _real_tables_lock:
             _fk_cache["key"] = key
             _fk_cache["ts"] = time.time()
@@ -265,8 +281,13 @@ def get_foreign_keys() -> dict[str, list[dict]]:
     return result
 
 
-def _load_foreign_keys_uncached() -> dict[str, list[dict]]:
-    """实际查询全库外键（无缓存，供 get_foreign_keys 内部使用）。"""
+def _load_foreign_keys_uncached() -> tuple[dict[str, list[dict]], bool]:
+    """实际查询全库外键（无缓存，供 get_foreign_keys 内部使用）。
+
+    返回 (外键图, 是否可信)：
+      - (dict, True)  查询成功（**含真空图**：库里确实没有外键，是可信结论）
+      - ({}, False)   查询失败/异常 —— 调用方必须不落缓存、不刷新 TTL
+    """
     try:
         from .executor import execute_sql
         if get_db_type() == "mysql":
@@ -294,7 +315,9 @@ def _load_foreign_keys_uncached() -> dict[str, list[dict]]:
                 "WHERE tc.constraint_type = 'FOREIGN KEY'"
             )
         if not (r["success"] and r["rows"]):
-            return {}
+            # 真空键图（success=True 且 0 行）= 可信结论，可缓存；
+            # 查询失败（success=False）= 不可信，必须返回 trusted=False
+            return {}, bool(r.get("success"))
         out: dict[str, list[dict]] = {}
         for row in r["rows"]:
             if get_db_type() == "mysql":
@@ -314,9 +337,9 @@ def _load_foreign_keys_uncached() -> dict[str, list[dict]]:
                 "ref_table": ref_table,
                 "ref_column": row["ref_column"],
             })
-        return out
+        return out, True
     except Exception:
-        return {}
+        return {}, False
 
 
 def get_dynamic_table_detail(table_name: str) -> dict | None:

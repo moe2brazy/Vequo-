@@ -348,12 +348,12 @@
           <div class="kb-graph-toolbar">
             <div class="kb-graph-toolbar-left">
               <span class="kb-graph-title"><AppIcon name="git-fork" :size="14" /> 业务知识图谱</span>
-              <span class="kb-graph-hint">{{ lightRagActive ? 'LightRAG 图谱 · 拖拽节点 · 滚轮缩放 · 点击查看描述' : '拖拽查看 · 点击连线查看关联字段' }}</span>
+              <span class="kb-graph-hint">{{ graphLoaded ? '实时表间关系图谱 · 拖拽节点 · 滚轮缩放 · 点击查看详情' : '拖拽查看 · 点击连线查看关联字段' }}</span>
               
             </div>
             <div class="kb-graph-toolbar-right">
               <!-- 图谱模式切换（合并自 2026-09-04 版本）：完整=六类知识图谱+ER 表节点；简洁=原表+外键图 -->
-              <!-- LightRAG 图谱生效时隐藏旧图专属控件（模式/类型过滤/场景均不适用于 LightRAG 数据） -->
+              <!-- 图谱加载成功时隐藏旧图专属控件（模式/类型过滤/场景不适用于实时表关系数据） -->
               <template v-if="!lightRagActive">
               <span class="kb-filter-btn" style="opacity:.65;cursor:default;border-color:transparent;padding-left:0;">模式</span>
               <button class="kb-filter-btn" :class="{ active: graphMode === 'full' }" @click="graphMode = 'full'"><AppIcon name="share-2" :size="11" /> 完整图谱</button>
@@ -1659,9 +1659,14 @@ const graphNodeFacts = computed(() => {
 })
 
 // 该节点涉及的数据表（指标/字段类节点用于跳转场景知识）
+// 该节点涉及的数据表。
+// 「数据表」类节点本身就是一个表：facts 区已经展示了「数据表 <物理表名>」，
+// 这里再渲染一遍会出现同一个表名连着出现两次（2026-10-03 实测截图确认），
+// 对该节点没有增量信息 —— 只有「指标/字段/概念」类节点才需要列出它跨了哪些表。
 const graphNodeTables = computed(() => {
   const zh = graphNodeZh.value
   if (!zh) return []
+  if (zh.kind === '数据表') return []
   const list = zh.table ? [zh.table, ...(zh.tables || [])] : (zh.tables || [])
   return Array.from(new Set(list.filter(Boolean)))
 })
@@ -1776,6 +1781,11 @@ const graphMode = ref<'simple' | 'full'>('full')
 // LightRAG 知识图谱（public/knowledge_graph.json）是否生效：
 // 生效时视图2 使用 LightRagGraph 组件（复刻 knowledge_graph.html），隐藏旧图谱的 模式/类型/场景 过滤
 const lightRagActive = ref(false)
+// 图谱数据是否已加载成功（用于工具栏提示语）。
+// 语义上就是原来的 lightRagActive —— 名字里的 "lightRag" 是历史遗留：
+// 该图谱的数据源 2026-10-03 起已改为实时表间关系接口 /api/tables/relationships，
+// 不再读 LightRAG 导出的静态 knowledge_graph.json。
+const graphLoaded = computed(() => lightRagActive.value || graphFullNodes.value.length > 0)
 
 // 切换场景过滤 / 图谱模式后，视图自动适配当前可见子图（否则全图 fit 后字太小）
 watch([activeGraphScene, graphMode], async () => {
@@ -1783,10 +1793,16 @@ watch([activeGraphScene, graphMode], async () => {
   ;(graphFullscreen.value ? graphFullscreenRef.value : graphRef.value)?.fitView?.()
 })
 
-// 「节点中文解释」面板展开/收起会改变图谱画布高度：重新适配一次，
+// 「节点中文解释」面板**展开**会改变图谱画布宽度：重新适配一次，
 // 否则画布变小后视图还停在旧位置，边上节点会跑到画布外，看起来像「图谱少了/没了」。
-// 只监听「有无选中节点」的变化，所以点不同节点不会反复重置视图。
-watch(() => !!selectedGraphNode.value, async () => {
+//
+// 只在「无 → 有」时 fit，**关闭时不再重置视图**（2026-10-03 修复）：
+// 原实现监听 `!!selectedGraphNode` 的变化，开和关都会跑 fitView()。后果是
+// 关掉面板后整张图重新 fit，所有节点位置突变 —— 刚关掉面板再点某个节点，
+// 点的是旧坐标，命不中（实测连续点击时命中率极低）；而且物理模拟的节点
+// 本来就有位移，每次开关都 fit 会让图谱「一跳一跳」，无法稳定点击。
+watch(selectedGraphNode, async (v) => {
+  if (!v) return            // 关闭时保持当前视图
   await nextTick()
   // 等两帧：面板展开 → 浏览器布局 → LightRagGraph 的 ResizeObserver 同步完画布尺寸，再 fit
   requestAnimationFrame(() => requestAnimationFrame(() => {
@@ -1966,44 +1982,48 @@ const buildTablesInfoFromScenes = () => {
 
 const loadRelations = async () => {
   try {
-    // ========== 优先从 LightRAG JSON 加载（public/knowledge_graph.json，由 knowledge_graph.html 导出） ==========
-    try {
-      const lightRagRes = await fetch('/knowledge_graph.json')
-      if (lightRagRes.ok) {
-        const lightRagData = await lightRagRes.json()
-        if (lightRagData.nodes && lightRagData.nodes.length > 0) {
-          // 原始 vis 格式：节点带 entity_type/description/label/color，边带 from/to/keywords/description
-          const nodes = lightRagData.nodes.map((n: any) => ({
-            id: n.id,
-            name: n.id,
-            label: n.label || n.id,
-            nodeType: n.entity_type || '实体',
-            scene: '其他',
-            desc: n.description || '',
-            columns: 0,
-            rowCount: 0
-          }))
-          const edges = lightRagData.edges.map((e: any) => ({
-            source_table: e.from,
-            target_table: e.to,
-            source_column: '',
-            target_column: '',
-            type: e.keywords || e.label || '关联',
-            description: e.description || ''
-          }))
+    // ========== 图谱主数据源：实时表间关系接口（2026-10-03）=========
+    // 必须与 LightRagGraph 组件画布**同源**：画布从 /api/tables/relationships 取
+    // 节点（id = 物理表名，如 dim_product / mes_process_output），点击时按 id 回查
+    // activeGraphNodes。若这里仍读 public/knowledge_graph.json（id 是「产品表」
+    // 这类中文名，44 个），两组 id 完全不同 → onGraphNodeClick 的 find() 必然
+    // 返回 undefined → 点了打不开详情（2026-10-03 修复的正是这个不一致）。
+    const relRes = await fetch(`${API_BASE}/tables/relationships`)
+    if (relRes.ok) {
+      const relJson = await relRes.json()
+      const rawNodes = relJson.nodes || []
+      const rawRels = relJson.relationships || []
+      if (rawNodes.length > 0) {
+        // 节点结构与后端 /tables/relationships 一致；补上页面侧用到的字段别名
+        const nodes = rawNodes.map((n: any) => ({
+          ...n,
+          name: n.name || n.id,
+          label: n.label || n.name || n.id,
+          nodeType: n.nodeType || '业务对象',
+          desc: n.description || '',
+        }))
+        // 边统一成页面侧的关系结构（source_table/target_table）
+        const edges = rawRels.map((e: any) => ({
+          source_table: e.source_table,
+          target_table: e.target_table,
+          source_column: e.source_column || '',
+          target_column: e.target_column || '',
+          type: e.type || 'business',
+          description: e.description || '',
+        }))
 
-          graphComponentNodes.value = nodes
-          graphComponentRels.value = edges
-          graphFullNodes.value = nodes
-          graphFullRels.value = edges
-          lightRagActive.value = true
+        graphComponentNodes.value = nodes
+        graphComponentRels.value = edges
+        graphFullNodes.value = nodes
+        graphFullRels.value = edges
+        lightRagActive.value = true
+        // 缓存表节点元信息，供节点详情面板复用（避免二次请求）
+        rawGraphNodesById.value = new Map(nodes.map((n: any) => [String(n.id), n]))
+        rawTableEdges.value = edges
 
-          console.log(`✅ 已加载 LightRAG 知识图谱: ${nodes.length} 个节点, ${edges.length} 条关系`)
-          return
-        }
+        console.log(`✅ 已加载实时表间关系图谱: ${nodes.length} 个表节点, ${edges.length} 条关系`)
+        return
       }
-    } catch (e) {
-      console.log('LightRAG JSON 加载失败，回退到后端 API:', e)
     }
     lightRagActive.value = false
 

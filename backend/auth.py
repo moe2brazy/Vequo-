@@ -13,6 +13,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -140,14 +141,37 @@ def load_users() -> list[dict]:
         try:
             _users_cache = json.loads(_USERS_FILE.read_text(encoding="utf-8"))
             return _users_cache
-        except Exception:
+        except FileNotFoundError:
             return []
+        except Exception as _e:
+            # 2026-10-03 修复（P0·fail-close）：原实现 `except: return []` 把
+            # 「文件被杀毒/编辑器瞬时锁住」与「还没有用户」当成同一件事。返回 [] 后
+            # find_user() 全 miss → get_current_user() 在 AUTH_REQUIRED=0 下把调用方
+            # 降级成 guest → build_acl_context 对 guest 显式豁免收敛到空集
+            # （「guest 不受此限」）→ allowed_tables=None → check_table_access 全放行。
+            # 于是文件被锁的那一瞬间，**所有已登录用户**静默拿到完整无过滤数据，
+            # 不是 500、不是登录失败，而是把 viewer 静默提升成全库可读。
+            # 权限系统不可用时必须拒绝发数据，绝不能回落 guest。
+            logging.getLogger("auth").error(
+                "读取用户文件失败(%s)，拒绝降级为 guest：%s", _USERS_FILE, _e)
+            raise
 
 
 def save_users(users: list[dict]) -> None:
     global _users_cache
     with _lock:
-        _USERS_FILE.write_text(json.dumps(users, ensure_ascii=False, indent=2), encoding="utf-8")
+        # 2026-10-03 修复（P0）：原实现是裸 write_text（先 truncate 再写）。
+        # 写到一半进程被杀/磁盘满 → 留下半截 JSON → 此后 load_users() **每次**
+        # 都走读失败分支 → 全员 guest 永久生效（且叠加上面 fail-close 后会全站 500，
+        # 但至少不再静默泄露权限）。改用项目内已有的原子写（含 PermissionError 退避，
+        # 见 database._write_text_atomic —— Windows 上 Defender 实时扫描会瞬时锁文件）。
+        try:
+            from database import _write_text_atomic
+            _write_text_atomic(_USERS_FILE, json.dumps(users, ensure_ascii=False, indent=2))
+        except ImportError:
+            tmp = _USERS_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(users, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, _USERS_FILE)
         _users_cache = None  # 缓存失效，下次读取重新加载
 
 
@@ -430,15 +454,22 @@ def get_current_user(authorization: str = Header(None)) -> dict:
     if token:
         payload = decode_token(token)
         if not payload:
-            # 开放模式（AUTH_REQUIRED=0）下无效/过期 token 降级 guest，避免体验卡死；
-            # 管理端点仍被 require_roles 拦截（guest 不在 管理员 内），权限不受影响
+            # 2026-10-03 修复（P0·fail-close）：原注释只论证了「管理端点仍被
+            # require_roles 拦截」，但忽略了 guest 在**数据权限链路**里的特殊地位：
+            # enforcer.build_acl_context 明确写着「guest（开放模式匿名访客）不受此限」
+            # 并显式豁免收敛到空集 → allowed_tables=None → check_table_access 全放行。
+            # 于是 token 一过期（默认 12h），登录用户静默变成全库可读，看到所有
+            # 本该脱敏的列明文，且不弹登录框、请求正常 200。
+            # 判据：带了 token 说明用户以为自己有身份，无效/过期不是「无身份」，
+            # 必须 401 让前端重新登录。只有**完全没带 header** 才走开放模式兜底。
             if not AUTH_REQUIRED:
-                return {"username": "guest", "role": "guest"}
+                raise HTTPException(status_code=401, detail="登录已过期或无效，请重新登录")
             raise HTTPException(status_code=401, detail="登录已过期或无效，请重新登录")
         user = find_user(payload.get("sub", ""))
         if not user:
             if not AUTH_REQUIRED:
-                return {"username": "guest", "role": "guest", "roles": ["guest"], "attributes": {}}
+                # 同上：token 有效但用户已不存在 → 不能降级成高权限 guest
+                raise HTTPException(status_code=401, detail="用户不存在，请重新登录")
             raise HTTPException(status_code=401, detail="用户不存在")
         # 禁用账号：即使 JWT 未过期也拒绝（禁止禁用后继续查数）
         if not user.get("enabled", True):

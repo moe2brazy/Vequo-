@@ -363,7 +363,14 @@ def _save() -> None:
     if not _PERSIST:
         return
     try:
-        snapshot = [{k: v for k, v in s.items() if not k.startswith("_")} for s in _skills]
+        # 2026-10-03 修复（P1）：`_key` 是 record_success 的去重键，但原实现按
+        # `not k.startswith("_")` 把它连同其它下划线字段一起剥离 → 落盘后消失 →
+        # 重启加载的 skill 全部没有 _key → 同一路径再次沉淀时被当成「新记录」
+        # （实测：内存内去重正常，重启后 re-record 同一路径 count 从 1 变 2）。
+        # 结果 _MAX_SKILLS=200 迅速被重复项占满，真实高频路径被淘汰逻辑挤掉。
+        # 现在白名单式保留 _key（其余下划线字段仍视为运行时派生、不落盘）。
+        snapshot = [{k: v for k, v in s.items() if not k.startswith("_") or k == "_key"}
+                    for s in _skills]
         _FILE.write_text(json.dumps(snapshot, ensure_ascii=False, indent=1), encoding="utf-8")
     except Exception as e:
         _logger.warning("Skill 持久化失败（保持内存模式）: %s", e)

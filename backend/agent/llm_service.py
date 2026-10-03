@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import queue
 import re
 import time
 import functools
@@ -15,6 +16,7 @@ import sys
 import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from typing import Generator, Any
 
 from langchain_openai import ChatOpenAI
@@ -1149,6 +1151,24 @@ def _fix_cte_rank_to_limit(query: str, sql: str) -> str:
 _REL_WINDOW_RE = re.compile(
     r"最近|近\s*\d+\s*[天日月周]|本月|这个月|当月|上月|上个月|本周|这周|上周|今天|今日|昨天|昨日")
 
+# 2026-10-03 新增：**绝对月份/年份**问句（「6月」「2026年8月」）同样需要数据范围提示。
+# 背景（真库实测）：编译器对这类问句产出
+#   `stat_date >= (SELECT date_trunc('year', MAX(stat_date)) FROM t) + INTERVAL '5 months'
+#     AND stat_date <  ... + INTERVAL '6 months'`
+# 这本身就是**数据驱动锚点**（取数据里的最新年份 + N 月），所以「问 6 月得 0 行」
+# 在数据只到 8~9 月时是**正确行为**，不该被自动重锚（重锚会把用户明确指定的月份
+# 偷换成另一个月，答非所问）。
+# 但此前 `_zero_row_data_range_hint` 用 `_REL_WINDOW_RE` 卡门，只认相对时间词 →
+# 「各产线6月的产量」这种绝对月份问句落在门外 → 提示返回空串 → 用户只看到
+# 「0 行」却不知道「库里根本没有 6 月」，反复重试或以为查询写错。
+# 这里只放宽**提示的触发条件**（不碰任何 SQL 改写）。
+_ABS_MONTH_RE = re.compile(
+    r"(?<!\d)(?:19|20)\d{2}\s*年\s*(?:1[0-2]|[1-9])\s*月"
+    r"|(?<!\d)(?:1[0-2]|[1-9])\s*月(?:份)?(?!\s*\d\s*日)"
+    r"|(?<!\d)[1-9]\s*季度"
+    r"|(?<!\d)(?:19|20)\d{2}\s*年(?!\s*[-/]\s*\d)")
+_ANY_TIME_ASK_RE = re.compile(_REL_WINDOW_RE.pattern + "|" + _ABS_MONTH_RE.pattern)
+
 
 # ── 数据实际时间范围探测（2026-09-28）────────────────────────────────
 # 背景（真跑复现）：问「上个月每个车间的平均停机时长」，编译器按注册口径生成
@@ -1217,7 +1237,21 @@ def _probe_data_range(sqlexec, tables: list[str]) -> dict | None:
         if not bare or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", bare):
             continue
         now = _t.time()
-        hit = _DATA_RANGE_CACHE.get(bare)
+        # 2026-10-03 修复（P1）：缓存 key 必须带数据库维度。原 key 只有裸表名，
+        # 而本缓存喂给三个**会改写 SQL** 的函数（_needs_time_reanchor /
+        # _reanchor_hardcoded_range / _align_period_compare_length），
+        # TTL 600s 且 clear_cache() 从不清它 → 切库后 10 分钟内，若新库存在同名表，
+        # 会拿**旧库**的 min/max 去判定「数据是陈旧的」并把 SQL 的 CURRENT_DATE 锚点
+        # 平移到旧库的时间段 → 在新库上查一个旧库区间 → 0 行，或返回与问句不符的区间。
+        # 表现为「刚切库就问什么都 0 行 / 数字明显不属于新库」，且完全静默。
+        # 同组缓存里 _llm_table_cache / _analysis_infer_cache / _all_cols_cache /
+        # _DIM_1TO1_CACHE 的 key 都带 db_key，本缓存是唯一漏掉的。
+        try:
+            _dbk = _current_db_key()
+        except Exception:
+            _dbk = ""
+        ckey = "%s|%s" % (_dbk, bare)
+        hit = _DATA_RANGE_CACHE.get(ckey)
         if hit and now - hit[0] < _DATA_RANGE_TTL:
             if hit[1]:
                 return hit[1]
@@ -1244,11 +1278,11 @@ def _probe_data_range(sqlexec, tables: list[str]) -> dict | None:
         # 0 行用户看不到范围提示，候选生成退化成盲猜时间区间。
         # 对齐本文件 _all_table_columns 的既有口径：只在拿到可信结论时才缓存。
         if got:
-            _DATA_RANGE_CACHE[bare] = (now, got)
+            _DATA_RANGE_CACHE[ckey] = (now, got)
             return got
         if not _data_range_cols(bare):
-            # 确认无日期列：负缓存，避免每次都白扫一遍列清单
-            _DATA_RANGE_CACHE[bare] = (now, None)
+            # 确认无日期列：负缓存，避免每次都白扫一遍列清单（key 带库维度）
+            _DATA_RANGE_CACHE[ckey] = (now, None)
     return None
 
 
@@ -1258,8 +1292,16 @@ def _fmt_dt(v) -> str:
 
 
 def _zero_row_data_range_hint(sqlexec, tables: list[str], query: str) -> str:
-    """0 行 + 相对时间问句 → 生成一句「数据实际在哪」的提示；探不到返回空串。"""
-    if not _REL_WINDOW_RE.search(str(query or "")):
+    """0 行 + 时间类问句 → 生成一句「数据实际在哪」的提示；探不到返回空串。
+
+    2026-10-03 修复：触发条件从「仅相对时间词」放宽到「相对时间词 **或绝对月份/年份**」。
+    真库实测（数据 2026-08-01~09-15）：问「各产线6月的产量」返回 0 行是**正确行为**
+    ——编译器用 `date_trunc('year', MAX(stat_date)) + INTERVAL 'N months'` 做锚点，
+    本就是数据驱动的，不该被重锚（重锚会把用户指定的 6 月偷换成 8 月）。
+    但原实现只认相对时间词，绝对月份问句拿不到任何提示 → 用户只看到「0 行」，
+    不知道库里根本没有 6 月。这才是真正要修的点（只补提示，不改 SQL）。
+    """
+    if not _ANY_TIME_ASK_RE.search(str(query or "")):
         return ""
     try:
         probed = _probe_data_range(sqlexec, tables)
@@ -1268,6 +1310,14 @@ def _zero_row_data_range_hint(sqlexec, tables: list[str], query: str) -> str:
     if not probed:
         return ""
     mn, mx = _fmt_dt(probed["min"]), _fmt_dt(probed["max"])
+    # 绝对月份问句：直接点明「你问的那个月不在库里」，比泛泛的范围更省一轮追问
+    _abs = _ABS_MONTH_RE.search(str(query or ""))
+    if _abs:
+        ask = re.sub(r"\s+", "", _abs.group(0))
+        return (f"\n\n【为什么是 0 条】你问的是 **{ask}**，但当前库里没有这个时间段的数据。"
+                f"表 `{probed['table']}` 的实际数据范围是 **{mn} ~ {mx}**"
+                f"（时间字段 `{probed['col']}`）。库里没覆盖的月份，再怎么改查询也取不到数——"
+                f"请改问 **{mx[:7]}** 这样的有数据月份。")
     hint = (f"\n\n【数据范围提示】本次查询条件里的时间区间在当前库里没有数据。"
             f"表 `{probed['table']}` 的实际数据范围是 **{mn} ~ {mx}**"
             f"（时间字段 `{probed['col']}`），请据此改用具体日期区间再问一次。")
@@ -2089,8 +2139,19 @@ def _fix_relative_date_anchor(query: str, sql: str) -> str:
 _MONTH_WORD_RE = re.compile(r"上月|上个月|本月|这个月|当月")
 
 
-def _fix_relative_month_literal(query: str, sql: str) -> str:
-    """「上月/本月」被写成硬编码的年月区间 → 归一为 date_trunc 表达式。"""
+def _fix_relative_month_literal(query: str, sql: str, reanchored: bool = False) -> str:
+    """「上月/本月」被写成硬编码的年月区间 → 归一为 date_trunc 表达式。
+
+    2026-10-03 修复（P0）：`reanchored=True` 时**直接跳过**。
+    数据感知重锚（`_reanchor_hardcoded_range`）的唯一产出就是一段「完整自然月」的
+    字面量区间（如 '2026-07-01' ~ '2026-07-31'），而本函数的触发条件恰好是
+    「完整自然月字面量区间 + 问句含本月/上月」——两者判据完全重叠、方向相反，
+    且本函数在 steps 链里后执行，会把刚重锚好的日期无条件改回 CURRENT_DATE
+    （演示库数据停在 7 月、CURRENT_DATE 是 10 月 → 必然 0 行），
+    同时 notes 里仍写着「已按最新有数据的月份重新查询」，说明与 SQL 直接矛盾。
+    """
+    if reanchored:
+        return sql
     s = (sql or "").strip()
     if not s or not _FIX_SUPERSET_ON:
         return sql
@@ -2142,7 +2203,17 @@ _BARE_DATE_COL_RE = re.compile(r'(?i)^(?:[\w"]+\.)?[\w"]*(?:date|time|_at)[\w"]*
 
 
 def _fix_relative_window_days(query: str, sql: str) -> str:
-    """「最近N天」的 INTERVAL 天数归一到问句里的 N（gold 两题实测都取 N）。"""
+    """「最近N天」的 INTERVAL 天数归一到问句里的 N（gold 两题实测都取 N）。
+
+    2026-10-03 修复（P0）：原实现对 SQL 里**每一个** `INTERVAL 'N days'` 做替换，
+    没有任何「这个区间是不是问句窗口」的判据，于是：
+      问「最近30天」+ SQL `d >= CURRENT_DATE-INTERVAL '60 days'
+      AND d <  CURRENT_DATE-INTERVAL '30 days'` → 两个都被改成 30 天
+      → 下界 == 上界，区间恒空，必然 0 行；
+      多分支对比（同比/环比/子查询各带窗口）时也会把无关分支静默改掉。
+    现在只在 SQL 中**恰好存在一个 days 区间**时才归一，多区间一律不动（宁可不改，
+    也不能改错语义）。
+    """
     s = (sql or "").strip()
     if not s or not _FIX_SUPERSET_ON:
         return sql
@@ -2151,6 +2222,11 @@ def _fix_relative_window_days(query: str, sql: str) -> str:
         return sql
     want = int(m.group(1))
     try:
+        found = _WINDOW_IV_DAY_RE.findall(s)
+        # 多个不同的 days 区间 → 无法判断哪个是问句窗口，整体放弃归一
+        distinct = {int(g[1]) for g in found}
+        if len(distinct) > 1:
+            return s
         changed = [False]
 
         def _sub(mm):
@@ -2691,6 +2767,9 @@ def apply_output_fixes(query: str, sql: str, fired: list | None = None,
         return out
     # 数据感知锚点重定：必须在其它改写**之前**，因为后续 `_fix_relative_window_days`
     # 等要基于重定后的日期字面量工作（顺序反了会把刚换好的锚点又改回去）。
+    # _reanchored 标记本次是否真的重锚过 —— `_fix_relative_month_literal` 要靠它
+    # 避免把重锚产物改回 CURRENT_DATE（见该函数注释）。
+    _reanchored = False
     if sqlexec is not None:
         try:
             _info = _needs_time_reanchor(sqlexec, query, out)
@@ -2699,6 +2778,7 @@ def apply_output_fixes(query: str, sql: str, fired: list | None = None,
                 _new = _reanchor_sql_to_month(out, _month, str(_dmax))
                 if _new != out:
                     out = _new
+                    _reanchored = True
                     if fired is not None:
                         fired.append("_fix_data_aware_time_anchor")
                     if notes is not None:
@@ -2714,6 +2794,7 @@ def apply_output_fixes(query: str, sql: str, fired: list | None = None,
                     _hr = _reanchor_hardcoded_range(sqlexec, query, out)
                     if _hr:
                         out = _hr[0]
+                        _reanchored = True
                         if fired is not None:
                             fired.append("_fix_data_aware_time_anchor")
                         if notes is not None:
@@ -2734,7 +2815,7 @@ def apply_output_fixes(query: str, sql: str, fired: list | None = None,
         # 必须在前两条之后——前两条产出的 HAVING 左右不同，不会与之重复作用。
         ("_fix_degenerate_self_compare", lambda s: _fix_degenerate_self_compare(query, s)),
         ("_fix_relative_date_anchor", lambda s: _fix_relative_date_anchor(query, s)),
-        ("_fix_relative_month_literal", lambda s: _fix_relative_month_literal(query, s)),
+        ("_fix_relative_month_literal", lambda s: _fix_relative_month_literal(query, s, _reanchored)),
         # 天数归一必须在日期锚点之后：锚点先把 `MAX(date)-INTERVAL '29 days'` 换成
         # `CURRENT_DATE-INTERVAL '29 days'`，这里再按问句把 29 改成 30。
         ("_fix_relative_window_days", lambda s: _fix_relative_window_days(query, s)),
@@ -4402,7 +4483,8 @@ class LLMService:
                  row_filters: dict[str, str] | None = None,
                  column_whitelist: dict[str, set[str]] | None = None,
                  acl=None,
-                 no_confirm: bool = False):
+                 no_confirm: bool = False,
+                 take_step_thought: bool = False):
         self.query = query
         self.history = history or []
         # 澄清重问（no_confirm=True）：前端已就歧义让用户用自然语言补充过 → 跳过二次确认
@@ -4447,6 +4529,17 @@ class LLMService:
         self.sql = ""
         self.executed_sql = ""   # 权限改写/脱敏后实际执行的 SQL（审计留痕）
         self.sql_result: dict = {}
+        # ── token 级思考流（旁路，2026-10-03）──
+        # 队列：旁路线程写入，stream.py 轮询抽干成 SSE `thought` 事件。
+        # _thought_closed 保证 thought_done 只补发一次（详见 drain_thought_events）。
+        self._thought_out: "queue.Queue" = queue.Queue(maxsize=2000)
+        self._thought_thread = None
+        self._thought_started = 0.0
+        self._thought_closed = False
+        # 2026-10-03：是否把每一步转成可读「思考」文本随 step 事件下发（前端逐字显示）。
+        # 默认关：同步端点（/api/agent/ask）与评测链路不需要，白拼字符串浪费。
+        # stream.ask_stream 会置 True；单独用 take_steps=True 的调用方也置。
+        self._take_step_thought = bool(take_step_thought)
         self.chart: dict = {"type": "none", "svg": ""}
         self.matched_tables: list[dict] = []
         self.schema_context = ""
@@ -4765,6 +4858,16 @@ class LLMService:
             ev = {"type": "step", "name": name, "detail": detail, "elapsed_ms": ms}
             if evidence:
                 ev["evidence"] = evidence
+            # 2026-10-03：同时产出一条「思考」事件，让前端能像聊天一样逐字显示推理过程。
+            # 挂在 _step() 上是因为它是所有步骤的唯一出口 —— 无论确定性编译还是 LLM 生成，
+            # 每一步都会经过这里，无需在各个分支各写一遍。
+            # 用 take_step_thought() 单独控制：只想看最终结论的调用方（如 /api/agent/ask 同步端点）
+            # 关闭它即可省掉这段字符串拼接；SSE 链路默认开启。
+            if self._take_step_thought:
+                try:
+                    ev["thought"] = _agent_thought_line(name, detail, evidence)
+                except Exception:
+                    pass
             return ev
 
         # ── BIRD 评测档位：独立生成路径（必须放在最前面）──
@@ -5151,6 +5254,52 @@ class LLMService:
                     "output": _preview + (" 等" if len(_names) > 5 else ""),
                     "basis": _basis,
                 })
+
+                # 2026-10-03：进入 LLM 生成前的预告。
+                # 这一步实测耗时 30~100s（深度思考模型要"先想后答"，首 token 常达 20~40s），
+                # 此前这段时间 SSE 一个字都不吐，前端只有一句静态的「正在生成 SQL…」，
+                # 用户无从判断是卡死了还是在算 —— 答辩现场尤其明显。
+                # 这里先推一条思考文本，把"要做什么、为什么要花这么久"讲清楚；
+                # 真正的 SQL 产出后仍由后续 step/sql 事件补上。
+                if self._take_step_thought:
+                    try:
+                        _hint_bits = []
+                        if self.metric_hint and self.metric_hint.get("name"):
+                            _hint_bits.append(f"已按注册指标「{self.metric_hint.get('name')}」的口径准备字段")
+                        _hint_bits.append("正在让 AI 根据表结构写出查询语句")
+                        _hint_bits.append("这一步通常需要 10~60 秒（模型需先推理再作答）")
+                        yield {"type": "thought", "step": "SQL生成",
+                               "text": _agent_thought_line(
+                                   "AI推理", "；".join(_hint_bits) + "…")}
+                        yield {"type": "thought_done", "step": "SQL生成"}
+                    except Exception:
+                        pass
+
+                # ── 2026-10-03：token 级思考流（旁路）────────────────────────
+                # 上一条只是「预告」，用户仍看不到模型真实的思考过程。这里启动一个
+                # **旁路** HTTP 流：独立线程直连 OpenAI 兼容端点，把模型的
+                # reasoning_content 逐 token 收进 self._thought_out 队列；
+                # ask_stream 的轮询循环每 20ms 调一次 self.drain_thought_events()
+                # 把已到达的 token 吐成 `thought` SSE 事件 —— 前端像聊天一样逐字显示。
+                #
+                # 为什么必须旁路、不能替换主链的 _llm.stream()：
+                #   · langchain 1.5.3 会把 reasoning_content 整段丢弃（实测同一请求
+                #     HTTP 层 328 个 delta，langchain 层 0 字符、additional_kwargs 空）；
+                #   · 主链的 deadline / 首token门 / 重试预算都是按「一次性拿全文」调的，
+                #     改成流式会牵动整条链路的时序与预算，风险远大于收益。
+                # 旁路代价是**多一次模型调用**（仅 SSE 展示链路开启时发生，同步端点
+                # /api/agent/ask 不受影响），换来零风险的真实思考流。
+                # 旁路失败 / 超时 / 端点不支持流式 → 静默放弃，主链照常出 SQL。
+                if self._take_step_thought:
+                    _start_thought_stream(
+                        self,
+                        query=self.query,
+                        tables_hint=[t.get("table_name", "") for t in (self.matched_tables or [])],
+                        model=_sql_gen_model() or LLM_CONFIG.get("model"),
+                        api_key=LLM_CONFIG.get("api_key"),
+                        base_url=LLM_CONFIG.get("base_url"),
+                        max_tokens=_sql_gen_max_tokens(),
+                    )
 
                 # 2026-09-07（产品决策）：未命中确定性编译 → 不再弹窗，直接在主链内生成。
                 # 生成策略按 provider 分档：
@@ -5927,11 +6076,15 @@ class LLMService:
                 # 并发抢同一个 LLM 端点会互相拖慢，Evaluator 从 3.8s 涨到 8.2s，
                 # 总墙钟反而更慢。两路是实测最优解。
                 with ThreadPoolExecutor(max_workers=2) as _ex:
-                    _f_review = _ex.submit(self._review_chain)
+                    # 2026-10-03：同 _start_analysis —— ThreadPoolExecutor 不传播
+                    # ContextVar，ACL 在 worker 线程里取不到。这里显式复制上下文。
+                    _c1 = copy_context()
+                    _c2 = copy_context()
+                    _f_review = _ex.submit(_c1.run, self._review_chain)
                     # 洞察若已在上面提交过则复用，避免重复生成
                     _f_analysis = None
                     if getattr(self, "_analysis_future", None) is None:
-                        _f_analysis = _ex.submit(self._llm_analysis)
+                        _f_analysis = _ex.submit(_c2.run, self._llm_analysis)
                     # 2026-10-01 提速（不降准）：原 .result() 无超时，复核链里 Critic/Evaluator
                     # 若上游抖动会无限阻塞整条响应。加 45s 硬超时兜底（覆盖内部 30s 调用 +
                     # 串行 Critic→Evaluator 两段），超时视为"无 issue、无评分"——即放行，
@@ -6990,6 +7143,16 @@ class LLMService:
         base_score = self._eval_score if isinstance(self._eval_score, (int, float)) else None
         best_sql, best_res, best_score = None, None, base_score
         prev_sql, prev_res = self.sql, self.sql_result
+        # 2026-10-03 修复（P0）：`_exec_sql` 有两个实例副作用 —— 覆写 executed_sql、
+        # 并把该候选的行过滤/脱敏项**累加**进 acl_applied。本函数要执行 N 次候选，
+        # 只还原 sql/sql_result 会让最终态停在「最后一个被试候选」（可能是被否决那条）：
+        #   → _build_lineage / main.py 审计 / stream.py 结果缓存 用的都是 executed_sql，
+        #     于是血缘面板、审计日志、结果缓存里存的是被淘汰的 SQL；
+        #   → acl_applied 是所有候选的并集，权限白盒显示的「注入 N 张表行过滤」
+        #     与最终 SQL 实际生效的不符。
+        # 与 0 行重试链 / 复核链的 prev_exec / prev_acl 对齐。
+        prev_exec = getattr(self, "executed_sql", "")
+        prev_acl = {k: list(v) for k, v in (getattr(self, "acl_applied", None) or {}).items()}
         try:
             for cand in self._generate_candidates(n=n):
                 if not cand or cand.strip() == (self.sql or "").strip():
@@ -7008,6 +7171,8 @@ class LLMService:
                     ev = self._llm_result_evaluate() or {}
                 finally:
                     self.sql, self.sql_result = prev_sql, prev_res
+                    self.executed_sql = prev_exec
+                    self.acl_applied = {k: list(v) for k, v in prev_acl.items()}
                 sc = ev.get("score")
                 # 评分缺失 → 跳过该候选（不参与择优），不拿 0 当分数
                 if not isinstance(sc, (int, float)):
@@ -7021,12 +7186,22 @@ class LLMService:
             return False
         finally:
             self.sql, self.sql_result = prev_sql, prev_res
+            self.executed_sql = prev_exec
+            self.acl_applied = {k: list(v) for k, v in prev_acl.items()}
 
         if best_sql is None or best_score is None:
             return False
         if base_score is not None and best_score <= base_score:
             return False
         self.sql, self.sql_result = best_sql, best_res
+        # 采纳路径：重新执行一次 best_sql，让 executed_sql / acl_applied 反映
+        # **最终生效**的 SQL（而不是最后一个被试候选，也不是采纳前的旧值）。
+        try:
+            _fr = self._exec_sql(best_sql)
+            if isinstance(_fr, dict) and _fr.get("success"):
+                self.sql_result = _fr
+        except Exception as _fe:
+            logging.getLogger("nl2sql").warning("交叉比对采纳后重执行失败，保留原结果: %s", _fe)
         self._eval_score = best_score
         self._evaluation = {"score": best_score, "dims": {}, "comment": "交叉比对后采纳更优候选"}
         self._cross_validated = True
@@ -7191,7 +7366,19 @@ class LLMService:
         try:
             if self.fast:
                 return
-            self._analysis_future = _POST_POOL.submit(self._llm_analysis)
+            # 2026-10-03 修复（P0，跨用户数据泄露）：ThreadPoolExecutor **不传播
+            # ContextVar**（实测主线程 get_acl() 返回对象、worker 线程返回 None），
+            # 而 ACL 正存在 ContextVar 里（security/context.py）。
+            # 后果链条：_llm_analysis 在 pool 线程跑 → get_acl() 为 None →
+            # 洞察缓存的 key 退化成字面量 "anon"（llm_service.py:9605-9611）→
+            # 权限不同的两个用户问同一问题且行数相同（分组聚合极易同长，双方都 5 行）
+            # 时，后提问者会拿到前者的洞察文本，**里面是对方权限范围内的真实数字**。
+            # 这正是本函数所在文件 9600-9604 行注释里写明的威胁模型 —— 当时给缓存
+            # 加了 ACL 指纹，却漏了让它失效的调用线程。
+            # 修法：submit 前 copy_context()，把当前 ACL 复制进 worker。
+            # 与 insight_scan.py:248-258 已有的同类修法保持一致。
+            _ctx = copy_context()
+            self._analysis_future = _POST_POOL.submit(_ctx.run, self._llm_analysis)
         except Exception:
             self._analysis_future = None
 
@@ -7503,6 +7690,15 @@ class LLMService:
         """
         rows = self.sql_result.get("rows") or []
         cols = self.sql_result.get("columns") or []
+        # 2026-10-03：Pearson 相关性结果**不能**走通用规则解读 _rule_insight。
+        # 通用摘要把「样本量」当第一数值列去排名，会输出「样本量最高的是一车间-4号线
+        # （38，占 22.2%）」「各维度之间差距不大」这类与相关性完全无关的结论 ——
+        # 这正是本编译器上线前 LLM 链路的原有毛病（它把 CORR 列当普通数值列解读）。
+        # 相关系数必须由懂统计的专用解读器处理：显著性看 t 值、强度看 |r|、
+        # 方向看 r 符号，三者缺一就会把「r=0.28 但 t=1.75 不显著」误读成强相关。
+        _corr_text = _pearson_insight(rows, cols)
+        if _corr_text:
+            return _bilingualize(_corr_text)
         text = _rule_insight(rows, cols)
         # 0 行 + 相对时间问句 → 附上「数据实际在哪」（2026-09-28）。
         # 只在这里追加而**不改写 SQL**：编译产物的确定性必须保住，
@@ -7822,6 +8018,13 @@ class LLMService:
         total_rows = 0
 
         # 只列当前 DB 中真实存在的表（支持任意 schema）
+        # 2026-10-03 修复（P1）：db_tables 原先只在 `r["success"]` 分支里初始化，
+        # 而 success=False（连接超时 / reload_pool 重建瞬间 / PG 短暂抖动）是**正常
+        # 业务路径不是异常** → except 兜底不生效 → 下一行读取即 UnboundLocalError
+        # → 整个请求 500，且 stream.py 把 Python 内部错误信息直接暴露给用户。
+        # 而这里本来有完整降级设计（下面 else 分支回退 META，注释写着"DB 不可用时
+        # 回退到元数据"）—— 精心写的兜底因一个变量绑定错误而永远走不到。
+        db_tables: list[str] = []
         try:
             from database import get_db_type as _gdt
             if _gdt() == "mysql":
@@ -7835,9 +8038,8 @@ class LLMService:
                     "WHERE table_schema NOT IN ('pg_catalog','information_schema') AND table_type='BASE TABLE' "
                     "ORDER BY (table_schema='public') DESC, table_schema, table_name"
                 )
-            if r["success"]:
-                db_tables = []
-                for row in r["rows"]:
+            if r and r.get("success"):
+                for row in (r.get("rows") or []):
                     if _gdt() == "mysql":
                         db_tables.append(row["table_name"])
                     else:
@@ -8536,7 +8738,20 @@ def _corr_pair(columns: list[str], rows: list[dict]):
         return None
 
 
-def _corr_strength(rv: float) -> str:
+def _corr_strength_phrase(rv: float) -> str:
+    """相关系数 → 纯文案短语（"较强正相关（同增同减）"）。
+
+    2026-10-03 修复（P0，隐蔽的函数名冲突）：本文件下方 9077 行另有一个**同名**
+    `_corr_strength(r) -> tuple[str, str]`（返回二元组，供 _pearson_insight 用）。
+    Python 里后定义覆盖先定义，所以本函数（原本也叫 `_corr_strength`）在模块加载后
+    **根本不存在** —— 8741/8849/8856 行的调用全部拿到的是 9077 那个 tuple 版本：
+      · 8849 行 f-string 拼 tuple → 输出 "('较强线性相关', '有较强的相关关系…')"
+        这种原始 tuple 字面量给用户看；
+      · 8856 行 `_corr_strength(rv).split('（')` → tuple 没有 .split() → AttributeError
+        → 被上层 except 吞掉后回退 LLM，白付 30~100s，且确定性文案整个丢失。
+    修法：把本函数改名 `_corr_strength_phrase`，与 9077 的 tuple 版本语义区分开
+    （一个出文案、一个出「强度档+业务解读」二元组），从根上消除同名覆盖。
+    """
     if rv > 0.7:
         return "较强正相关（同增同减）"
     if rv > 0.4:
@@ -8607,7 +8822,7 @@ def _corr_evidence(columns: list[str], rows: list[dict]) -> str:
     rv, a, b, n = best
     a, b = _col_display(a), _col_display(b)   # 2026-10-02：相关分析文案同样双语化
     return (f"【确定性相关证据】按行配对计算，「{a}」与「{b}」的皮尔逊相关系数 "
-            f"r={rv:.2f}（有效样本 n={n}），呈{_corr_strength(rv)}。"
+            f"r={rv:.2f}（有效样本 n={n}），呈{_corr_strength_phrase(rv)}。"
             f"该系数只描述线性共变方向与强弱，不代表因果关系。请以它为依据回答用户问题。")
 
 
@@ -8622,7 +8837,12 @@ def _build_deterministic_insight(query: str, columns: list[str], rows: list[dict
     if not best:
         return None
     rv, a, b, n = best
-    a, b = _col_display(a), _col_display(b)   # 2026-10-02：相关分析文案字段双语化
+    # 2026-10-03 修复（P0）：此前此处写成 `a, b = _col_display(a), _col_display(b)`
+    # 就把列名**覆盖**成了「合格数量（good_qty）」这种展示形态，而 _stat() 是拿这个
+    # 展示名去 rows.get() 取值的 —— rows 的 key 是真实列名，取不到 → sa/sb 恒为 None
+    # → 「最高/最低/均值」这段确定性佐证**永远不出现**（静默降级，不报错）。
+    # 修法：列名保持真实值供取数用，只在拼文案时做展示层双语化。
+    disp_a, disp_b = _col_display(a), _col_display(b)
 
     def _stat(col: str):
         vals = []
@@ -8639,14 +8859,17 @@ def _build_deterministic_insight(query: str, columns: list[str], rows: list[dict
         return {"max": max(vals), "min": min(vals), "avg": sum(vals) / len(vals)}
 
     sa, sb = _stat(a), _stat(b)
-    lines = [f"在 {n} 个样本中，{a} 与 {b} 的皮尔逊相关系数 r={rv:.2f}，呈{_corr_strength(rv)}。"]
+    lines = [f"在 {n} 个样本中，{disp_a} 与 {disp_b} 的皮尔逊相关系数 r={rv:.2f}，呈{_corr_strength_phrase(rv)}。"]
     if sa and sb:
-        lines.append(f"{a} 最高 {sa['max']:g}、最低 {sa['min']:g}、均值 {sa['avg']:.2f}；"
-                     f"{b} 最高 {sb['max']:g}、最低 {sb['min']:g}、均值 {sb['avg']:.2f}。")
+        lines.append(f"{disp_a} 最高 {sa['max']:g}、最低 {sa['min']:g}、均值 {sa['avg']:.2f}；"
+                     f"{disp_b} 最高 {sb['max']:g}、最低 {sb['min']:g}、均值 {sb['avg']:.2f}。")
     if abs(rv) < 0.4:
         lines.append("二者线性关联较弱，单一指标的变化不足以解释另一方，建议结合其它因素一起看。")
     elif abs(rv) >= 0.4:
-        lines.append(f"二者存在可观测的{_corr_strength(rv).split('（')[0]}，"
+        # 2026-10-03 修复：函数重命名（见 _corr_strength_phrase 的注释）。
+        # 原写法在本轮之前是 `_corr_strength(rv).split(...)`，因同名覆盖拿到 tuple
+        # 而抛 AttributeError；这里显式用改名后的文案函数。
+        lines.append(f"二者存在可观测的{_corr_strength_phrase(rv).split('（')[0]}，"
                      f"但相关性不代表因果，建议进一步排查是否存在共同驱动因素或滞后效应。")
     return "".join(lines)
 
@@ -8833,6 +9056,360 @@ def _review_sample(rows: list, cols: list, budget: int = 30) -> str:
     else:
         fields_info = f"（列: {fields_info}"
     return f"{fields_info}\n{data_json}"
+
+
+# Pearson 相关性结果的显著性临界值（双尾，α=0.05）：|t| 超过该值即拒绝
+# 「无相关」的原假设。df = n-2。
+# n-2 = 1 → df=1（12.71）；df=2（4.30）；df=3（3.18）；df=4（2.78）；df=5（2.57）；
+# df=6（2.45）；df=7（2.36）；df=8（2.31）；df=9（2.26）；df=10（2.23）；
+# df=11~20 内插近似；df≥30 时 t 分布已足够接近正态，用 1.96。
+_T_CRIT_005 = {1: 12.71, 2: 4.30, 3: 3.18, 4: 2.77, 5: 2.57, 6: 2.45, 7: 2.36,
+               8: 2.31, 9: 2.26, 10: 2.23, 11: 2.20, 12: 2.18, 13: 2.16,
+               14: 2.14, 15: 2.13, 16: 2.12, 17: 2.11, 18: 2.10, 19: 2.09,
+               20: 2.09, 25: 2.06, 30: 2.04}
+
+
+def _t_crit(df: int) -> float | None:
+    """t 分布双尾 α=0.05 临界值。df 超出已知范围时保守取 1.96（df≥30 近似正态）。"""
+    if df <= 0:
+        return None
+    if df in _T_CRIT_005:
+        return _T_CRIT_005[df]
+    if df > 30:
+        return 1.96
+    # 10 < df < 30 未列出的整数：在相邻两个已知点之间线性插值（单调递减，插值保守）
+    lo = max(k for k in _T_CRIT_005 if k < df)
+    hi = min([k for k in _T_CRIT_005 if k > df] + [30])
+    if hi == lo:
+        return _T_CRIT_005[lo]
+    f = (df - lo) / (hi - lo)
+    return _T_CRIT_005[lo] + (_T_CRIT_005[hi] - _T_CRIT_005[lo]) * f
+
+
+def _corr_strength(r: float) -> tuple[str, str]:
+    """相关系数绝对值 → (强度档, 业务解读)。阈值参照通用统计惯例。"""
+    a = abs(r)
+    if a < 0.1:
+        return "几乎无线性相关", "两者之间没有可用的线性关系"
+    if a < 0.3:
+        return "弱线性相关", "有轻微的同向/反向关系，但不足以支撑业务判断"
+    if a < 0.5:
+        return "中等线性相关", "存在明确的相关关系，可作为分析线索"
+    if a < 0.7:
+        return "较强线性相关", "有较强的相关关系，值得进一步验证成因"
+    if a < 0.9:
+        return "强线性相关", "有很强的相关关系"
+    return "极强线性相关", "几乎完全线性相关"
+
+
+def _pearson_insight(rows: list[dict], cols: list[str]) -> str:
+    """Pearson 相关性结果的规则解读（零 LLM、确定性）。
+
+    只在结果列里同时存在「pearson相关系数」与「t统计量」时接管，否则返回 ""
+    交回通用规则解读。**不能**用通用解读：它会把「样本量」当度量排名，输出
+    与相关性无关的结论（详见 _quick_analysis 调用处注释）。
+
+    输出三段：每维度相关强度（含显著性判定）→ 整体结论 → 分析口径说明。
+    显著性是必写项：实测最典型的坑是 r=0.28 / t=1.75（n=38）——|t| 未过临界值，
+    统计上仍不能拒绝「无相关」；只报 r 会让用户误判为强相关。
+    """
+    if not rows or not cols:
+        return ""
+    cl = [str(c) for c in cols if c is not None]
+    c_r = next((c for c in cl if "pearson" in c.lower() or "相关系数" in c), None)
+    c_t = next((c for c in cl if c.lower().startswith("t") or "t统计量" in c or "t检验" in c), None)
+    if not c_r or not c_t:
+        return ""
+    c_dim = next((c for c in cl if c not in (c_r, c_t)
+                  and not re.search(r"样本量|sample|数量|count", c, re.I)), None)
+    c_n = next((c for c in cl if re.search(r"样本量|sample|n$", c, re.I)), None)
+
+    def _f(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    # 解析每行的 (维度, n, r, t)
+    items = []
+    insufficient = []
+    for row in rows:
+        r = _f(row.get(c_r))
+        t = _f(row.get(c_t))
+        n = int(_f(row.get(c_n)) or 0) if c_n else 0
+        dim = str(row.get(c_dim)) if c_dim else "整体"
+        if r is None:
+            # PG 的 CASE 保护在 n<3 时让 CORR 返回 NULL，但 COUNT(*) 仍有值。
+            # 这一行**不能静默丢弃** —— 用户会以为该维度没参与统计。
+            insufficient.append((dim, n))
+            continue
+        items.append((dim, n, r, t))
+    if not items:
+        # 全部维度样本量都 <3：明确告知原因，而不是交回通用解读（那会把
+        # 「样本量」当度量排名，输出与相关性无关的结论）。
+        detail = "、".join(f"{d}（{n} 天）" for d, n in insufficient)
+        return ("【相关性分析】按各维度计算 Pearson 线性相关系数。\n\n"
+                f"【整体结论】所有维度的配对样本量都不足 3 天（{detail}），"
+                f"Pearson 相关系数至少需要 3 对样本才能计算，当前无法给出相关性判断。"
+                f"建议放宽时间范围后重试。")
+
+    lines = ["【相关性分析】按各维度分别计算 Pearson 线性相关系数（配对单元：维度 × 日）", ""]
+    # 显著性按 n 逐维度判定
+    sig_flags = []
+    for dim, n, r, t in items:
+        df = max(n - 2, 0)
+        tc = _t_crit(df) if df > 0 else None
+        sig = bool(t is not None and tc is not None and abs(t) >= tc)
+        sig_flags.append(sig)
+        strength, meaning = _corr_strength(r)
+        # |r| < 0.1 时 r 的符号没有业务含义（0.0276 说"正相关"是噪声放大），
+        # 与其「几乎无线性相关」自相矛盾，不如直接不给方向。
+        if abs(r) < 0.1:
+            direction = "无明确方向"
+        elif r > 0:
+            direction = "正相关（一方升高，另一方随之升高）"
+        else:
+            direction = "负相关（一方升高，另一方随之下降）"
+        mark = "显著" if sig else "不显著"
+        lines.append(
+            f"· {dim}：r = {r:+.4f}（{strength}，{direction}），样本量 {n}，"
+            f"t = {t:+.3f}（df={df}，{mark}）"
+        )
+    if insufficient:
+        _d = "、".join(f"{d}（{n} 天）" for d, n in insufficient)
+        lines.append(f"· {_d}：样本量不足 3 天，无法计算相关系数（已跳过）")
+    any_sig = any(sig_flags)
+    max_abs = max(items, key=lambda x: abs(x[2]))
+    s_strong, s_mean = _corr_strength(max_abs[2])
+    lines.append("")
+    if any_sig:
+        lines.append(
+            f"【整体结论】存在达到统计显著的相关维度（|t| 已过 α=0.05 临界值）。"
+            f"其中 {max_abs[0]} 的相关程度最高（r = {max_abs[2]:+.4f}，{s_strong}）：{s_mean}。"
+        )
+    else:
+        # 不显著时**不能**再按 |r| 百分比去描述强弱：r=0.50 落在「较强」档，
+        # 说成「50% 的弱关联」与分档自相矛盾，会误导用户。
+        lines.append(
+            f"【整体结论】各维度的相关系数均未达到统计显著水平（|t| 未过 α=0.05 临界值），"
+            f"按当前数据**不足以判定** {max_abs[0]} 等维度存在线性相关关系 —— "
+            f"即使相关系数最高的 {max_abs[0]}（r = {max_abs[2]:+.4f}，{s_strong}），"
+            f"在当前样本量下也可能只是随机波动，不宜作为业务决策依据。"
+        )
+    # 可选：指出最值得关注的维度
+    n_min = min((x[1] for x in items if x[1] > 0), default=0)
+    if n_min and n_min < 30:
+        lines.append(
+            f"【注意】部分维度配对样本量仅 {n_min} 天，相关系数在小样本下波动较大，"
+            f"建议扩大时间范围后复核。"
+        )
+    return "\n".join(lines)
+
+
+# ── token 级思考流（旁路，2026-10-03）──────────────────────────────────
+# 目标：让用户像在聊天软件里那样，逐字看到模型真实的思考过程，而不是只看到
+# 「正在生成 SQL…」这种静态提示。
+#
+# 实现约束（三条，都是实测踩出来的）：
+#  1. langchain 1.5.3 会丢弃 reasoning_content —— 同一请求 HTTP 层拿到 328 个
+#     delta（2600 字符），走 ChatOpenAI.stream() 后 content 0 字符、
+#     additional_kwargs 为空 {}。非标准字段没有承载位置，被静默丢掉。
+#     所以必须绕过 langchain，直连 OpenAI 兼容端点自己解 SSE。
+#  2. 主链的 run() 生成器在 LLM 调用期间是**阻塞**的，此时无法 yield 任何事件。
+#     所以旁路不能靠生成器自己吐，必须写进一个共享队列，由 stream.py 的轮询
+#     循环（每 20ms 一跳）主动抽干 —— 这样主链阻塞时用户照样能看到 token。
+#  3. 旁路与主链是**两次独立的模型调用**。这是有意的取舍：主链的 deadline、
+#     首token门、重试预算都按"一次性拿全文"调校过，改成流式会牵动整条链路的
+#     时序与预算；而旁路失败最多少一段思考展示，绝不影响 SQL 正确性。
+#     仅 SSE 展示链路开启，同步端点（/api/agent/ask）不触发，无额外开销。
+_MAX_THOUGHT_TOKENS = 4000      # 旁路最多推多少字符，防止超长思考刷屏
+_THOUGHT_FLUSH_CHARS = 24       # 攒够多少字符推一次（太碎会压垮 SSE，太粗会失去"逐字"感）
+
+
+def _start_thought_stream(service, *, query: str, tables_hint: list[str],
+                          model: str | None, api_key: str | None,
+                          base_url: str | None, max_tokens: int) -> None:
+    """在后台线程启动旁路思考流，把 token 攒进 service._thought_out 队列。
+
+    任何异常都吞掉 —— 展示层故障绝不能影响主链路出 SQL（fail-open）。
+    """
+    try:
+        if not (model and api_key and base_url and query):
+            return
+        if getattr(service, "_thought_thread", None) is not None:
+            return                      # 已有旁路在跑，不重复起（省一次模型调用）
+
+        from agent.llm_reasoning_stream import stream_reasoning
+
+        # 旁路 prompt 与主链同源：给同样的表清单，让思考内容与真实任务相关，
+        # 而不是泛泛的"我来想想"。**不要求它输出 SQL** —— 它只负责把思路讲出来。
+        tbl = "、".join([t for t in (tables_hint or []) if t][:8]) or "（未指定）"
+        prompt = (
+            f"用户问：{query}\n"
+            f"可用数据表：{tbl}\n\n"
+            "请用中文简要说明：要回答这个问题，你会先确认哪些信息、怎么选表、"
+            "打算怎么算、有哪些不确定的地方。不要输出 SQL，控制在 200 字以内。"
+        )
+
+        out: "queue.Queue[tuple[str, str]]" = getattr(service, "_thought_out", None) \
+            or queue.Queue(maxsize=2000)
+        service._thought_out = out
+
+        def _runner():
+            buf: list[str] = []
+            size = 0
+            try:
+                for kind, txt in stream_reasoning(
+                    prompt, model=model, api_key=api_key, base_url=base_url,
+                    temperature=0.3, max_tokens=min(int(max_tokens or 4096), 4096),
+                    timeout=60.0,
+                    system="你是制造业数据分析师，回答简洁、只讲思路。",
+                ):
+                    if kind != "reasoning":
+                        continue          # 只展示思考；content（那段思路说明）另行处理
+                    buf.append(txt)
+                    size += len(txt)
+                    if size >= _THOUGHT_FLUSH_CHARS:
+                        _put(out, ("reasoning", "".join(buf)))
+                        buf, size = [], 0
+                    if size + len(txt) > _MAX_THOUGHT_TOKENS:
+                        break
+                if buf:
+                    _put(out, ("reasoning", "".join(buf)))
+            except Exception:
+                pass
+            finally:
+                _put(out, ("done", ""))
+
+        th = threading.Thread(target=_runner, daemon=True,
+                              name="thought-stream")
+        service._thought_thread = th
+        service._thought_started = time.time()
+        th.start()
+    except Exception:
+        pass
+
+
+def _put(q, item) -> None:
+    """非阻塞入队；队列满直接丢（展示层可丢，绝不阻塞主链）。"""
+    try:
+        q.put_nowait(item)
+    except Exception:
+        pass
+
+
+def drain_thought_events(service) -> list[dict]:
+    """抽干旁路队列，把 token 转成前端可渲染的 SSE 事件列表。
+
+    由 agent/stream.py 的轮询循环调用（每 20~30ms 一次）—— 这是主链阻塞期间
+    用户仍能看到思考 token 的关键。
+
+    返回的事件有两种：
+      {"type": "thought", "step": "AI思考", "kind": "reasoning", "text": "…"}
+      {"type": "thought_done", "step": "AI思考"}
+    """
+    q = getattr(service, "_thought_out", None)
+    if q is None:
+        return []
+    events: list[dict] = []
+    finished = False
+    while True:
+        try:
+            kind, txt = q.get_nowait()
+        except Exception:
+            break
+        if kind == "done":
+            finished = True
+            continue
+        if not txt:
+            continue
+        events.append({"type": "thought", "step": "AI思考",
+                       "kind": "reasoning", "text": txt})
+    # ⚠️ 这里用标志位而不是把 done 放回队列：放回会导致**每次** drain 都补发一条
+    # thought_done，前端反复收尾（曾自己踩过这个坑）。
+    # 只在「本次确实收到 done」且「尚未收尾过」时补发一次。
+    if finished and not getattr(service, "_thought_closed", False):
+        service._thought_closed = True
+        events.append({"type": "thought_done", "step": "AI思考"})
+    return events
+
+
+def _agent_thought_line(name: str, detail: str, evidence: dict | None = None) -> str:
+    """把一步 Agent 决策转成一句可读的「思考」文本（2026-10-03）。
+
+    为什么需要它：`run()` 里的 `_step()` 是**所有**推理步骤的唯一出口，但产出的
+    `{"type":"step"}` 事件只带 name/detail，前端只能显示成干巴巴的一行提示
+    （如「SQL生成：正在生成…」）。用户看不到 Agent **为什么**这么决策。
+
+    这里把 name + detail + evidence 拼成一句解释性文本，随 `thought` 事件流式下发，
+    前端逐字累积显示，于是用户看到的是「像聊天一样的思考过程」：
+        意图理解：识别为「数据分析」类问题，涉及生产统计
+        匹配数据表：命中 3 张表 — mes_process_output、dim_process、dim_production_line
+        采用确定性口径：「良率」= 合格数 ÷ 投入数 × 100%（免 LLM，结果可复现）
+    刻意只讲**可审计的客观事实**（命中了什么口径、选了哪张表、为什么回退 LLM），
+    不编造模型内部的推理 —— 那些既拿不到，写出来也是假的。
+    """
+    # 步骤名 → 用户可读的动词短语（前端已有 stepLabel，这里给更完整的说法）
+    VERB = {
+        "意图理解": "识别问题类型",
+        "意图分类": "识别问题类型",
+        "表匹配": "在数据底座中定位数据表",
+        "读取表结构": "读取表结构与字段",
+        "SQL生成": "生成查询语句",
+        "兜底SQL": "改用备选查询方案",
+        "SQL校验": "校验查询语句",
+        "SQL执行": "执行查询",
+        "SQL重试": "修复查询语句",
+        "结果复核": "复核查询结果",
+        "图表生成": "生成可视化图表",
+        "记忆检索": "检索历史记忆",
+        "语义缓存": "命中语义缓存",
+        "思考中": "组织回复",
+        "ML建模": "准备机器学习建模",
+        "ML方案设计": "设计建模方案",
+        "AI推理": "AI 推断查询方案",
+        "分析中": "分析查询结果",
+        "报告生成": "生成分析报告",
+        "归因分析": "分析波动原因",
+        "趋势预测": "预测后续趋势",
+        "异常检测": "检测异常",
+    }
+    verb = VERB.get(name, name)
+    parts = [f"**{verb}**"]
+    if detail:
+        parts.append(str(detail).strip())
+    # evidence 是这一步的判定依据（输入/产出/为什么），对信任最关键
+    if evidence:
+        for k, v in evidence.items():
+            if v in (None, "", [], {}):
+                continue
+            label = {
+                "basis": "依据", "tables": "涉及表", "metrics": "命中口径",
+                "reason": "原因", "sql": "SQL", "rows": "结果行数",
+                "input": "输入", "output": "产出", "candidates": "候选表",
+                "compiled_by": "编译方式", "note": "备注",
+            }.get(k, k)
+            sv = v if isinstance(v, str) else (
+                "、".join(str(x) for x in v) if isinstance(v, (list, tuple)) else str(v))
+            if len(sv) > 160:
+                sv = sv[:157] + "…"
+            parts.append(f"{label}：{sv}")
+    return "　".join(parts)
+
+
+def _stream_thought(llm, messages, step_name: str) -> Generator[str, None, None]:
+    """把 LLM 的流式输出逐块 yield 出来（供 thought 事件使用）。
+
+    与 llm_service 里其他 `.stream()` 调用点一致：只有 AIMessageChunk 才带 content
+    （langchain 的空 chunk 也要跳过）。异常时静默返回 —— 思考流是**增强**，
+    拿不到内容不能影响主链路结果。
+    """
+    try:
+        for chunk in llm.stream(messages):
+            if isinstance(chunk, AIMessageChunk) and chunk.content:
+                yield chunk.content
+    except Exception:
+        return
 
 
 def _rule_insight(rows: list[dict], cols: list[str]) -> str:
@@ -9053,7 +9630,24 @@ _INSIGHT_TTL = 60.0
 
 def _insight_cache_key(query: str, row_count: int):
     try:
-        return (_current_db_key(), (query or "").strip(), int(row_count or 0))
+        # 2026-10-03 修复（P1·权限方向）：key 增加 ACL 指纹维度。
+        # 项目对「结果缓存必须带 ACL 指纹」已有明确且一致的既定规范：
+        #   _cache_key  → f"{db}|{acl_fp or 'anon'}|{sha256(query)}"
+        #   _semantic_lookup → 逐条 `if e.get("acl_fp") != acl_fp: continue  # 防越权复用`
+        #   stream.py / main.py → cache_result(..., acl_fp=acl_fingerprint(...))
+        # 本函数是**唯一**漏掉 ACL 指纹的查询结果缓存，而洞察文本的内容就是
+        # 结果集的数字解读。后果：用户 A（行级过滤/列脱敏）与用户 B（权限不同）
+        # 问同一句话且结果行数相同（分组聚合极易同长，双方都返回 5 行）时，
+        # B 在 TTL 内拿到 A 的洞察文本，里面是 A 权限范围内的真实数字。
+        # 属权限方向的信息泄露，且行数相同这个条件很容易满足、排查极难。
+        try:
+            from security.context import get_acl
+            from security.enforcer import acl_fingerprint
+            _acl = get_acl()
+            _afp = acl_fingerprint(_acl) if _acl is not None else "anon"
+        except Exception:
+            _afp = "anon"
+        return (_current_db_key(), _afp, (query or "").strip(), int(row_count or 0))
     except Exception:
         return None
 
@@ -12089,6 +12683,14 @@ def _semantic_lookup(query: str, db_key: str, acl_fp: str):
                     "similarity": 1.0,
                     "compiled": e.get("compiled", False),
                     "mql": e.get("mql"),
+                    # 2026-10-03 修复（P0）：此前两个 return 都漏了 "metrics"，而
+                    # _semantic_cache_hit 的口径隔离护栏（4613 行 `hit.get("metrics")`）
+                    # 依赖这个键 → entry_metrics 恒为空集 → 护栏②「命中的是不同指标
+                    # 就不复用」**永久失效**。症状：用户问「良率」沉淀的 LLM 直生 SQL，
+                    # 会被「一次合格率」这类零命中的近似问法以 0.2s 静默复用，别名还叫
+                    # 「良率」——错误口径的稳定复现机制。
+                    # 根因是 store 写了 metrics、lookup 没读出来（数据存了取不到）。
+                    "metrics": e.get("metrics") or [],
                 }
     vec = _embed_query(query)
     if not vec:
@@ -12115,6 +12717,8 @@ def _semantic_lookup(query: str, db_key: str, acl_fp: str):
             # 跳过 LLM 复查，见 run() 命中分支与 _review_chain）
             "compiled": best.get("compiled", False),
             "mql": best.get("mql"),
+            # 2026-10-03 修复（P0）：同上，必须回传 metrics，否则口径隔离护栏失效
+            "metrics": best.get("metrics") or [],
         }
     return None
 

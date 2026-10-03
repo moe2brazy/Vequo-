@@ -112,12 +112,21 @@ def _run_due() -> int:
         except Exception as e:
             ok = False
             _logger.warning("报表订阅 %s 生成失败: %s", s.get("id"), e)
+        # 2026-10-03 修复（P2）：推进 next_run 的 `int(s.get("interval_min", 60))` 自身
+        # 可能抛（interval_min 会被 _PERSIST=1 的 JSON 读回，文件被手改或截断成 "60 "
+        # 时 int() 直接 ValueError）。该行在 try 之外 → 异常冒到 _loop 的兜底 →
+        # **本轮剩余所有到期订阅全部跳过**，且这条的 next_run 也没推进 → 30 秒后
+        # 重试、再中断。一条坏订阅让定时报表整体停用。现在推进逻辑自带容错。
+        try:
+            _iv = int(s.get("interval_min") or 60)
+        except (TypeError, ValueError):
+            _iv = 60
         with _lock:
             # 2026-10-03 修复：next_run 的推进原来在 try 内、_dispatch 之后，
             # 于是失败时 next_run 保持为过去的 due 时刻，守护线程每 30 秒重试一次
             # → 日志被刷满、真实错误被淹没（告警风暴）。现在无论成败都推进，
             # 失败时按固定间隔重试；连续失败达阈值则自动停用。
-            s["next_run"] = now + max(1, int(s.get("interval_min", 60))) * 60
+            s["next_run"] = now + max(1, _iv) * 60
             s["fail_count"] = int(s.get("fail_count") or 0) + (0 if ok else 1)
             if not ok and s["fail_count"] >= 5:
                 s["enabled"] = False

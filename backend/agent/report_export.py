@@ -89,6 +89,19 @@ class _BlockParser(HTMLParser):
             if "sum-sec-h" in cls:
                 self._flush()
                 self._type = "subheading"
+            elif "sum-risk" in cls:
+                # 2026-10-03 修复（P1）：html_report 产出的是 <div class="sum-risk"> /
+                # <div class="sum-good">，但本分支此前只认 sum-sec-h 与 footer →
+                # _type 保持 None → handle_endtag 调 _flush() 时判定失败 → **整段丢弃**。
+                # 后果：网页版总览报告的风险/亮点齐全，点「导出 Word/PDF」后
+                # 「⚠️ 停机时长激增 3 倍」这类最该被看到的结论整段消失，
+                # 而导出件看起来是完整的（比报错更糟）。
+                # （80/82 行的同名判断在 p/li 分支里，对 div 不生效。）
+                self._flush()
+                self._type = "risk"
+            elif "sum-good" in cls:
+                self._flush()
+                self._type = "good"
             elif "footer" in cls:
                 self._flush()
                 self._type = "footer"  # 页脚，最终过滤

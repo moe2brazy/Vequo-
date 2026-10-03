@@ -8,7 +8,13 @@ import { ref, watch } from 'vue'
 const KEY = 'ops.knowledge.favorites'
 
 function load(): any[] {
-  try { return JSON.parse(localStorage.getItem(KEY) || '[]') } catch { return [] }
+  // 2026-10-03 修复（与 loginLog.ts 同型）：补 Array.isArray 形状校验。
+  // 非数组的合法 JSON（"null" / {}）会被原样赋给 ref，随后 list.value.some/unshift
+  // 抛错 → KnowledgePage 渲染期直接白屏。
+  try {
+    const d = JSON.parse(localStorage.getItem(KEY) || '[]')
+    return Array.isArray(d) ? d : []
+  } catch { return [] }
 }
 function save(arr: any[]) {
   try { localStorage.setItem(KEY, JSON.stringify(arr)) } catch { /* ignore */ }

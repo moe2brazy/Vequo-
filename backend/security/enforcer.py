@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 
 from security import model as perm_model
@@ -535,6 +536,8 @@ def build_acl_for_username(username: str) -> AclContext:
 
 _col_cache: dict[str, list[str]] = {}
 _col_cache_lock = threading.Lock()
+# 2026-10-03 新增：列结构查询失败的短 TTL 负缓存（避免同一 SQL 内重复放大 DB 压力）
+_col_fail_cache: dict[str, float] = {}
 
 
 def invalidate_column_cache() -> None:
@@ -582,6 +585,20 @@ def _table_columns(table: str) -> list[str]:
     if cols:
         with _col_cache_lock:
             _col_cache[cache_key] = cols
+        return cols
+    # 2026-10-03：失败结果做**短 TTL** 负缓存。原实现不缓存空结果，于是同一列的
+    # 每次引用都会重新查一次 information_schema —— DB 压力大时（正是最需要权限校验
+    # 生效的时刻）把压力放大 N 倍。缓存 10s 足以挡掉单条 SQL 内的重复引用，
+    # 又不会像成功缓存那样把失败钉死到进程结束。
+    now = time.time()
+    with _col_cache_lock:
+        prev_fail = _col_fail_cache.get(cache_key)
+        if prev_fail and now - prev_fail < 10.0:
+            return cols
+        _col_fail_cache[cache_key] = now
+        if len(_col_fail_cache) > 512:
+            for k in [k for k, v in _col_fail_cache.items() if now - v > 10.0]:
+                _col_fail_cache.pop(k, None)
     return cols
 
 
@@ -766,15 +783,75 @@ def rewrite_sql(sql: str, ctx: AclContext | None, dialect: str | None = None) ->
             pass
 
         # 别名 → 裸表名映射（全 AST）
+        # 2026-10-03 修复（P0）：派生表/CTE 的列归属此前完全丢失，导致列级 deny 与
+        # mask 被整段跳过（fail-open，敏感列以明文返回）。
+        # 实测本项目 sqlglot 版本对 `FROM (SELECT …) s` 的 AST 形态是
+        #   From(this=Subquery(Select…), alias=TableAlias(s))
+        # —— 派生表**自身不是 exp.Table**，别名挂在 Subquery 上；ast.find_all(exp.Table)
+        # 只会返回子查询**内部**的基表（test_orders），别名 s 在任何 Table 节点上都
+        # 不存在 → alias_map 无 's' → `s.customer_name` 的 _owner_of 返回 None
+        # → 862 行 `if not owner: continue` 跳过全部 deny/mask 检查。
+        # 现在显式遍历 From/Join 下的 Subquery，把别名映射到其真实基表：
+        # 单一基表 → 直接映射；多基表 → _AMBIGUOUS_OWNER（交调用方 fail-close 拒绝）。
         alias_map: dict[str, str] = {}
         bare_tables: set[str] = set()
-        for tobj in ast.find_all(exp.Table):
+
+        def _register(tobj) -> None:
             bare = (tobj.name or "").split(".")[-1].lower()
             if not bare or bare in cte_names:
-                continue
+                return
             bare_tables.add(bare)
             alias_map[(tobj.alias or tobj.name).split(".")[-1].lower()] = bare
             alias_map.setdefault(bare, bare)
+
+        def _map_subquery(node, alias: str) -> None:
+            """派生表别名 → 其子查询内用到的真实基表。"""
+            key = (alias or "").split(".")[-1].lower()
+            if not key:
+                return
+            inner: set[str] = set()
+            for t in node.find_all(exp.Table):
+                b = (t.name or "").split(".")[-1].lower()
+                if b and b not in cte_names:
+                    inner.add(b)
+            if len(inner) == 1:
+                alias_map[key] = next(iter(inner))
+            elif len(inner) > 1:
+                alias_map[key] = _AMBIGUOUS_OWNER
+
+        for tobj in ast.find_all(exp.Table):
+            _register(tobj)
+
+        # 派生表：FROM (SELECT…) s / JOIN (SELECT…) x
+        for from_node in list(ast.find_all(exp.From)) + list(ast.find_all(exp.Join)):
+            src = from_node.this
+            if isinstance(src, exp.Subquery):
+                _map_subquery(src, src.alias or "")
+        # 兜底：任何挂在 Subquery / Lateral 上的别名（形态变化时不至于漏掉）
+        for sub in ast.find_all(exp.Subquery):
+            if sub.alias:
+                _map_subquery(sub, sub.alias)
+
+        # 2026-10-03 修复（P0）：CTE 别名同样要能定位到真实基表。
+        # `WITH x AS (SELECT * FROM test_orders) SELECT x.customer_name FROM x`
+        # 中 x 命中 cte_names 被 _register 跳过，`x.customer_name` 的 owner 会是 None
+        # → 整段跳过 deny/mask。这里把每个 CTE 的名字映射到它内部用到的基表。
+        try:
+            for cte in ast.find_all(exp.CTE):
+                key = (cte.alias_or_name or "").split(".")[-1].lower()
+                if not key:
+                    continue
+                inner: set[str] = set()
+                for sub_t in cte.find_all(exp.Table):
+                    b = (sub_t.name or "").split(".")[-1].lower()
+                    if b and b not in cte_names:
+                        inner.add(b)
+                if len(inner) == 1:
+                    alias_map[key] = next(iter(inner))
+                elif len(inner) > 1:
+                    alias_map[key] = _AMBIGUOUS_OWNER
+        except Exception:
+            pass
 
         # ── 数据集/模型级：无权表直接拒绝（含子查询/JOIN 内的表）──
         ok_tbl, denied_tbl = check_table_access(ctx, sorted(bare_tables))
@@ -806,6 +883,14 @@ def rewrite_sql(sql: str, ctx: AclContext | None, dialect: str | None = None) ->
                     if (col.name.lower() in ctx.column_denies.get(t, set())
                             or col.name.lower() in ctx.column_masks.get(t, {})):
                         return _AMBIGUOUS_OWNER
+            # 2026-10-03 修复（P0·fail-close）：cands 为空有两种完全不同��含义 ——
+            # 「该列确实不属于任何受管表」（安全，放行正确）与「查不到列结构所以判断不了」
+            # （不安全）。原实现把两者折叠成同一个 None，而调用方 862 行把 None 当放行
+            # → 一次 information_schema 超时（DB 压力大时高发，而那正是权限校验最不该
+            # 失效的时刻）就让所有配了 mask 的列以明文进入结果集。
+            # 受管表存在 + 归属不明 → 按 _AMBIGUOUS_OWNER 处理，由调用方拒绝。
+            if managed & bare_tables:
+                return _AMBIGUOUS_OWNER
             return None
 
         # ── 行级：对直接 FROM/JOIN 了目标表的每个 SELECT 层追加条件 ──
