@@ -562,7 +562,14 @@ def add_schema_candidates(cands: list[dict]) -> int:
         tables = c.get("tables") or []
         if not expr or not tables:
             continue
-        key = (_norm_expr(expr), tuple(sorted({str(t).split(".")[-1].lower() for t in tables})))
+        # 2026-10-03 修复：原 key 是二元组，而 _registered_keys 产出的是三元组
+        # (_norm_expr, tbls, filter_sig) —— 二元组永远不等于三元组，
+        # `key in registered` 恒为 False，schema_scan 通道的「已注册口径去重」
+        # 完全失效：已注册的口径（良率、停机时长等）会反复作为「新候选」出现在
+        # 人工审核列表里。改用 _metric_key（它已正确返回三元组），
+        # 且表名要与 _registered_keys 同口径归一（裸名 + 小写），否则仍对不上。
+        _norm_tbls = {str(t).split(".")[-1].lower() for t in tables}
+        key = _metric_key(expr, tuple(_norm_tbls), "")
         if key in registered:
             continue
         cid = _cid(expr, tuple(tables))

@@ -325,15 +325,28 @@ export async function askAiStream(key: string, text: string): Promise<void> {
     pending: true,
     ts: Date.now(),
   }
+  const msgId = placeholder.id
   pushMsg(conv.id, placeholder)
+  // 2026-10-03 修复（P0）：原来直接对 placeholder（push 进去的**裸对象**）赋值。
+  // Vue 3 的依赖收集/触发都发生在 Proxy 的 get/set trap 上，对原始对象直接赋值
+  // 完全绕过 set trap → 不 trigger 任何依赖 → 气泡永远停在「正在思考…」：
+  // 步骤文案不更新、最终回答不显示、pending 永不复位（要等别处产生一次响应式变更
+  // 才突然刷出来，表现为「AI 回答时有时无」）。FAQ 命中路径是新对象 push，所以正常，
+  // 更让问题显得随机。
+  // 现在统一通过响应式代理按 id 查找目标消息再赋值。
+  const target = (): ChatMessage | undefined =>
+    (data.value.messages[conv.id] || []).find((m: ChatMessage) => m.id === msgId)
   try {
     const { text: answer } = await askAgentStream(t, {
-      onStep: (label) => { placeholder.text = label },
+      onStep: (label) => { const m = target(); if (m) m.text = label },
     })
-    placeholder.text = answer
+    const m = target()
+    if (m) m.text = answer
   } catch (e: any) {
-    placeholder.text = `请求失败：${e?.message || '未知错误'}\n\n请确认后端服务已启动；也可以直接前往「智能问析」重试该问题。`
+    const m = target()
+    if (m) m.text = `请求失败：${e?.message || '未知错误'}\n\n请确认后端服务已启动；也可以直接前往「智能问析」重试该问题。`
   } finally {
-    placeholder.pending = false
+    const m = target()
+    if (m) m.pending = false
   }
 }

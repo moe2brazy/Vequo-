@@ -44,8 +44,18 @@ const BLIND_LABEL: Record<string, string> = {
   unused_measure: '未统计指标',
 }
 
+// 2026-10-03 修复（串台）：loading / error 是跨 tab 共享的单值 ref，load 也没有
+// in-flight 去重或序号守卫。/api/insights/scan 是重接口（要扫维度组合），
+// 返回明显慢于 /api/insights/blind-spots ——「洞察后到、先复位 loading」几乎是必然。
+// 于是快速切 tab 时：盲点请求先返回把 loading 置 false，洞察请求后返回再置一次，
+// 而此时面板渲染的是 blinds 分支 → loading 消失 + blinds 仍是空数组 → 显示
+// 「未发现数据盲点」——把「还没加载完」说成「没有盲点」，是一条明确的错误结论。
+// 现在加请求序号守卫：只有最新一次请求能写状态。
+let loadSeq = 0
 async function load(which: Tab, force = false) {
   if (loaded.value[which] && !force) return
+  const my = ++loadSeq
+  const isStale = () => my !== loadSeq
   loading.value = true
   error.value = ''
   try {
@@ -57,6 +67,7 @@ async function load(which: Tab, force = false) {
       headers: { 'Content-Type': 'application/json' },
     })
     const data = await res.json().catch(() => ({}))
+    if (isStale()) return          // 已有更新的请求在跑，丢弃本次结果
     if (!res.ok) throw new Error(data?.detail || `请求失败(${res.status})`)
     if (which === 'insights') {
       insights.value = data.insights || []
@@ -67,9 +78,10 @@ async function load(which: Tab, force = false) {
     }
     loaded.value[which] = true
   } catch (e: any) {
+    if (isStale()) return
     error.value = e?.message || '加载失败'
   } finally {
-    loading.value = false
+    if (!isStale()) loading.value = false
   }
 }
 

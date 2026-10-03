@@ -392,12 +392,25 @@ export async function renderChart(
   // 不再做 G2Plot 二次兜底，避免无谓的 chunk 加载）
   const option = buildEChartOption(t, cols, rows, palette)
   if (option) {
+    // 2026-10-03 修复（内存泄漏）：RENDER_SEQ 竞速保护发现 stale 就 return null，
+    // 但此时 echarts.init(el) 创建的实例已经插入 canvas 并登记进 echarts 内部实例表，
+    // 调用方拿 null 后会把 el.innerHTML 改成 fallback SVG —— innerHTML 只移除子节点，
+    // **不会 dispose 实例**，其动画循环/resize 监听/事件绑定全部存活。
+    // G2Plot 分支早已在 stale 时 destroy()，这里补齐对称处理。
+    let inst: echarts.EChartsType | null = null
     try {
+      inst = echarts.init(el)
+      inst.setOption(option)
+    } catch {
       // 旧实例已由 renderChart 入口的 disposeChart 统一清理（2026-10-02 上移）
-      echarts.init(el).setOption(option)
-      if (isStale()) return null
-      return 'echarts'
-    } catch { /* 回退 SVG */ }
+      try { inst?.dispose() } catch { /* ignore */ }
+      return null   // 回退 SVG 由调用方处理
+    }
+    if (isStale()) {
+      try { inst.dispose() } catch { /* ignore */ }   // 已被更新的渲染取代 → 立刻销毁
+      return null
+    }
+    return 'echarts'
   }
   return null
 }

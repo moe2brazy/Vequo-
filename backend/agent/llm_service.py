@@ -502,13 +502,17 @@ def _select_tables_by_llm(query: str) -> list[str]:
                     sim = sum(a * b for a, b in zip(qv, tv)) / (qn * tn)
                     vec_scores.append((sim, t))
                 vec_scores.sort(key=lambda x: x[0], reverse=True)
-                vec_hit_names = {t["table_name"] for _, t in vec_scores[:15] if _[0] > 0.35}
+                # 2026-10-03 修复：推导式里`for _, t in ...` 的 `_` 绑定的是相似度 float，
+                # 原写作 `_[0] > 0.35` 对 float 取下标必然 TypeError，被下面 510 行裸
+                # except 吞掉 → 整段向量语义召回从未生效（embedding 白跑，同义问法漏表）。
+                vec_hit_names = {t["table_name"] for sim, t in vec_scores[:15] if sim > 0.35}
                 # 语义命中但关键词未命中的表，插在关键词命中之后、miss 之前
                 if vec_hit_names:
                     extra = [t for t in tables if t["table_name"] in vec_hit_names and t not in hit_tables]
                     candidate = hit_tables + extra + miss_tables
-        except Exception:
-            pass  # embedding 不可用/异常 → 保持关键词粗筛结果
+        except Exception as _vec_err:
+            # 降级要留痕：否则同类错误会再次静默隐藏（2026-10-03）
+            logging.getLogger("nl2sql").debug("向量语义召回降级（保持关键词粗筛）: %s", _vec_err)
 
         tables_sub = candidate[:40]
         hit_cnt = len(hit_tables)
@@ -1219,6 +1223,7 @@ def _probe_data_range(sqlexec, tables: list[str]) -> dict | None:
                 return hit[1]
             continue
         got = None
+        no_date_col = False     # 表确实没有日期列（可信的负结论，可缓存）
         for col in _data_range_cols(bare):
             if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", col):
                 continue
@@ -1233,9 +1238,17 @@ def _probe_data_range(sqlexec, tables: list[str]) -> dict | None:
                 if len(vals) >= 2 and vals[0] is not None and vals[1] is not None:
                     got = {"col": col, "min": vals[0], "max": vals[1], "table": bare}
                     break
-        _DATA_RANGE_CACHE[bare] = (now, got)
+        # 2026-10-03 修复：原实现无条件把 got（可能为 None）写进缓存并按 600s TTL 保留
+        # —— 一次偶发失败（DB抖动 / 连接池重载 / 权限改写临时拒绝 / MIN/MAX 全 NULL）
+        # 就让接下来 10 分钟的所有相关查询都拿不到「数据实际在哪」提示，
+        # 0 行用户看不到范围提示，候选生成退化成盲猜时间区间。
+        # 对齐本文件 _all_table_columns 的既有口径：只在拿到可信结论时才缓存。
         if got:
+            _DATA_RANGE_CACHE[bare] = (now, got)
             return got
+        if not _data_range_cols(bare):
+            # 确认无日期列：负缓存，避免每次都白扫一遍列清单
+            _DATA_RANGE_CACHE[bare] = (now, None)
     return None
 
 
@@ -4415,7 +4428,11 @@ class LLMService:
             self.allowed_tables = (None if allowed_tables is None
                                    else {str(t).lower() for t in allowed_tables})
         else:
-            self.allowed_tables = {str(t).lower() for t in (allowed_tables or [])} or None
+            # 2026-10-03 修复：原`{...} or None` 让「显式传空集」与「完全没传」都塌成
+            # None（不限表），与上方注释声明的 fail-close 口径自相矛盾——遗留调用方传
+            # allowed_tables=[] 表示零授权，却拿到全表放行。改用 is not None 区分这两种语义。
+            self.allowed_tables = (None if allowed_tables is None
+                                   else {str(t).lower() for t in allowed_tables})
         # 行列级权限（改造5）：表名(裸名) → 行过滤条件 / 列白名单；执行前自动改写 SQL
         self.row_filters = {str(k).lower(): str(v) for k, v in (row_filters or {}).items() if v} or None
         self.column_whitelist = {str(k).lower(): set(str(c) for c in v) for k, v in (column_whitelist or {}).items() if v} or None
@@ -4807,6 +4824,26 @@ class LLMService:
                 yield {"type": "error", "message": self.error}
                 return
             yield {"type": "sql", "sql": self.sql}
+            # 2026-10-03 修复：原分支 yield sql 后直接 return，既不执行 SQL 也不发 done。
+            # 经 HTTP 入口调用时消费方靠 done 事件取 final_response（main.py 的
+            # `if event["type"] == "done": final_response = event.get("response", {})`），
+            # 于是恒返回空响应、sql_result 恒空（审计 rows=0、结果缓存永不命中）。
+            # 纯 BIRD 评测脚本只消费 sql 事件自己执行 SQL，所以一直没暴露。
+            # 这里补齐「执行 + sql_result + done」，与主链收尾契约一致。
+            _b_res = self._exec_sql(self.sql)
+            self.sql_result = _b_res
+            if _b_res.get("success"):
+                yield {"type": "sql_result",
+                       "columns": _b_res.get("columns") or [],
+                       "rows": _b_res.get("rows") or [],
+                       "row_count": _b_res.get("row_count", 0)}
+            else:
+                self.error = ("BIRD 档位：生成的 SQL 执行失败（%s）。"
+                              % str(_b_res.get("error") or "未知原因")[:200])
+                yield {"type": "error", "message": self.error}
+                return
+            yield {"type": "done", "elapsed_ms": 0,
+                   "response": self._build_response()}
             return
 
         # ── Step 1: 意图分类 ──
@@ -5291,9 +5328,9 @@ class LLMService:
             yield {"type": "error", "message": self.error}
             return
 
-        yield {"type": "sql", "sql": self.sql}
-
         # 表权限二次校验（Phase 4.3）：SQL 引用的表必须都在允许集合内（防御 LLM 编造无权表）
+        # 2026-10-03 前移到 yield sql 之前：SSE 单向流，已 yield 的事件无法撤回，
+        # 原顺序会让前端先渲染出一条从未执行、且越权的 SQL，再显示"已拦截"，审计留痕与实际不符。
         if self.allowed_tables is not None:
             ref_tables = _extract_sql_tables(self.sql)
             if ref_tables and not ref_tables.issubset(self.allowed_tables):
@@ -5301,6 +5338,8 @@ class LLMService:
                 self.error = f"查询涉及无权访问的表（{', '.join(denied)}），已拦截。请联系管理员开通权限。"
                 yield {"type": "error", "message": self.error, "code": "forbidden"}
                 return
+
+        yield {"type": "sql", "sql": self.sql}
 
         # ── Step 5: SQL 执行 ──
         # 前置校验：SQL 引用的表必须存在于当前库（防御 LLM 编造/跨库混用表名，如 123 库误用 postgres 表名）
@@ -5599,6 +5638,12 @@ class LLMService:
             _zero_retry = True
             _zero_orig_sql = self.sql
             _zero_orig_result = dict(self.sql_result)
+            # 2026-10-03 修复：重试链在执行期间会持续改写 executed_sql（审计/血缘/缓存
+            # key 都用它）与 acl_applied（前端权限白盒），原快照只覆盖 sql/sql_result，
+            # 恢复后二者仍停留在重试链的最后状态 → 最终 sql、审计留痕、血缘、权限白盒
+            # 四者互相矛盾（血缘显示的是被丢弃的重试 SQL）。
+            _zero_orig_exec = self.executed_sql
+            _zero_orig_acl = {k: list(v) for k, v in (self.acl_applied or {}).items()}
             # 提速（2026-09-29）：0 行时把**已经探测到的真实数据范围**喂给候选生成，
             # 而不是让 LLM 盲猜时间区间。实测（问「上个月每台设备的故障次数」，演示库数据
             # 停在 2026-07-15）：不喂范围时锚定会漂到没数据的月份 → 0 行 → 走
@@ -5851,6 +5896,8 @@ class LLMService:
             if _zero_retry and not (self.sql_result.get("rows") or []):
                 self.sql = _zero_orig_sql
                 self.sql_result = _zero_orig_result
+                self.executed_sql = _zero_orig_exec
+                self.acl_applied = _zero_orig_acl
                 ok = True
                 yield _step("SQL执行", "重试后仍无数据，按原查询如实返回 0 行")
 
@@ -5911,6 +5958,9 @@ class LLMService:
                 refined = self._refine_sql(issue)
                 if refined and refined.strip() != (self.sql or "").strip():
                     prev_sql, prev_result = self.sql, self.sql_result
+                    # 2026-10-03 同上：复核链也会改写 executed_sql / acl_applied，必须一并快照
+                    prev_exec = self.executed_sql
+                    prev_acl = {k: list(v) for k, v in (self.acl_applied or {}).items()}
                     self.sql = refined
                     yield {"type": "sql", "sql": self.sql}
                     new_result = self._exec_sql(self.sql)
@@ -5945,6 +5995,8 @@ class LLMService:
                                    "row_count": self.sql_result["row_count"]}
                         else:
                             self.sql, self.sql_result = prev_sql, prev_result
+                            self.executed_sql = prev_exec
+                            self.acl_applied = prev_acl
                             # 把拒绝原因一并留痕：否则用户只看到"复核没生效"，看不到为什么
                             self._result_warning = (issue + "（改写后的 SQL 判定为退化输出，"
                                                     f"已保留改写前的结果：{_refine_rej}）") if _refine_rej else issue
@@ -5953,6 +6005,8 @@ class LLMService:
                     else:
                         # 改写没有变好 → 回退到原结果，不让复核把可用结果弄丢
                         self.sql, self.sql_result = prev_sql, prev_result
+                        self.executed_sql = prev_exec
+                        self.acl_applied = prev_acl
                         self._result_warning = issue
                         self._start_analysis()
                 else:
@@ -6393,9 +6447,23 @@ class LLMService:
         直接复用 _exec_sql，因此**同样走权限改写与 fail-close 闸门**——
         探测 SQL 命中的表若不在授权范围内，会被照常拒绝（返回 success=False），
         _probe_data_range 见失败即静默跳过，不会因探测而泄露未授权表的行数/范围。
+
+        2026-10-03 修复：_exec_sql 有副作用（写 self.executed_sql、累积
+        self.acl_applied），而本探测发生在主查询**执行完之后**，于是
+        executed_sql 最后停在 `SELECT MIN(stat_date),MAX(stat_date) ...` 这条探测语句上
+        → 血缘面板显示的是探测 SQL、审计日志记的"实际执行的 SQL"也是它、
+        acl_applied 里混入探测触发的改写项。这里把实例状态存取包在 try/finally 里，
+        权限闸门不变（fail-close 依旧），但实例留痕只反映真正的业务查询。
         """
         try:
-            return self._exec_sql(sql)
+            _saved_sql = self.executed_sql
+            _saved_acl = self.acl_applied
+            self.acl_applied = {}
+            try:
+                return self._exec_sql(sql)
+            finally:
+                self.executed_sql = _saved_sql
+                self.acl_applied = _saved_acl
         except Exception as e:
             return {"success": False, "error": str(e)[:200], "rows": [], "row_count": 0}
 
@@ -6917,7 +6985,9 @@ class LLMService:
         **只有严格优于当前结果时才替换**（防止越换越差）。
         返回是否发生了替换。
         """
-        base_score = self._eval_score or 0
+        # 2026-10-03 修复：原`self._eval_score or 0` 把「评分缺失(None)」与「0分」混为一谈，
+        # 0 是合法分数。一旦base_score=0，任何 sc>0 的候选都会被采纳（6943 行守卫形同虚设）。
+        base_score = self._eval_score if isinstance(self._eval_score, (int, float)) else None
         best_sql, best_res, best_score = None, None, base_score
         prev_sql, prev_res = self.sql, self.sql_result
         try:
@@ -6929,21 +6999,32 @@ class LLMService:
                     continue
                 # 规则校验要用「候选 SQL + 候选结果」的一致性状态判定
                 self.sql, self.sql_result = cand, res
+                # ev 初值提到 try 外：原代码只在 try 内赋值，异常路径会在6942 行
+                # 读未绑定变量 NameError，再被 6945 行 except 吞掉 → 交叉比对静默全失效
+                ev = {}
                 try:
                     if self._validate_result():
                         continue
-                    ev = self._llm_result_evaluate()
+                    ev = self._llm_result_evaluate() or {}
                 finally:
                     self.sql, self.sql_result = prev_sql, prev_res
-                sc = ev.get("score") or 0
-                if sc > best_score:
+                sc = ev.get("score")
+                # 评分缺失 → 跳过该候选（不参与择优），不拿 0 当分数
+                if not isinstance(sc, (int, float)):
+                    continue
+                # 初始分未知时，任何有效评分都可作为基线
+                if best_score is None or sc > best_score:
                     best_sql, best_res, best_score = cand, res, sc
-        except Exception:
+        except Exception as _cv_err:
+            # 静默 return False 会让前端已展示的「交叉比对候选」变成谎言，必须留痕
+            logging.getLogger("nl2sql").warning("交叉比对异常，本轮不做替换: %s", _cv_err)
             return False
         finally:
             self.sql, self.sql_result = prev_sql, prev_res
 
-        if best_sql is None or best_score <= base_score:
+        if best_sql is None or best_score is None:
+            return False
+        if base_score is not None and best_score <= base_score:
             return False
         self.sql, self.sql_result = best_sql, best_res
         self._eval_score = best_score
@@ -6981,7 +7062,7 @@ class LLMService:
             rows = self.sql_result.get("rows") or []
             if rows:
                 try:
-                    sample = json.dumps(rows[:3], ensure_ascii=False, default=str)[:500]
+                    sample = _rows_json_capped(rows[:3], 500)[0]
                 except Exception:
                     sample = ""
             refine_prompt = (
@@ -8154,12 +8235,14 @@ def generate_analysis(query: str, sql: str, sql_result: dict) -> Generator[dict,
         return
 
     rows = sql_result["rows"][:15]
-    data_json = json.dumps(rows, ensure_ascii=False, default=str)
+    # 2026-10-03 修（P0）：原先 data_json = json.dumps(rows)[:1500] 是字符级硬切，
+    # 会切出非法 JSON；改为整行截断（_rows_json_capped），恒可 json.loads。
+    data_json, _kept, _cut = _rows_json_capped(rows, 1500)
     # 2026-10-02：字段说明给双语名 + 结束时兜底双语化，杜绝裸英文字段名
     fields_info = ", ".join(_col_display(c) for c in sql_result["columns"])
 
     prompt = ANALYSIS_SYSTEM_PROMPT.format(
-        data_json=data_json[:1500],
+        data_json=data_json,
         fields_info=fields_info,
         query=query,
     )
@@ -8192,16 +8275,32 @@ def _linear_predict(values: list[float], horizon: int = 3) -> list[float]:
 
 
 def _shift_date_str(s, days: int) -> str:
-    """把日期字符串顺延 N 天；解析失败返回原串（预测行日期列兜底）"""
+    """把日期字符串顺延 N 天；解析失败返回原串（预测行日期列兜底）
+
+    2026-10-03 修复：原来同一个 fmt 既用于 strptime 解析又用于 strftime 回写。
+    对 "%Y-%m"（按月聚合的查询非常常见，prompt 规则 10 明确要求 LLM 用
+    TO_CHAR(date_col,'YYYY-MM')）来说，天数偏移会被月粒度完全吸收：
+    "2026-07" + 1 天 = "2026-07"，于是 generate_predict 产出的 3 行预测日期
+    与最后一个历史点完全相同，用户看到「未来三天」却日期不变，还会被当成
+    真实数据点画进图表。现在月粒度改为按月偏移。
+    """
     import datetime as _dt
     try:
         s = str(s).strip()
         for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y-%m-%d %H:%M:%S", "%Y-%m"):
             try:
                 d = _dt.datetime.strptime(s, fmt)
-                return (d + _dt.timedelta(days=days)).strftime(fmt)
             except ValueError:
                 continue
+            if fmt == "%Y-%m":
+                # 月粒度：days 不足一月时按「至少进入下一个月」处理，
+                # 保证预测行的日期严格递增、可与历史点区分
+                step = max(1, int(days))
+                m = d.month - 1 + step
+                y = d.year + m // 12
+                m = m % 12 + 1
+                return f"{y:04d}-{m:02d}"
+            return (d + _dt.timedelta(days=days)).strftime(fmt)
     except Exception:
         pass
     return s
@@ -8590,7 +8689,83 @@ def _is_ratio_like(col: str) -> bool:
     return any(t in _RATIO_EN_TOKENS for t in toks)
 
 
-def _insight_sample(rows: list, cols: list, budget: int = 40) -> tuple[str, str]:
+def _shrink_dict_strings(d: dict, limit: int) -> str:
+    """dict 超长时，逐步折半「最长的字符串字段」，返回**合法** JSON 字符串。
+
+    模型原始返回 / 报错文本通常是那个超长字段，折半它比其他策略更保信息。
+    """
+    work = dict(d or {})
+    s = json.dumps(work, ensure_ascii=False, default=str)
+    for _ in range(32):
+        if len(s) <= limit:
+            return s
+        k = max((kk for kk, vv in work.items() if isinstance(vv, str)),
+                key=lambda kk: len(work[kk]), default=None)
+        if k is None or len(work[k]) <= 1:
+            break
+        work[k] = work[k][: max(1, len(work[k]) // 2)]
+        s = json.dumps(work, ensure_ascii=False, default=str)
+    return s if len(s) <= limit else "{}"
+
+
+def _rows_json_capped(rows: list, limit: int = 4000) -> tuple[str, int, bool]:
+    """把「行列表」序列化成**始终合法**的 JSON——绝不在字符中间硬切。
+
+    背景（实测）：多处直接把 `json.dumps(rows)[:4000]` 硬切。JSON 是不定长文本，
+    第 4000 个字符可能正好落在一个字符串值/转义序列/数字中间，于是切出一段
+    **非法 JSON**（实测：4153 字符被切在 char 3991 → Unterminated string），
+    喂给模型的是坏数据，下游 json.loads 直接抛错。
+
+    策略：超限时按**整行**从尾部丢弃；若连单行都放不下，则折半该行的长字段
+    （而不是丢掉整行）。返回的字符串恒可被 json.loads 解析。
+    返回 (json_str, kept_count, truncated)。
+    """
+    rows = list(rows or [])
+    s = json.dumps(rows, ensure_ascii=False, default=str)
+    if len(s) <= limit:
+        return s, len(rows), False
+    kept = list(rows)
+    while len(kept) > 1:
+        kept = kept[: max(1, len(kept) - max(1, len(kept) // 10))]
+        s = json.dumps(kept, ensure_ascii=False, default=str)
+        if len(s) <= limit:
+            return s, len(kept), True
+    # 只剩单行仍超限 → 折半该行长字段后包回列表（不丢这一行）
+    if kept and isinstance(kept[0], dict):
+        try:
+            one = json.loads(_shrink_dict_strings(kept[0], max(1, limit - 2)))
+            s = json.dumps([one], ensure_ascii=False, default=str)
+            if len(s) <= limit:
+                return s, 1, True
+        except Exception:
+            pass
+    return "[]", 0, True
+
+
+def _even_pick(rows: list, m: int, head: int = 12, tail: int = 8) -> tuple:
+    """从 rows 里取 m 条：首 head + 尾 tail 必留，中间等距抽样（首尾不足时按比例缩）。
+
+    返回 (picked, h, t, mid_n)——h/t 为**实际**保留的首/尾条数，供文案如实描述。
+    """
+    n = len(rows)
+    if m >= n:
+        h = min(head, n)
+        t = min(tail, n - h)
+        return list(rows), h, t, max(0, n - h - t)
+    if m <= 1:
+        return ([rows[0]] if n else []), (1 if n else 0), 0, 0
+    if m <= head + tail:
+        h = max(1, (m * head) // (head + tail))
+        t = m - h
+        return (rows[:h] + (rows[n - t:] if t > 0 else [])), h, t, 0
+    mid_n = m - head - tail
+    mid = rows[head:n - tail]
+    step = max(1, len(mid) // mid_n)
+    return rows[:head] + mid[::step][:mid_n] + rows[n - tail:], head, tail, mid_n
+
+
+def _insight_sample(rows: list, cols: list, budget: int = 40,
+                    char_limit: int = 4000) -> tuple[str, str]:
     """为「数据洞察」构造喂给 LLM 的样本 + 字段说明。
 
     2026-09-28 新增。此前两处洞察入口都写 `rows[:15]` 且注明「以上为前 15 行样例」，
@@ -8600,6 +8775,10 @@ def _insight_sample(rows: list, cols: list, budget: int = 40) -> tuple[str, str]
       - >budget 行：首 12 + 尾 8 + 中间等距 20（首尾必留，趋势类问题靠端点定形状），
         并在字段说明里告诉模型这是「代表性子集」，且**不要在结论里强调哪些行没给出**。
 
+    2026-10-03 修（P0）：原实现把整段 JSON `[:4000]` 硬切，会切出**非法 JSON**。
+    现统一改为整行截断（见 `_rows_json_capped`）；>budget 分支先自适应缩减「中间抽样」
+    条数，确保整段不超 char_limit（首尾必留），不再依赖字符级硬切。
+
     返回 (data_json, fields_info)。
     """
     rows = list(rows or [])
@@ -8608,18 +8787,23 @@ def _insight_sample(rows: list, cols: list, budget: int = 40) -> tuple[str, str]
     # 而不是照抄裸英文字段名（此前 fields_info 只有裸列名，洞察满屏 equipment_name）。
     fields_info = ", ".join(_col_display(c) for c in cols)
     n = len(rows)
-    if n <= budget:
-        data_json = json.dumps(rows, ensure_ascii=False, default=str)[:4000]
-        return data_json, fields_info
-    head, tail, mid_n = 12, 8, max(1, budget - 20)
-    mid = rows[head:n - tail]
-    step = max(1, len(mid) // mid_n)
-    picked = mid[::step][:mid_n]
-    sample = rows[:head] + picked + rows[n - tail:]
-    data_json = json.dumps(sample, ensure_ascii=False, default=str)[:4000]
-    fields_info += (f"（共 {n} 行，以下为 {len(sample)} 行代表性子集：含首 {head} 行与"
-                    f"末 {tail} 行，中间为等距抽样 {len(picked)} 行；"
-                    f"请基于子集判断整体趋势，不要在结论里强调「哪些行没给出」）")
+    head, tail = 12, 8
+    # 自适应条数：从 budget 起逐步缩减，直到整段 JSON ≤ char_limit。
+    # 首尾必留（趋势靠端点定形状），缩的是「中间等距抽样」；条数少时首尾按比例缩。
+    m = min(budget, n)
+    picked, h, t, mid_n = _even_pick(rows, m, head, tail)
+    while m > 1 and len(json.dumps(picked, ensure_ascii=False, default=str)) > char_limit:
+        m = max(1, m * 3 // 4)
+        picked, h, t, mid_n = _even_pick(rows, m, head, tail)
+    data_json = json.dumps(picked, ensure_ascii=False, default=str)
+    if len(data_json) > char_limit:          # 极端兜底：单行也超限 → 整行折半字段
+        data_json, shown, _cut = _rows_json_capped(picked, char_limit)
+    else:
+        shown = len(picked)
+    if shown < n:
+        fields_info += (f"（共 {n} 行，以下为 {shown} 行代表性子集：含首 {h} 行与"
+                        f"末 {t} 行，中间为等距抽样 {mid_n} 行；"
+                        f"请基于子集判断整体趋势，不要在结论里强调「哪些行没给出」）")
     return data_json, fields_info
 
 
@@ -8682,7 +8866,13 @@ def _rule_insight(rows: list[dict], cols: list[str]) -> str:
                 ok = False
                 break
         need = max(1, int(len(sample) * 0.6))
-        if ok and len(vals) >= need:
+        # 2026-10-03 修复：原判据是「非空率≥60%」，稀疏指标列（LEFT JOIN 出来的达成率、
+        # 部分维度无数据的度量列——非空率 20%~50% 很常见）会被整列划进 dim_cols，
+        # 于是用户问的那个指标完全不参与统计、也不进维度拆分，洞察「只字不提该指标」，
+        # 甚至全列被划走时退化成「无数值列可做统计」——与表格里肉眼可见的数值矛盾。
+        # 改为：只要有 >=3 个可解析数值就认定为度量列（能否解析才是关键），
+        # 缺失情况交由 8813 行既有的「N 行中有 M 行为空，未参与统计」显式提示。
+        if ok and len(vals) >= min(3, need):
             num_cols.append(col)
         else:
             dim_cols.append(col)
@@ -8997,7 +9187,8 @@ def generate_recommend_questions(query: str, sql: str, sql_result: dict, schema_
     rows = sql_result["rows"]
     result_summary = f"{len(rows)} rows, columns: {', '.join(sql_result['columns'])}"
     if rows:
-        result_summary += f", sample: {json.dumps(rows[0], ensure_ascii=False, default=str)[:120]}"
+        _s, _k, _c = _rows_json_capped([rows[0]], 120)
+        result_summary += f", sample: {_s}"
     structure = _result_structure_hint(sql_result)
     if structure:
         result_summary += f"; 结构线索: {structure}"
@@ -9953,7 +10144,10 @@ def _literal_table_index() -> dict:
     p = os.path.normpath(_LITERAL_INDEX_FILE)
     with _literal_index_lock:
         try:
-            cached = json.load(open(p, encoding="utf-8"))
+            # 2026-10-03 修复：原来 json.load(open(...)) 不关句柄，且写侧靠 GC 回收，
+            # 缓冲区未 flush 时被回收会写坏索引文件 → 读失败 → 全库 DISTINCT 重建，泄漏自我放大。
+            with open(p, encoding="utf-8") as _f:
+                cached = json.load(_f)
             if (cached.get("db") == dbk
                     and time.time() - float(cached.get("built_at") or 0) < _LITERAL_INDEX_TTL
                     and isinstance(cached.get("index"), dict)):
@@ -9962,8 +10156,9 @@ def _literal_table_index() -> dict:
             pass
         idx = _build_literal_table_index()
         try:
-            json.dump({"db": dbk, "built_at": time.time(), "index": idx},
-                      open(p, "w", encoding="utf-8"), ensure_ascii=False)
+            with open(p, "w", encoding="utf-8") as _f:
+                json.dump({"db": dbk, "built_at": time.time(), "index": idx},
+                          _f, ensure_ascii=False)
         except Exception:
             pass
         return idx

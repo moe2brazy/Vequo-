@@ -627,6 +627,12 @@ def _in_group_or_order(col) -> bool:
         while p is not None:
             if isinstance(p, (_e.Group, _e.Order)):
                 return True
+            # 2026-10-03 修复：原实现缺了子查询边界判断（_in_agg_func 里有，
+            # 这里没有）。sqlglot 的 parent 链会穿过子查询：内层 Select →
+            # ScalarSubquery → 外层 Select → Group，于是子查询里的脱敏列会被误判为
+            # 「仅用于分组/排序」而直接放行，明文进结果集（fail-open 数据泄露）。
+            if isinstance(p, _e.Select):
+                return False  # 跨过子查询边界，外层的 Group/Order 与本列无关
             p = p.parent
     except Exception:
         pass

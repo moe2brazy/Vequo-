@@ -84,7 +84,14 @@ def _run_query(query: str, acl) -> dict:
             "status": "done", "title": "查数",
             "summary": f"命中 {len(cols)} 列 × {len(rows)} 行",
             "sql": svc.sql, "columns": cols[:12], "rows": rows[:8],
+            # 2026-10-03 修复：原实现把 rows 截断到 8 行就交给下游，而 _run_attribution /
+            # _run_insight 都从这个已截断的 step 里取 rows —— 洞察节点照样据此计算
+            # 「合计/均值/最大」，于是「合计 1234」实际只是前 8 行的合计，
+            # 却与 summary 里宣称的真实行数矛盾（接口 success=True，结论却基于残缺样本）。
+            # 现在区分「展示用（截断）」与「计算用（全量）」。
             "rows_total": len(rows),
+            "_full_rows": rows,
+            "_full_columns": cols,
             "elapsed_ms": int((_now() - t0) * 1000),
         }
     except Exception as e:
@@ -100,8 +107,10 @@ def _run_attribution(query: str, query_step: dict) -> dict:
             return {"status": "skipped", "title": "归因", "summary": "依赖查数结果，查数未完成",
                     "elapsed_ms": int((_now() - t0) * 1000)}
         from agent.attribution import detect_and_attribute
-        sql_result = {"success": True, "columns": query_step.get("columns", []),
-                      "rows": query_step.get("rows", [])}
+        # 计算用全量数据（_full_rows 为None 时退回展示数据，保持对旧调用方兼容）
+        sql_result = {"success": True,
+                      "columns": query_step.get("_full_columns") or query_step.get("columns", []),
+                      "rows": query_step.get("_full_rows") or query_step.get("rows", [])}
         text = detect_and_attribute(query, sql_result)
         if not text or "未检测到" in text or "无明显" in text:
             return {"status": "done", "title": "归因",
@@ -147,8 +156,11 @@ def _run_insight(query: str, query_step: dict) -> dict:
         if query_step.get("status") != "done":
             return {"status": "skipped", "title": "洞察", "summary": "依赖查数结果，查数未完成",
                     "elapsed_ms": int((_now() - t0) * 1000)}
-        rows = query_step.get("rows") or []
-        cols = query_step.get("columns") or []
+        # 2026-10-03 修复：统计必须基于**全量**行。原实现取的是展示用的 8 行，
+        # 于是「合计/均值/最大/最小」全是残缺样本算出来的，且与 summary 宣称的
+        # 真实行数矛盾（最典型的「看起来成功、实际算错」）。
+        rows = query_step.get("_full_rows") or query_step.get("rows") or []
+        cols = query_step.get("_full_columns") or query_step.get("columns") or []
         if not rows:
             return {"status": "done", "title": "洞察", "summary": "无数据可洞察",
                     "elapsed_ms": int((_now() - t0) * 1000)}

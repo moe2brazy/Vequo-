@@ -450,6 +450,7 @@ def search_across_sources(keyword: str, limit: int = 8) -> list[dict]:
         database = s.get("database") or s.get("name") or ""
         user = s.get("user", "")
         password = s.get("password", "")
+        src_engine = None
         try:
             src_engine = build_engine({"db_type": db_type, "host": host, "port": port,
                                        "name": database, "user": user, "password": password})
@@ -465,9 +466,19 @@ def search_across_sources(keyword: str, limit: int = 8) -> list[dict]:
                         "FROM information_schema.tables "
                         "WHERE table_schema NOT IN ('pg_catalog','information_schema')"
                     ).fetchall()
-            src_engine.dispose()
         except Exception:
-            continue  # 某源连不上（离线/密码过期）→ 跳过，不影响其他源
+            # 某源连不上（离线/密码过期/元数据查询失败）→ 跳过，不影响其他源
+            continue
+        finally:
+            # 2026-10-03 修复：原dispose() 写在 with 之后、元数据查询抛错时被 except
+            # 直接 continue 跳过 → 每调一次 /api/database/search 就泄漏一整个 engine
+            # 及其 5~15 条池化连接，最终打满该库 max_connections（本机文件句柄同样吃紧），
+            # 表现为「搜一次表之后数据库连不上了」且日志无任何痕迹。
+            if src_engine is not None:
+                try:
+                    src_engine.dispose()
+                except Exception:
+                    pass
         for tbl, desc in rows[:500]:
             tbl_name = str(tbl or "")
             if not tbl_name:

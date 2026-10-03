@@ -421,7 +421,17 @@ def execute_sql(sql: str) -> dict:
                 conn.execute(text(f"SET LOCAL statement_timeout = {SQL_TIMEOUT_MS}"))
             result = conn.execute(text(effective_sql))
             # MySQL information_schema 返回大写列名，统一转小写
-            columns = [str(c).lower() for c in result.keys()]
+            # 2026-10-03 修复：原代码把列名一律lower() 后用 dict(zip(columns,row)) 组行。
+            # dict 对重复 key 只保留最后一个 → 多表 JOIN 的同名列（如 SELECT o.order_id, c.order_id）
+            # 被静默合并，每行第二个值被第一个覆盖：row_count 正常、success=True，
+            # 只是某列数据悄悄变成了另一列的值（NL2SQL 最不能出的一类错）。
+            # 现在保留原始列名，仅对 lower() 后的重名加序号去重。
+            raw_cols = [str(c) for c in result.keys()]
+            columns, _seen = [], {}
+            for _c in raw_cols:
+                _base = _c.lower()
+                _seen[_base] = _seen.get(_base, 0) + 1
+                columns.append(_c if _seen[_base] == 1 else f"{_c}_{_seen[_base]}")
             raw_rows = result.fetchmany(SQL_MAX_ROWS + 1)
             if len(raw_rows) > SQL_MAX_ROWS:
                 truncated = True
@@ -566,6 +576,13 @@ def fill_param_placeholders(sql: str) -> str:
                         "('date','timestamp without time zone','timestamp with time zone')"
                     ), {"t": t}).fetchall()
                 except Exception:
+                    # 2026-10-03 修复：与本文件 get_table_row_counts 已有的 B5 修复对齐 ——
+                    # PG 下任一语句失败会把事务置为 aborted(25P02)，不 rollback 则本连接上
+                    # 后续所有表全部连坐失败，lo/hi 永远为 None，占位符原样返回导致必然报错。
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
                     continue
                 if not cols:
                     continue
@@ -579,6 +596,11 @@ def fill_param_placeholders(sql: str) -> str:
                 try:
                     row = conn.execute(text(f"SELECT {agg} FROM {qt}")).fetchone()
                 except Exception:
+                    # 同上：失败后必须 rollback，否则后续表全部 25P02
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
                     continue
                 if row is None:
                     continue

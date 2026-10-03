@@ -17,6 +17,7 @@ key 约定：obj:<table> / met:<name> / rule:<name> / topic:<name> / term:<term>
 from __future__ import annotations
 
 import json
+import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,7 +37,13 @@ def _load() -> dict:
         if _DATA_FILE.exists():
             try:
                 _cache = json.loads(_DATA_FILE.read_text(encoding="utf-8"))
-            except Exception:
+            except Exception as _e:
+                # 2026-10-03 修复：原实现静默 _cache = {}，而 _save 又是「截断→写」——
+                # 一旦文件是半截 JSON（写入途中崩溃/磁盘满），下次加载就把全部用户的
+                # 收藏/术语/人工覆盖归零，且后续 _save 会用这个空壳覆盖回去，不可恢复。
+                # 现在：保留损坏文件留证据 + 显式告警，不静默吞掉。
+                print(f"[knowledge_user_data] 读取失败({_e})，文件疑似损坏，"
+                      f"原文件已保留在 {_DATA_FILE}，本次按空数据处理")
                 _cache = {}
         else:
             _cache = {}
@@ -46,9 +53,16 @@ def _load() -> dict:
 
 
 def _save(data: dict) -> None:
+    """原子写：先写同目录临时文件再 os.replace 替换（2026-10-03）。
+
+    原实现直接 write_text 覆写（先 truncate 再写），写入途中崩溃会留半截 JSON，
+    下次 _load 的 json.loads 异常被静默吞掉 → 全部用户数据静默归零。
+    """
     global _cache
     with _lock:
-        _DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp = _DATA_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, _DATA_FILE)   # 同目录原子替换，崩溃不留半截
         _cache = data
 
 

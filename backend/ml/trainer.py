@@ -143,14 +143,29 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
     # 2026-10-01 修复（P1）：dropna 原先无任何提示——某列 NULL 率高时 5000 行可能掉到
     # 几十行，用户只看到"有效数据不足"，不知道是哪列导致。记录行数变化与缺失最多的列，
     # 通过 data_note 透出到结果卡。
+    # 2026-10-03 修复（P0）：df.dropna() 无参数 =丢弃**任一列**含 NaN 的行。特征里只要
+    # 有一列（如order_status 这类文本列）缺失率高，5000 行会被砍到几十行，且 len(df)<10
+    # 的门槛拦不住"砍到 200 行"这种更糟的情况。而 DecisionTree/LogisticRegression 本身
+    # 能处理 NaN（KMeans 不行）。改为按任务区分：有监督只补齐不删行，无监督才清理数值列。
     rows_before = len(df)
     _na_counts = df.isna().sum()
-    df = df.dropna()
+    _num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    if task in ("clustering", "anomaly"):
+        # 无监督：KMeans 不接受 NaN，必须清理，且只清数值列（文本列后面要 LabelEncoder）
+        df = df.dropna(subset=_num_cols) if _num_cols else df.dropna()
+    else:
+        # 有监督：树模型/线性模型容忍 NaN，改为按列中位数补齐，避免整表被砍光
+        for c in _num_cols:
+            if df[c].isna().any():
+                df[c] = df[c].fillna(df[c].median())
     data_note = ""
     if rows_before - len(df) > 0:
         _worst = _na_counts.idxmax() if _na_counts.max() > 0 else ""
         data_note = (f"原始 {rows_before} 行，剔除含缺失值记录后剩余 {len(df)} 行"
                      + (f"（缺失最多：{_worst}）" if _worst else ""))
+    elif task not in ("clustering", "anomaly") and _na_counts.max() > 0:
+        _worst = _na_counts.idxmax()
+        data_note = f"原始 {rows_before} 行，缺失值已按列中位数补齐（缺失最多：{_worst}）"
     # 脱敏：剥离敏感列（对齐 ml/executor）；目标/特征列涉敏则直接拒绝训练
     dropped = [c for c in df.columns if any(s in c.lower() for s in _SENSITIVE_COLUMNS)]
     if dropped:
@@ -281,6 +296,13 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
     else:
         raise ValueError(f"未知模型类型: {model_type}")
 
+    # 2026-10-03 修复（P0）：小表（10~20 行）时测试段只有 2 行，r2_score 在目标值为
+    # 常数时返回 NaN（0/0，sklearn 只发 UndefinedMetricWarning 不抛异常），
+    # round(nan,4) 仍是 nan → 一路进 metrics → json.dumps 默认 allow_nan=True 把它
+    # 序列化成**裸 NaN 字面量**（不合法 JSON）→ 前端 JSON.parse 直接抛错、界面卡在
+    # 「建模中」。这里统一做有限性校验，NaN/inf 转 None（前端显示为空，不崩）。
+    metrics = _safe_metrics(metrics)
+
     # 特征重要性
     importance = {}
     if hasattr(m, "feature_importances_"):
@@ -290,7 +312,7 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
         # 原实现只取第 0 类系数（=「类0 vs 其余」的判别方向），标题却是「特征重要性」，
         # 大小和方向都可能误导。多分类按各类系数绝对值取均值聚合。
         import numpy as _np
-        coef = _np.abs(m.coef_).mean(axis=0) if m.coef_.ndim > 1 else m.coef_
+        coef = _np.abs(m.coef_).mean(axis=0) if m.coef_.ndim > 1 else _np.abs(m.coef_)
         importance = {features[i]: round(float(coef[i]), 4) for i in range(len(features))}
 
     # 保存模型（key 按库隔离，切库后旧库模型不可见）
@@ -305,7 +327,18 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
     charts = {}
     charts["importance"] = _plot_importance(importance, info["name"])
     if model_type not in ("kmeans", "isolation") and y_test is not None and y_pred is not None:
-        charts["pred_vs_actual"] = _plot_pred_vs_actual(y_test[:50], y_pred[:50])
+        # 2026-10-03 修复：分类任务的 y 是 LabelEncoder 编码后的 0..K-1 整数，
+        # 直接画图横轴是「0/1/2」而不是「合格/不合格/缺陷」，用户完全看不懂。
+        # 这里先还原成原始类名再画。
+        if le_target is not None:
+            try:
+                _yt = [str(x) for x in le_target.inverse_transform(y_test[:50])]
+                _yp = [str(x) for x in le_target.inverse_transform(y_pred[:50])]
+            except Exception:
+                _yt, _yp = list(y_test[:50]), list(y_pred[:50])
+        else:
+            _yt, _yp = list(y_test[:50]), list(y_pred[:50])
+        charts["pred_vs_actual"] = _plot_pred_vs_actual(_yt, _yp)
 
     return {
         "model_name": name,
@@ -425,6 +458,23 @@ def predict(model_name: str, data: dict) -> dict:
             return {"prediction": int(y_pred[0]), "label": str(label), "warnings": warnings}
         return {"prediction": float(y_pred[0]), "label": str(round(float(y_pred[0]), 4)), "warnings": warnings}
 
+def _safe_metrics(d: dict) -> dict:
+    """把指标里的 NaN/inf 转成 None（2026-10-03）。
+
+    背景：Python json 默认 allow_nan=True，会把 float('nan') 序列化成裸 `NaN`
+    字面量——这不是合法 JSON，前端 JSON.parse 直接抛错，整条 ml_result 事件
+    解析失败、界面卡在「建模中」。这里在序列化前把非有限值统一收敛为 None。
+    """
+    import math as _math
+    out = {}
+    for k, v in (d or {}).items():
+        if isinstance(v, float) and not _math.isfinite(v):
+            out[k] = None
+        else:
+            out[k] = v
+    return out
+
+
 def _plot_importance(importance: dict, title: str) -> str:
     if not importance: return ""
     font = _get_zh_font()
@@ -432,25 +482,34 @@ def _plot_importance(importance: dict, title: str) -> str:
     labels = [i[0] for i in items]
     vals = [abs(i[1]) for i in items]
     fig, ax = plt.subplots(figsize=(5, max(2.5, len(labels)*0.35)))
-    colors = ["#ef4444" if importance[l] < 0 else "#3b82f6" for l in labels]
-    ax.barh(range(len(labels)), vals, color=colors)
-    ax.set_yticks(range(len(labels)))
-    ax.set_yticklabels(labels, fontproperties=font, fontsize=9)
-    ax.set_title(f"{title} — 特征重要性", fontproperties=font, fontsize=11)
-    ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
-    buf = io.BytesIO(); fig.savefig(buf, format="svg", bbox_inches="tight", transparent=True); plt.close(fig)
+    # 2026-10-03 修复：原来 plt.close 在最后一行，前面任一步抛异常（最常见是
+    # 中文字体缺失导致 set_yticklabels 报错）就跳过 close，matplotlib 的 Agg
+    # 全局 figure 注册表持续堆积，内存单调上涨。用 try/finally 保证回收。
+    try:
+        colors = ["#ef4444" if importance[l] < 0 else "#3b82f6" for l in labels]
+        ax.barh(range(len(labels)), vals, color=colors)
+        ax.set_yticks(range(len(labels)))
+        ax.set_yticklabels(labels, fontproperties=font, fontsize=9)
+        ax.set_title(f"{title} — 特征重要性", fontproperties=font, fontsize=11)
+        ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+        buf = io.BytesIO(); fig.savefig(buf, format="svg", bbox_inches="tight", transparent=True)
+    finally:
+        plt.close(fig)
     buf.seek(0); svg = buf.read().decode()
     return svg[svg.index("<svg"):] if svg.startswith("<?xml") else svg
 
 def _plot_pred_vs_actual(y_true, y_pred) -> str:
     font = _get_zh_font()
     fig, ax = plt.subplots(figsize=(5, 4))
-    ax.scatter(range(len(y_true)), y_true, c="#3b82f6", s=20, alpha=0.7, label="真实值")
-    ax.scatter(range(len(y_pred)), y_pred, c="#ef4444", s=20, alpha=0.7, label="预测值")
-    ax.set_title("预测 vs 真实 (前50条)", fontproperties=font, fontsize=11)
-    ax.legend(prop=font)
-    ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False); ax.grid(alpha=0.3)
-    buf = io.BytesIO(); fig.savefig(buf, format="svg", bbox_inches="tight", transparent=True); plt.close(fig)
+    try:  # 同上：异常路径也必须 close，否则 figure 句柄泄漏
+        ax.scatter(range(len(y_true)), y_true, c="#3b82f6", s=20, alpha=0.7, label="真实值")
+        ax.scatter(range(len(y_pred)), y_pred, c="#ef4444", s=20, alpha=0.7, label="预测值")
+        ax.set_title("预测 vs 真实 (前50条)", fontproperties=font, fontsize=11)
+        ax.legend(prop=font)
+        ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False); ax.grid(alpha=0.3)
+        buf = io.BytesIO(); fig.savefig(buf, format="svg", bbox_inches="tight", transparent=True)
+    finally:
+        plt.close(fig)
     buf.seek(0); svg = buf.read().decode()
     return svg[svg.index("<svg"):] if svg.startswith("<?xml") else svg
 

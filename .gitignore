@@ -40,7 +40,7 @@ backend/imports/
 # 认证/指标运行时数据（含密码哈希与密钥，禁止提交）
 backend/auth_users.json
 backend/auth_secret.key
-backend/metrics_registry.json
+# 指标口径注册表为团队共享资产（仅含指标定义，无密钥），纳入版本管理（2026-10-02）
 backend/feedback_queue.jsonl
 backend/logs/
 # 权限策略备份（临时产物，禁止提交）

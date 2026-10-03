@@ -896,12 +896,13 @@ def delete_metric(name: str):
 #    Aloudata CAN 指标自动发现）：自动提炼候选 → **人工审核**后才进注册表。
 #    自动化只负责"覆盖率"，"正确性"必须留给人 —— 口径错了就是数据事故。
 @app.post("/api/metrics/mine", dependencies=[Depends(require_roles("admin"))])
-def mine_metric_candidates(limit: int = 10, use_llm: bool = True):
+def mine_metric_candidates(limit: int = 10, use_llm: bool = True,
+                            authorization: str = Header(None)):
     """从历史成功 SQL 中挖掘尚未治理的指标口径候选（只进候选池，不自动入库）。"""
     from agent.metric_miner import mine_candidates
     res = mine_candidates(limit=max(1, min(limit, 30)), use_llm=use_llm)
     try:
-        u = get_current_user()
+        u = get_current_user(authorization)
         audit("metric_mine", user=u.get("username", ""), role=u.get("role", ""),
               total=res.get("total", 0))
     except Exception:
@@ -910,7 +911,8 @@ def mine_metric_candidates(limit: int = 10, use_llm: bool = True):
 
 
 @app.post("/api/metrics/scan-schema", dependencies=[Depends(require_roles("admin"))])
-def scan_schema_candidates_api(limit: int = 20, use_llm: bool = True):
+def scan_schema_candidates_api(limit: int = 20, use_llm: bool = True,
+                               authorization: str = Header(None)):
     """语义层自动构建 Agent（P0-1，对齐极昆仑语义层构建 Agent）：扫描库表结构 → 候选指标。
 
     确定性扫描（维度表/事实表识别 + 数值列 SUM/AVG 候选 + 时间列标注）+ LLM 只做 NL 命名
@@ -921,7 +923,7 @@ def scan_schema_candidates_api(limit: int = 20, use_llm: bool = True):
     from agent.semantic_builder import scan_schema_candidates
     res = scan_schema_candidates(limit=max(1, min(limit, 40)), use_llm=use_llm)
     try:
-        u = get_current_user()
+        u = get_current_user(authorization)
         audit("metric_scan_schema", user=u.get("username", ""), role=u.get("role", ""),
               total=res.get("total", 0), added=res.get("added", 0))
     except Exception:
@@ -948,7 +950,8 @@ def update_metric_candidate(cid: str, patch: dict):
 
 @app.post("/api/metrics/candidates/{cid}/adopt",
           dependencies=[Depends(require_roles("admin"))])
-def adopt_metric_candidate(cid: str, body: dict | None = None):
+def adopt_metric_candidate(cid: str, body: dict | None = None,
+                            authorization: str = Header(None)):
     """人工采纳候选：写入指标注册表（human-in-loop 的确认环节）。"""
     from agent.metric_miner import adopt_candidate
     body = body or {}
@@ -962,7 +965,7 @@ def adopt_metric_candidate(cid: str, body: dict | None = None):
     if not res.get("success"):
         raise HTTPException(status_code=400, detail=res.get("error", "采纳失败"))
     try:
-        u = get_current_user()
+        u = get_current_user(authorization)
         audit("metric_adopt", user=u.get("username", ""), role=u.get("role", ""),
               metric=(res.get("metric") or {}).get("name", ""), cid=cid)
     except Exception:
@@ -984,7 +987,7 @@ def ignore_metric_candidate(cid: str):
 # 复用单条 adopt/ignore（自带黑名单、采纳留痕、名称兜底），这里只做批量循环与失败收集。
 @app.post("/api/metrics/candidates/batch",
           dependencies=[Depends(require_roles("admin"))])
-def batch_metric_candidates(body: dict):
+def batch_metric_candidates(body: dict, authorization: str = Header(None)):
     """候选批量处置：body = {ids: [...], action: "adopt"|"ignore"}。
 
     adopt  → 逐条入库（空名候选会失败并计入 failed，不影响其余）；
@@ -1016,7 +1019,7 @@ def batch_metric_candidates(body: dict):
         except Exception as e:
             failed.append({"id": cid, "error": str(e)[:120]})
     try:
-        u = get_current_user()
+        u = get_current_user(authorization)
         audit("metric_batch_%s" % action, user=u.get("username", ""),
               role=u.get("role", ""), total=len(ok), failed=len(failed))
     except Exception:
@@ -2003,9 +2006,10 @@ def compile_action_api(req: ActionExecuteRequest):
 
 
 @app.post("/api/actions/execute", dependencies=[Depends(require_roles("admin"))])
-def execute_action_api(req: ActionExecuteRequest):
+def execute_action_api(req: ActionExecuteRequest,
+                        authorization: str = Header(None)):
     """执行写回动作（P2-2）：二次确认 + 白名单 + 参数化绑定 + 审计。"""
-    u = get_current_user()
+    u = get_current_user(authorization)
     from agent.action_agent import execute_action
     r = execute_action(req.action, req.params, confirmed=req.confirmed,
                        operator=u.get("username", "") if u else "")
@@ -3190,6 +3194,11 @@ def ask_report_file_download(rid: str, format: str = "docx",
         raise HTTPException(
             status_code=404,
             detail="报告缓存已过期或不存在，请重新提问生成报告后再导出。")
+    # 2026-10-03 修复：html 预览分支做了 owner 校验，docx/pdf 导出分支却漏了 ——
+    # 只要拿到 rid 就能导出他人报告（含其行级权限过滤后的经营数据）。补齐同一套校验。
+    _owner = item.get("username") or ""
+    if _owner and _owner != u.get("username") and u.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="这份报告不属于当前账号")
     try:
         from agent.report_export import parse_report_blocks, blocks_to_docx, blocks_to_pdf
         blocks = parse_report_blocks(item["html"])

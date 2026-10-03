@@ -853,13 +853,41 @@ def _load_user_metrics() -> list[dict]:
                 data = json.load(f)
                 return data if isinstance(data, list) else []
     except Exception as e:
-        _logger.warning("指标注册表加载失败，返回空列表: %s", e)
+        # 2026-10-03修复：原实现只 warning 然后 return []，而 save_user_metrics 是
+        # 「截断→写」，一旦写坏文件，下次加载就静默返回空列表——全部用户指标消失，
+        # 且无任何用户可见提示。现在保留损坏文件并显式告警，便于人工恢复。
+        _logger.error("指标注册表加载失败（文件可能已损坏，已保留原文件以便恢复）: %s", e)
+        try:
+            bak = _REGISTRY_PATH.with_suffix(".json.corrupt")
+            if _REGISTRY_PATH.exists() and not bak.exists():
+                bak.write_bytes(_REGISTRY_PATH.read_bytes())
+                _logger.error("已将损坏的注册表备份到 %s", bak)
+        except Exception:
+            pass
     return []
 
 
 def save_user_metrics(metrics: list[dict]) -> None:
-    with open(_REGISTRY_PATH, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, ensure_ascii=False, indent=2)
+    """原子写：先写同目录临时文件再 os.replace 替换。
+
+    2026-10-03 修复：原为 open(_REGISTRY_PATH, "w") 原地覆盖 —— 该模式会先 truncate
+    原文件，json.dump 途中抛异常（不可序列化对象/磁盘满/进程被杀）就留下半截文件，
+    配合 _load_user_metrics 的静默兜底会导致整个用户指标注册表清空且无法恢复。
+    """
+    tmp = _REGISTRY_PATH.with_suffix(".json.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(metrics, f, ensure_ascii=False, indent=2)
+            f.flush()
+            _os.fsync(f.fileno())
+        _os.replace(tmp, _REGISTRY_PATH)   # 同目录替换，原子生效
+    except Exception:
+        try:
+            if tmp.exists():
+                _os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _infer_metric_type(metric: dict) -> str:

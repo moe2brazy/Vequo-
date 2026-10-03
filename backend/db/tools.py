@@ -64,6 +64,14 @@ def get_real_tables() -> list[dict]:
         if key is not None and _real_tables_cache["key"] == key and now - _real_tables_cache["ts"] < _META_TTL:
             return _real_tables_cache["value"]
 
+    # 2026-10-03 修复：原实现把「查询失败/异常」与「库里真的 0 张表」两种完全不同
+    # 的结果都写成 tables=[] 并无条件写入 60s TTL 缓存 —— 一次瞬时失败（EXPLAIN 闸门
+    # 拦下 / statement_timeout / 连接池忙）就让空表清单被钉住 60 秒，
+    # 期间所有并发请求的 LLM 都拿到这份错清单（回退到硬编码 TABLES），
+    # 生成不存在的表名或看不到业务表，且无任何错误提示。
+    # 现在：查询失败 → 不落缓存、降级返回上一次好结果；真空表（success=True 且 0 行）
+    # → 是可信结论，可缓存。
+    _trusted = False
     try:
         from .executor import execute_sql
         if get_db_type() == "mysql":
@@ -75,8 +83,10 @@ def get_real_tables() -> list[dict]:
                 "AND table_name NOT LIKE 'tmp_upload_%' "  # 排除 CSV 临时表（会话内数据，不污染业务表清单）
                 "ORDER BY table_name"
             )
-            if result["success"] and result["rows"]:
-                tables = [{"table_name": r["table_name"], "field_count": r["field_count"]} for r in result["rows"]]
+            if result["success"]:
+                _trusted = True
+                tables = [{"table_name": r["table_name"], "field_count": r["field_count"]}
+                          for r in (result["rows"] or [])]
             else:
                 tables = []
         else:
@@ -90,15 +100,23 @@ def get_real_tables() -> list[dict]:
                 "AND table_name NOT LIKE 'tmp_upload_%' "  # 排除 CSV 临时表（会话内数据）
                 "ORDER BY (table_schema='public') DESC, table_schema, table_name"
             )
-            if result["success"] and result["rows"]:
+            if result["success"]:
+                _trusted = True
                 tables = []
-                for r in result["rows"]:
+                for r in (result["rows"] or []):
                     name = r["table_name"] if r["table_schema"] == "public" else f"{r['table_schema']}.{r['table_name']}"
                     tables.append({"table_name": name, "field_count": r["field_count"]})
             else:
                 tables = []
     except Exception:
         tables = []
+
+    if not _trusted:
+        # 查询失败：沿用上一次好结果（同一库）且不刷新 TTL，让下一次调用能重新探测
+        with _real_tables_lock:
+            if key is not None and _real_tables_cache["key"] == key and _real_tables_cache["value"]:
+                return _real_tables_cache["value"]
+        return tables
 
     with _real_tables_lock:
         _real_tables_cache["key"] = key

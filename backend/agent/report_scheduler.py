@@ -106,14 +106,23 @@ def _run_due() -> int:
             if s.get("enabled", True) and now >= s.get("next_run", 0):
                 due.append(s)
     for s in due:
+        ok = True
         try:
             _dispatch(s)
-            with _lock:
-                # 推进下次运行时间（从本次触发时刻起算间隔，避免赶工）
-                s["next_run"] = now + max(1, int(s.get("interval_min", 60))) * 60
-                _save()
         except Exception as e:
+            ok = False
             _logger.warning("报表订阅 %s 生成失败: %s", s.get("id"), e)
+        with _lock:
+            # 2026-10-03 修复：next_run 的推进原来在 try 内、_dispatch 之后，
+            # 于是失败时 next_run 保持为过去的 due 时刻，守护线程每 30 秒重试一次
+            # → 日志被刷满、真实错误被淹没（告警风暴）。现在无论成败都推进，
+            # 失败时按固定间隔重试；连续失败达阈值则自动停用。
+            s["next_run"] = now + max(1, int(s.get("interval_min", 60))) * 60
+            s["fail_count"] = int(s.get("fail_count") or 0) + (0 if ok else 1)
+            if not ok and s["fail_count"] >= 5:
+                s["enabled"] = False
+                _logger.warning("报表订阅 %s 连续失败 5 次，已自动停用", s.get("id"))
+            _save()
     return len(due)
 
 

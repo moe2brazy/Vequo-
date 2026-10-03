@@ -103,32 +103,47 @@ async def ask_stream(query: str, history: list[dict] | None = None,
     # 先推一个 ping，尽早建立连接并冲掉中间层缓冲
     yield ": stream-open\n\n"
 
-    while True:
-        try:
-            item = event_queue.get_nowait()
-        except queue.Empty:
-            # 队列空：让出 event loop，让 uvicorn 把已 yield 的数据真正 flush 出去
-            if not thread.is_alive() and event_queue.empty():
+    # 2026-10-03 修复（P1）：客户端断连时 async generator 会在某个 yield 处被 GC/aclose，
+    # 原实现没有任何取消机制 —— 后台线程继续跑完 service.run() 的整条链（选表 + MQL +
+    # 逃生生成 + 执行 + 评审，单条最长数分钟），持续占用全局 LLM 信号量、线程池与连接池；
+    # 且 break 之后还会把**已被客户端放弃**的查询结果写进结果缓存，后续用户会命中它。
+    # 现在：断连时置 cancelled 标志，退出前不写缓存，也不无谓等待线程。
+    cancelled = False
+    try:
+        while True:
+            try:
+                item = event_queue.get_nowait()
+            except queue.Empty:
+                # 队列空：让出 event loop，让 uvicorn 把已 yield 的数据真正 flush 出去
+                if not thread.is_alive() and event_queue.empty():
+                    break
+                await asyncio.sleep(0.02)
+                continue
+
+            if item is None:
                 break
-            await asyncio.sleep(0.02)
-            continue
 
-        if item is None:
-            break
-
-        yield _sse(item["type"], {k: v for k, v in item.items() if k != "type"})
-        # 关键：每条事件后让出控制权，确保逐条抵达前端而非批量堆积
-        await asyncio.sleep(0)
+            yield _sse(item["type"], {k: v for k, v in item.items() if k != "type"})
+            # 关键：每条事件后让出控制权，确保逐条抵达前端而非批量堆积
+            await asyncio.sleep(0)
+    except (GeneratorExit, asyncio.CancelledError):
+        # 客户端断连/任务取消：明确标记，不再写缓存
+        cancelled = True
+        raise
 
     # 缓存结果供后续分析/预测复用（key 含 ACL 指纹，防越权复用）；
     # 报告路径没有 service（不走问数管道），跳过
-    if rr is None and service.sql_result.get("rows"):
+    # 2026-10-03：客户端已断连（cancelled）时不写缓存 —— 那种结果没人要，
+    # 却会被后续用户命中，白占缓存位且语义不对。
+    if not cancelled and rr is None and service.sql_result.get("rows"):
         from security.enforcer import acl_fingerprint
         cache_result(query, getattr(service, "executed_sql", "") or service.sql,
                      service.sql_result, service.schema_context,
                      acl_fp=acl_fingerprint(getattr(service, "acl", None)))
 
-    await asyncio.to_thread(thread.join, 1)
+    # 后台线程是 daemon，join 只是尽力而为：断连时不再白等它跑完
+    if not cancelled:
+        await asyncio.to_thread(thread.join, 1)
 
 
 async def _bridge(sync_gen_factory) -> AsyncGenerator[str, None]:

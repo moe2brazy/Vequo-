@@ -99,7 +99,8 @@ def generate_python_plan(query: str, columns: list, rows: list,
         cap_text += "（可用 sklearn 做聚类 / 回归 / 异常检测）"
 
     try:
-        sample = json.dumps(rows[:3], ensure_ascii=False, default=str)[:1200]
+        from agent.llm_service import _rows_json_capped
+        sample = _rows_json_capped(rows[:3], 1200)[0]
     except Exception:
         sample = "[]"
 

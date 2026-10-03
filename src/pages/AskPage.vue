@@ -699,7 +699,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted, onActivated, onUnmounted, nextTick, watch, inject } from 'vue'
+import { ref, reactive, computed, onMounted, onActivated, onDeactivated, onUnmounted, nextTick, watch, inject } from 'vue'
 // 图表渲染：ECharts（常规图）+ AntV G2Plot（扩展图）双引擎统一入口
 import { renderChart, disposeChart, resizeChart, coerceRenderableType, downgradeChartType } from '../charts'
 import echarts from '../echarts'
@@ -1024,9 +1024,18 @@ const askRootEl = ref<HTMLElement | null>(null)
 
 // 当前请求的 AbortController（用于暂停 / 切换对话时取消）
 let activeAbort: AbortController | null = null
+// 2026-10-03 新增（P0 竞态修复）：请求序号。只有「当前最新那次请求」才允许复位
+// 共享状态（isLoading / activeAbort）。原实现里旧请求的 finally 无条件复位，
+// 而 stopGenerating 只是同步 abort + 置 isLoading=false，并不等旧请求的 finally
+// 真正跑完（fetch body reader 的 reject 通常滞后几十毫秒）→ 用户点「暂停」后
+// 立刻发新问题 B，B 设 isLoading=true，新旧两条流同时往同一会话 push，
+// 答案顺序错乱；且旧请求把 activeAbort 清空后「暂停」再也停不掉新请求。
+let reqSeq = 0
 
 // 停止当前生成（暂停按钮 / 新建对话时调用）
 const stopGenerating = () => {
+  // 让所有在途请求的 finally/catch 失效（它们复位共享状态前会先校验序号）
+  reqSeq++
   if (activeAbort) {
     activeAbort.abort()
     activeAbort = null
@@ -1845,11 +1854,14 @@ const runConfirmedSql = async (sql: string) => {
   let chat = history.value.find(h => h.id === chatId)
   if (!chat) return  // 找不到当前对话，直接返回
   analysisDialogRef.value?.setSubmitting(true)
+  // 本次执行消息的稳定标识：2026-10-03 用于精确定位，避免 catch/finally 靠
+  // messages[last] 猜测（执行期间用户可能又发了新问题，最后一条根本不是这条）
+  const execMid = 'm' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
   try {
     // 追加一条 assistant 消息，结果渲染复用流式同一条路径
     chat.messages.push({
       role: 'assistant',
-        _mid: 'm' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+        _mid: execMid,
       content: '正在执行确认的查询…',
       result: '',
       thinking: '',
@@ -1886,12 +1898,16 @@ const runConfirmedSql = async (sql: string) => {
       src.analysisDismissed = false
     }
   } catch (e: any) {
-    // 失败：错误写回失败消息（不再弹窗；用户可改口径/重新生成）
-    chat = history.value.find(h => h.id === chatId) || chat
-    const msg = chat?.messages[chat.messages.length - 1]
-    if (msg) {
-      msg.content = '执行失败：' + (e?.message || '网络错误')
-      msg.thinkingStreaming = false
+    // 失败：错误写回**本条执行消息**（2026-10-03 修复：原代码取
+    // chat.messages[messages.length - 1]，把「执行失败」写到用户另一条提问的气泡上，
+    // 覆盖其正在流式输出的内容 —— 用户看到的是「我问的那个问题答错了」，
+    // 实际出错的是上一轮的确认查询）。这里按 _mid 精确定位，找不到就不碰消息数组。
+    chat = history.value.find(h => h.id === chatId)
+    const target = chat?.messages.find(m => m._mid === execMid)
+    if (target) {
+      target.content = '执行失败：' + (e?.message || '网络错误')
+      target.result = `<div class="text-sm text-red-500">${esc(e?.message || '网络错误')}</div>`
+      target.thinkingStreaming = false
     }
     ac.error = e?.message || '网络错误'
     // chat 可能已被账号切换整体清空（find 返回 undefined），可选链防止对 undefined 访问
@@ -1899,7 +1915,8 @@ const runConfirmedSql = async (sql: string) => {
     if (src && src.analysisConfirm) {
       src.analysisConfirm = { ...src.analysisConfirm, error: ac.error }
     }
-    analysisConfirm.value = ac
+    // 切走了就别把弹窗挂回新会话
+    analysisConfirm.value = chat ? ac : null
   } finally {
     analysisDialogRef.value?.setSubmitting(false)
     chat = history.value.find(h => h.id === chatId) || chat
@@ -1967,6 +1984,9 @@ const sendMessage = async (presetText?: string | Event, opts?: { noConfirm?: boo
   // 为本次请求创建 AbortController（暂停/新建对话时取消）
   const controller = new AbortController()
   activeAbort = controller
+  // 本次请求的序号：后续所有对共享状态的写入都要先校验 isCurrent()
+  const mySeq = ++reqSeq
+  const isCurrent = () => mySeq === reqSeq
   // 占位助手消息（函数级声明：try 内的流式回写与 try 外的 catch 错误回写共用）
   let msg: any
 
@@ -2278,8 +2298,12 @@ const sendMessage = async (presetText?: string | Event, opts?: { noConfirm?: boo
     saveToStorage()
     await scrollToBottom()
   } finally {
-    isLoading.value = false
-    activeAbort = null
+    // 2026-10-03 修复：只在「我仍是当前请求」时复位共享状态，避免旧请求的 finally
+    // 把新请求刚设好的 isLoading / activeAbort 覆盖掉（双流并发 + 暂停失效）
+    if (isCurrent()) {
+      isLoading.value = false
+      activeAbort = null
+    }
   }
 }
 
@@ -2385,7 +2409,13 @@ const applyFinalData = (msg: any, finalData: any) => {
       msg.matchedTables = finalData.matched_tables || []
       msg.columns = (finalData.result && finalData.result.columns) || []
       // 结果行（封顶 30）：多轮会话记忆用它提取"那 L01 呢"里的维度实体（P1-1）
-      msg.rows = (finalData.result && finalData.result.rows || []).slice(0, 30)
+      const _allRows = (finalData.result && finalData.result.rows) || []
+      // 2026-10-03：另存真实行数，供 MD 导出表述「共 N 行」用 ——
+      // 否则导出时只能拿到封顶后的 30 行，真实 5000 行时会写成「共 30 行」，
+      // 与气泡上的「已查询到 5000 条数据」自相矛盾。
+      msg.rowCount = (finalData.result && (finalData.result.row_count
+        ?? finalData.result.rowCount)) || _allRows.length
+      msg.rows = _allRows.slice(0, 30)
       msg.chartSvg = (finalData.chart && finalData.chart.svg) || msg.chartSvg || ''
       // 图表类型：存到 msg，供图表切换下拉默认值使用
       msg.chartType = (finalData.chart && finalData.chart.type) || msg.chartType || ''
@@ -2692,7 +2722,12 @@ const exportMarkdown = (msg: any) => {
     rows.slice(0, 20).forEach((r) => {
       lines.push('| ' + cols.map((c) => mdCell(r[c])).join(' | ') + ' |')
     })
-    if (rows.length > 20) lines.push(`\n> 共 ${rows.length} 行，仅导出前 20 行`)
+    // 2026-10-03 修复：msg.rows 在 applyFinalData 里被刻意封顶到 30 行（供多轮会话
+    // 记忆提取实体），原代码直接用它算「共 N 行」→ 真实结果 5000 行时这里恒显示
+    // 「共 30 行」，而气泡上写着「已查询到 5000 条数据」，用户会把截断的表当完整
+    // 结果去做分析。改为优先用消息上记录的真实行数。
+    const totalRows = (msg as any).rowCount || rows.length
+    if (totalRows > 20) lines.push(`\n> 共 ${totalRows} 行，仅导出前 20 行`)
   }
   const analysis = (msg.content || '').slice(0, 5000)
   if (analysis) lines.push(`\n## 分析\n\n${analysis}`)
@@ -2867,8 +2902,22 @@ const saveToStorage = () => {
       ...c,
       // 报告 HTML 一份几十 KB，写进本地存储（总配额 5MB）会把对话历史挤掉：
       // 只留 rid，下次要打开时按 rid 从后端把预览件取回来（见 openReport）
-      messages: (c.messages || []).slice(-60).map((m: any) =>
-        m && m.reportHtml ? { ...m, reportHtml: '' } : m),
+      // 2026-10-03 修复：图表容器 result 里内嵌了**全量 rows 的 JSON**
+      // （data-rows="[...]"），一条返回几千行的结果就是几百 KB —— 作者显然知道
+      // 体积问题（专门剥离了 reportHtml、也把 msg.rows 封顶 30 行），却漏了这块
+      // 更大的。几轮之后 5MB 配额写满 → 一路降级到"本轮不持久化"，
+      // 用户刷新页面整段对话消失且只 console.warn 不报错。
+      // 落盘时把 result 里的 data-rows 清空：刷新后该消息的 .echart 容器拿不到
+      // cols/rows，renderECharts 会走 fallback 分支显示后端 SVG，结果依然完整可见
+      // （与报告走 rid 回取是同一思路）。
+      messages: (c.messages || []).slice(-60).map((m: any) => {
+        if (!m) return m
+        const { reportHtml, ...rest } = m as any
+        if (typeof rest.result === 'string' && rest.result.includes('data-rows=')) {
+          rest.result = rest.result.replace(/data-rows="[^"]*"/g, 'data-rows="[]"')
+        }
+        return rest
+      }),
     }))
   try {
     localStorage.setItem(key, JSON.stringify(payload))
@@ -2960,6 +3009,13 @@ onActivated(() => {
     renderECharts()
     scrollToBottom()
   })
+})
+
+// 2026-10-03 修复（内存泄漏）：本页被 KeepAlive 包裹（上面有 onActivated 即为证），
+// 切页只触发 deactivate，onUnmounted 永远不执行 → 原先只在 onUnmounted 里调用的
+// disposeAllCharts 形同虚设。加上 deactivate 时就释放（onActivated 会重渲，无需保留）。
+onDeactivated(() => {
+  disposeAllCharts()
 })
 
 // 登录态切换（登出/换账号）→ 切换「智能问析记忆」命名空间：不同账号的历史记录互不可见。

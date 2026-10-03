@@ -24,6 +24,7 @@ import datetime
 import html as html_mod
 import logging
 import re
+import threading
 import time
 import uuid
 from typing import AsyncGenerator  # noqa: F401  (保留签名提示)
@@ -399,6 +400,9 @@ def build_html(rr, data: dict, summary: str, user: str = "", db_name: str = "") 
 
 _STORE: dict[str, dict] = {}
 _STORE_TTL = 2 * 3600   # 2 小时内可反复导出；过期重新提问即可
+_STORE_MAX = 50          # 容量上限：单份 HTML 几十~几百 KB，无上限会常驻内存
+_store_lock = threading.Lock()   # 2026-10-03 新增：FastAPI 同步路由跑在 threadpool 里，
+                                 # 原「遍历→pop→写入」三步无锁，并发生成报告会互相顶掉条目
 
 
 def save_report_html(title: str, html: str, username: str = "") -> str:
@@ -408,18 +412,25 @@ def save_report_html(title: str, html: str, username: str = "") -> str:
     HTML 取回去重开预览，那时候得确认这份报告确实是这个人生成的。
     """
     now = time.time()
-    for k in [k for k, v in _STORE.items() if now - v["ts"] > _STORE_TTL]:
-        _STORE.pop(k, None)
     rid = uuid.uuid4().hex[:12]
-    _STORE[rid] = {"title": title, "html": html, "ts": now, "username": username or ""}
+    with _store_lock:
+        for k in [k for k, v in _STORE.items() if now - v["ts"] > _STORE_TTL]:
+            _STORE.pop(k, None)
+        # 容量上限：超了丢最旧的一份（否则 TTL 清理只在 save 时触发，
+        # 一旦不再生成报告，几十份大 HTML 会永久驻留）
+        while len(_STORE) >= _STORE_MAX:
+            oldest = min(_STORE, key=lambda k: _STORE[k]["ts"])
+            _STORE.pop(oldest, None)
+        _STORE[rid] = {"title": title, "html": html, "ts": now, "username": username or ""}
     return rid
 
 
 def load_report_html(rid: str) -> dict | None:
-    item = _STORE.get(str(rid or ""))
-    if not item or time.time() - item["ts"] > _STORE_TTL:
-        return None
-    return item
+    with _store_lock:
+        item = _STORE.get(str(rid or ""))
+        if not item or time.time() - item["ts"] > _STORE_TTL:
+            return None
+        return item
 
 
 # ═════════════════════════════════════════════════════════════

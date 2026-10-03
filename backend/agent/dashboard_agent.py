@@ -202,7 +202,8 @@ def _batch_insights(query: str, cards: list[dict]) -> list[str]:
             brief.append("#%d %s：取数失败（%s）" % (i, c.get("title"), c["error"][:40]))
             continue
         try:
-            sample = json.dumps((c.get("rows") or [])[:8], ensure_ascii=False, default=str)[:600]
+            from agent.llm_service import _rows_json_capped
+            sample = _rows_json_capped((c.get("rows") or [])[:8], 600)[0]
         except Exception:
             sample = "[]"
         brief.append("#%d %s（%d 行，列：%s）\n样例：%s"

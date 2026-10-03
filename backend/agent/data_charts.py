@@ -354,7 +354,14 @@ def _build_sunburst(table: str, tlab: str, fields: list[dict]) -> dict | None:
         kids = [{"name": _clean_name(row.get("t")), "value": int(_to_num(row.get("n")) or 0)}
                 for row in rows if _sev_cn(row.get("s")) == s and _clean_name(row.get("t"))]
         children.append({"name": s, "children": kids})
+    # 2026-10-03 修复：type_total / sev_total 只在有名字的行才写入，若所有行的类型
+    # （或严重度）都为空串会被 continue 跳过 → 两个 dict 为空 → max() 抛
+    # ValueError: max() arg is an empty sequence（再被上层 except 吞成旭日图静默消失）。
+    if not type_total or not sev_total:
+        return None
     total = sum(type_total.values())
+    if not total:
+        return None
     top_type = max(type_total, key=type_total.get)
     top_sev = max(sev_total, key=sev_total.get)
     return {

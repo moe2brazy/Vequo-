@@ -352,13 +352,40 @@ _FALLBACK_ANSWER = (
 _LOG_DIR = os.path.join(os.path.dirname(_DATA_DIR), "logs")
 
 
+def _cap_json(entry: dict, limit: int = 4000) -> str:
+    """把日志条目序列化成**一行合法 JSON**（support_ai.log 是 JSONL）。
+
+    原先 `json.dumps(entry)[:4000]` 是字符级硬切，会切出非法 JSON，读取端
+    （read_diag_log）解析失败后只能退化成 {"raw_line": ...}，丢掉结构。
+    现改为：超长时逐步折半「最长的字符串字段」（模型原始返回/报错文本通常就是
+    那个超长字段），始终保证输出可被 json.loads 解析。
+    """
+    s = json.dumps(entry, ensure_ascii=False)
+    if len(s) <= limit:
+        return s
+    work = dict(entry)
+    for _ in range(24):
+        k = max((kk for kk, vv in work.items() if isinstance(vv, str)),
+                key=lambda kk: len(work[kk]), default=None)
+        if k is None or len(work[k]) <= 1:
+            break
+        work[k] = work[k][: max(1, len(work[k]) // 2)]
+        s = json.dumps(work, ensure_ascii=False)
+        if len(s) <= limit:
+            return s
+    # 兜底：仍放不下（如嵌套结构巨大）→ 只保留定位信息，仍是合法 JSON
+    return json.dumps({"ts": work.get("ts"), "kind": work.get("kind"),
+                       "note": "entry too large; long fields truncated"},
+                      ensure_ascii=False)
+
+
 def _log_failure(kind: str, detail: dict) -> None:
     """把 AI 调用/解析失败的原始信息落盘（backend/logs/support_ai.log），便于排查"""
     try:
         os.makedirs(_LOG_DIR, exist_ok=True)
         entry = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "kind": kind, **detail}
         with open(os.path.join(_LOG_DIR, "support_ai.log"), "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False)[:4000] + "\n")
+            f.write(_cap_json(entry, 4000) + "\n")
     except Exception:
         pass
 

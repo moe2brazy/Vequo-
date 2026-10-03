@@ -141,8 +141,15 @@ const nOrNull = (v: any): number | null => {
  *  - 值本身在 (0,1] 且是比率语义 → 直接用；
  *  - 否则按「首个值 / 该列最大值」归一，避免 100 分制被当成 10000%。 */
 function percentOf(rows: any[], valueCol: string): number | null {
-  const vals = rows.map((r) => n(r?.[valueCol])).filter((v) => Number.isFinite(v))
-  if (!vals.length) return null
+  // 2026-10-03 修复：本函数此前仍用 n() 取数（缺失值塌缩成 0），而同文件 126-138 行
+  // 已专门引入 nOrNull 并注明「统计类图必须用本函数」——percentOf 是漏网的最后一块。
+  // 指标列首行为NULL 时 first=0，`first > 0` 与 `first > 1` 都不成立，
+  // 落到 first/max = 0 分支 → 仪表盘/水波/环形进度静默显示 0%，
+  // 用户会读出「达成率为 0」这个完全错误的结论（比空白更危险）。
+  const vals = rows
+    .map((r) => nOrNull(r?.[valueCol]))
+    .filter((v): v is number => v !== null)
+  if (!vals.length) return null   // 整列无有效观测 → 交调用方返回 null，不画假 0%
   const first = vals[0]
   if (first > 0 && first <= 1) return first
   // 2026-10-02 修复（潜伏准确性 bug）：值在 (1,100] 区间（如综合良率 97.56）是

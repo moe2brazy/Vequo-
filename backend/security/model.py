@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -228,9 +229,14 @@ def _normalize_policy(raw) -> dict:
                     rule = {"mode": rule}
                 if not isinstance(rule, dict):
                     continue
-                mode = str(rule.get("mode") or "visible").lower()
+                # 2026-10-03 修复：原实现只lower() 没strip()，且任何无法识别的 mode
+                # 一律回落成 visible —— 这是 fail-open：「deny 」（表单尾随空格）、
+                # 「denied」「禁止」等拼写问题都会把「禁止访问」变成「明文可见」，
+                # 保存成功、界面回显正常、引擎层却完全没拦，且无任何报错。
+                # 现在：先strip()；未知值按 deny 处理（收紧方向，宁可多挡）。
+                mode = str(rule.get("mode") or "visible").strip().lower()
                 if mode not in COLUMN_MODES:
-                    mode = "visible"
+                    mode = "deny"
                 item = {"mode": mode, "note": str(rule.get("note") or "")}
                 if mode == "mask":
                     item["mask"] = coerce_mask_key(rule.get("mask"))
@@ -251,9 +257,13 @@ def _normalize_policy(raw) -> dict:
                 rule = {"mode": rule}
             if not isinstance(rule, dict):
                 continue
-            mode = str(rule.get("mode") or "allow").lower()
+            # 2026-10-03 修复：与上面columns 段同一个 bug，此前只修了列、漏了指标。
+            # 原实现只lower() 没 strip()，且无法识别的 mode 一律回落成 allow——
+            # 同样 是 fail-open：「deny 」（表单尾随空格）、「denied」会把「禁止访问」
+            # 变成「完全放行」，引擎层不拦、界面回显正常、无任何报错。
+            mode = str(rule.get("mode") or "allow").strip().lower()
             if mode not in METRIC_MODES:
-                mode = "allow"
+                mode = "deny"
             item = {"mode": mode, "note": str(rule.get("note") or "")}
             if mode == "override":
                 expr = str(rule.get("sql_expression") or "").strip()
@@ -294,7 +304,12 @@ def _migrate(raw: dict) -> dict:
 
 
 def _write(model: dict) -> None:
-    _PERM_FILE.write_text(json.dumps(model, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 2026-10-03 修复：原来是裸 write_text（先 truncate 再写），写入途中崩溃会留下
+    # 半截 JSON → 下次 load_model 读失败 → 又触发种子覆写 → 整套权限被永久抹掉。
+    # 改用「同目录临时文件 + 原子替换」，与 database.py 的 _write_text_atomic 同一思路。
+    tmp = _PERM_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(model, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, _PERM_FILE)
 
 
 def load_model(refresh: bool = False) -> dict:
@@ -304,12 +319,32 @@ def load_model(refresh: bool = False) -> dict:
         if _cache is not None and not refresh:
             return _cache
         raw = None
+        # 2026-10-03 修复：原实现把「文件读不出来」（被占用/半截 JSON/磁盘错误）与
+        # 「文件确实是空的」当同一件事 —— 任何一次读失败都会用 _seed_model() 覆写磁盘，
+        # 管理员配的列 deny、行过滤、user_grants 全部消失，被替换成只含
+        # admin/viewer/region_manager 的种子模型。丢 deny 意味着敏感列从「无权访问」
+        # 变成「明文可见」，权限是往**放宽**方向静默滑坡的。
+        # 现在：读失败时绝不覆写用户文件；有内存缓存就继续用旧模型，没有才退回种子
+        # 且不落盘（并显式告警）。
+        read_failed = False
         if _PERM_FILE.exists():
             try:
                 raw = json.loads(_PERM_FILE.read_text(encoding="utf-8"))
-            except Exception:
+            except FileNotFoundError:
                 raw = None
+            except Exception as e:
+                read_failed = True
+                print(f"[perm-model] 读取 {_PERM_FILE} 失败（{e}）：沿用内存缓存，不覆写权限文件")
+        if read_failed:
+            model = _cache if _cache is not None else _seed_model()
+            if _cache is not None:
+                return _cache
+            # 没有任何可用模型：返回种子供本次请求使用，但**不落盘**，
+            # 避免把用户文件覆盖成种子
+            _cache = model
+            return model
         if not isinstance(raw, dict) or not raw:
+            # 仅在「文件确实不存在/为空」时播种
             model = _seed_model()
             _write(model)
         elif int(raw.get("version") or 1) >= MODEL_VERSION and "policies" in raw:

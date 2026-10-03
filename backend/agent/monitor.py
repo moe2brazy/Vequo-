@@ -139,8 +139,17 @@ def check_rule(rule: dict) -> dict | None:
     rule["last_error"] = ""
     val = _first_value(r)
     prev = rule.get("last_value")
+    # 2026-10-03 修复：原代码先 `rule["last_value"] = val` 再判空 ——
+    # SQL 成功但结果为空/非数值（当天表还没写入、监控 SQL 取的是 MAX(date) 等）时
+    # val 为 None，把上一轮的有效基线**抹掉**，随后 `prev is None` 分支又把它当成
+    # 「首次运行只建立基线」：这一次异动被静默吞掉，对 10 分钟一轮的监控来说
+    # 用户可能整整 20 分钟收不到告警，而界面「最近异动」是空的，看起来像「没检测到问题」。
+    # 现在：取不到数值时保留原基线，并记录原因，本轮跳过对比。
+    if val is None:
+        rule["last_error"] = "查询成功但未取到数值（结果为空或非数值），本轮跳过对比"
+        return None
     rule["last_value"] = val
-    if val is None or prev is None or prev == 0:
+    if prev is None or prev == 0:
         return None  # 首次运行只建立基线 / 无量纲不可比
     change_pct = (val - prev) / abs(prev) * 100
     try:

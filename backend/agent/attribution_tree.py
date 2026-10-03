@@ -292,7 +292,13 @@ def build_attribution_tree(query: str, sql_result: dict,
         # 避免因口径差异（如主指标含子节点未覆盖的部分）导致加总不等于 100%。
         denom = sum(abs(c["delta"]) for c in additive_children)
         for c in additive_children:
-            c["contribution_pct"] = round(abs(c["delta"]) / denom * 100, 2) if denom else 0.0
+            # 2026-10-03 修复：原实现用 abs(delta) 算贡献度，导致贡献度全为正——
+            # 「不良数上升 200」被标成「正贡献 60%」，符号与业务含义相反
+            #（tree_to_text 会渲染成「投入量 -500（贡献 60%）」这种自相矛盾的表述）。
+            # 现在分两栏：contribution_pct 带符号（正=推高主指标，负=反向拖累），
+            # contribution_abs_pct 是绝对值占比，供前端画条形用，两者加总仍是 100%。
+            c["contribution_pct"] = round(c["delta"] / denom * 100, 2) if denom else 0.0
+            c["contribution_abs_pct"] = round(abs(c["delta"]) / denom * 100, 2) if denom else 0.0
         # 比率节点不参与加和，明确标记，避免前端把它混进贡献度求和
         for c in ratio_children:
             c["contribution_pct"] = None
@@ -338,9 +344,15 @@ def tree_to_text(root: dict, periods: list[str] | None = None) -> str:
     dims = [c for c in root.get("children", []) if c.get("kind") == "dimension"]
 
     if additive:
-        lines.append("加性指标贡献（可加和，加总 100%）：")
-        for c in sorted(additive, key=lambda x: -(x.get("contribution_pct") or 0)):
-            lines.append(f"· {c['name']}: {c['delta']:+,.0f}（贡献 {c.get('contribution_pct')}%）")
+        # 2026-10-03：contribution_pct 现在带符号（正=推高主指标，负=反向拖累），
+        # 故按绝对值占比排序（用户最关心"谁影响最大"），并对负值明确标注方向，
+        # 避免出现「投入量 -500（贡献 60%）」这种符号与业务含义相反的表述。
+        lines.append("加性指标贡献（可加和，绝对值占比合计 100%；负贡献表示反向拖累）：")
+        for c in sorted(additive, key=lambda x: -(x.get("contribution_abs_pct")
+                                                   or abs(x.get("contribution_pct") or 0))):
+            _cp = c.get("contribution_pct")
+            _dir = "（反向拖累）" if (_cp is not None and _cp < 0) else ""
+            lines.append(f"· {c['name']}: {c['delta']:+,.0f}（贡献 {_cp}%{_dir}）")
     if ratio:
         lines.append("比率指标变动（不可加和，仅作解释因素）：")
         for c in ratio:

@@ -802,7 +802,12 @@ def _resolve_drill(query: str, metric: dict, fact: str, dims: list[str]) -> tupl
             # （产线的父级是车间），若放行会生成把停机原因当车间用的错误过滤。
             # 这里按父级维度的注册列（含 JOIN 展示列）做精确匹配，两张都不匹配就放弃下钻，
             # 退回普通聚合（宁可少做一层下钻，不可生成语义错误的 WHERE）。
-            if val and _drill_value_belongs(val, metric, hierarchy[idx - 1]):
+            # 2026-10-03 修复：原传的是 metric（指标注册项，其 dims 是**字符串列表**），
+            # 而 _drill_value_belongs 期望的是 _FACT_META 那种 {"dims": {维度: 配置}}
+            # 结构 → 内部 .get 抛 AttributeError 被 746 行 except 吞掉恒返回 True，
+            # 使上面注释郑重声明的「父级值归属校验」这道守卫**完全失效**。
+            if val and _drill_value_belongs(val, _FACT_META.get(fact) or {},
+                                            hierarchy[idx - 1]):
                 return dim, {"filter_value": val, "parent_level": hierarchy[idx - 1]}
         # 下钻词：切到下一级（「各产线的产量，下钻到设备」等）
         if _DRILL_DOWN_RE.search(query) and idx + 1 < len(hierarchy):
@@ -1054,15 +1059,20 @@ def _compare_ranges(query: str, anchor: str, time_col: str, is_yoy: bool):
     m = re.search(r"近\s*(\d+)\s*天", query)
     if m:
         n = int(m.group(1))
-        cur_gte = f"{time_col} >= {anchor} - INTERVAL '{n} days'"
+        # 2026-10-03 修复（期长对齐，与下方「本月」分支同一口径）：原实现本期是
+        # [anchor-n, anchor] 闭区间 = n+1 个日历日，对比期却是 [anchor-2n, anchor-n)
+        # = n 日，两期不等长 → 「近30天产量环比」恒定偏高约 1/30（数据不波动时
+        # 也会显示一个稳定的假涨幅，比明显错答更难发现）。
+        # 现在两期统一为 n 天（都含锚点当日）。
+        cur_gte = f"{time_col} >= {anchor} - INTERVAL '{n - 1} days'"
         cur_lt = f"{time_col} <= {anchor}"
         if is_yoy:
-            prev_gte = f"{time_col} >= {anchor} - INTERVAL '{n} days' - INTERVAL '1 year'"
+            prev_gte = f"{time_col} >= {anchor} - INTERVAL '{n - 1} days' - INTERVAL '1 year'"
             prev_lt = f"{time_col} <= {anchor} - INTERVAL '1 year'"
             prev_label = f"去年同{n}天"
         else:
-            prev_gte = f"{time_col} >= {anchor} - INTERVAL '{2 * n} days'"
-            prev_lt = f"{time_col} < {anchor} - INTERVAL '{n} days'"
+            prev_gte = f"{time_col} >= {anchor} - INTERVAL '{2 * n - 1} days'"
+            prev_lt = f"{time_col} < {anchor} - INTERVAL '{n - 1} days'"
             prev_label = f"前{n}天"
         return cur_gte, cur_lt, prev_gte, prev_lt, prev_label
     if "本月" in query or "这个月" in query:
@@ -1459,8 +1469,12 @@ def compile_period_compare(query: str) -> dict | None:
     time_col = _FACT_TIME_COL[fact]
     if _detect_dim(query, fact):
         return None  # 有维度分组的对比 → LLM（仅总体对比）
-    expr = _pg_numeric(m.get("sql_expression") or "")
-    if not expr:
+    # 2026-10-03 修复：本入口原先只调 _pg_numeric，漏掉 _resolve_expr —— 而注册表里
+    # 「标准良率」的 sql_expression 正是候选语法 {standard_yield_rate|std_yield_rate}，
+    # 花括号会原样进 SQL 报语法错；又因返回非 None 不回退 LLM，整条查询直接失败。
+    # 与其余编译入口（2223 等）保持同一顺序，并补安全校验兜底。
+    expr = _pg_numeric(_resolve_expr(m.get("sql_expression") or "", fact))
+    if not expr or not _safe_metric_expr(expr):
         return None
     name = m["name"].split("(")[0].strip()
     unit = m.get("unit", "")
