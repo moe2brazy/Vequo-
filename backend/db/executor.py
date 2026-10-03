@@ -158,11 +158,39 @@ _BLOCKED_KEYWORDS = re.compile(
     r"LOCK|UNLOCK|COPY|LOAD|DUMP|RESTORE|REFRESH)\b",
     re.IGNORECASE,
 )
-# 危险函数：睡眠/锁定/文件操作等（防 DoS 与提权）
+# 危险函数：睡眠/锁定/文件操作/跨库访问等（防 DoS、提权与数据外泄）
+# 2026-10-03 补齐（原清单缺以下高危项，均为"SELECT 开头 + 无黑名单词"即可绕过）：
+#   dblink / dblink_exec —— 跨库读取任意数据。可直连内网其他库并带出账号密码，
+#       绕过本库所有表级/列级/行级权限（本项目护栏完全失效）。危害最高。
+#   pg_read_binary_file / pg_stat_file / pg_ls_dir —— 读服务器文件、目录枚举。
+#   set_config —— 可在查询里改 GUC（含 statement_timeout、role 等会话设置）。
+#   pg_notify / pg_rotate_logfile —— 副作用写入。
+#   query_to_xml / table_to_xml —— 部分场景可探测 schema。
+#   xp_cmdshell / sp_oacreate —— MySQL 侧命令执行。
+#   into outfile/dumpfile 原有，但因整条 alternation 末尾带 `\s*\(`，
+#   导致 "INTO OUTFILE '/tmp/x'"（后面是字符串字面量而非左括号）匹配不到 —— 已在下方
+#   单独补一条不依赖 `\s*\(` 的正则。
 _BLOCKED_FUNCS = re.compile(
-    r"\b(pg_sleep|pg_sleep_for|pg_sleep_until|pg_advisory_lock|pg_advisory_xact_lock|"
-    r"pg_cancel_backend|pg_terminate_backend|pg_write_file|pg_read_file|"
-    r"lo_import|lo_export|load_file|into\s+outfile|benchmark|sleep|shutdown)\s*\(",
+    r"\b(dblink|dblink_exec|dblink_open|dblink_fetch|dblink_send_query|"
+    r"pg_read_file|pg_read_binary_file|pg_ls_dir|pg_stat_file|pg_ls_logdir|"
+    r"pg_logdir_ls|pg_write_file|pg_rotate_logfile|pg_notify|"
+    r"pg_sleep|pg_sleep_for|pg_sleep_until|"
+    r"pg_advisory_lock|pg_advisory_xact_lock|"
+    r"pg_cancel_backend|pg_terminate_backend|pg_reload_conf|"
+    r"set_config|current_setting|"
+    r"lo_import|lo_export|load_file|benchmark|sleep|shutdown|"
+    r"xp_cmdshell|sp_oacreate|sp_executesql|"
+    r"query_to_xml|table_to_xml)\s*\(",
+    re.IGNORECASE,
+)
+# 文件写出：不带 `\s*\(` 约束，单独匹配（否则 "INTO OUTFILE '/path'" 逃逸）
+_BLOCKED_FILE_WRITE = re.compile(
+    r"\bINTO\s+(OUTFILE|DUMPFILE)\b",
+    re.IGNORECASE,
+)
+# PG 的 SELECT ... INTO newtable（建表，无任何写操作关键词，会被 SELECT 开头规则放行）
+_BLOCKED_SELECT_INTO = re.compile(
+    r"\bSELECT\b[\s\S]*?\bINTO\s+[A-Za-z_][A-Za-z0-9_.\"]*\s*(,|FROM\b|FROM\s)",
     re.IGNORECASE,
 )
 # 分号拼接多条语句：分号后还有非空白内容（允许结尾分号）
@@ -229,6 +257,15 @@ def _check_sql_safety(sql: str) -> str | None:
         return "SQL 包含被禁止的写操作/管理语句"
     if _BLOCKED_FUNCS.search(s_stripped):
         return "SQL 包含被禁止的危险函数"
+    # 2026-10-03 补三条（原先均可绕过）：
+    # ① INTO OUTFILE/DUMPFILE 任意文件写 —— 旧正则整条 alternation 末尾带 `\s*\(`，
+    #    而 OUTFILE 后接的是字符串字面量（已被替换为 'x'）而非左括号 → 匹配不到。
+    if _BLOCKED_FILE_WRITE.search(s_stripped):
+        return "禁止 SELECT ... INTO OUTFILE/DUMPFILE（任意文件写）"
+    # ② PG 的 SELECT ... INTO newtable 建表 —— 不含任何写操作关键词，能通过
+    #    "仅允许 SELECT 开头" 这条检查，留下影子表占用资源。
+    if _BLOCKED_SELECT_INTO.search(s_stripped):
+        return "禁止 SELECT ... INTO（建表）"
     # LIMIT 取值校验：拒绝负数（PG 中 LIMIT -1 语义为「无限制」会全量排序）与超大/非法值，
     # 防止 LLM 幻觉的 LIMIT 绕过 fetchmany 前的数据库端提前停止，长时间占用数据库。
     # 校验**所有** LIMIT（多个/嵌套 CTE 里的都要查，防第一个合法后面越界的绕过）；

@@ -404,6 +404,11 @@ def _build_pareto(table: str, tlab: str, fields: list[dict]) -> dict | None:
     if len(data) < 2:
         return None
     total = sum(x["value"] for x in data)
+    # 2026-10-03 修复（P2）：与 _build_sunburst 的 `if not total` 同类漏网兄弟 ——
+    # 全部行数值为 0 时 total==0，下面 cum_top/total 直接 ZeroDivisionError，
+    # 被上层 `except Exception: c = None` 吞掉 → 帕累托图静默消失。
+    if not total:
+        return None
     top_k, cum_top = 0, 0.0
     for i, x in enumerate(data, 1):
         cum_top += x["value"]

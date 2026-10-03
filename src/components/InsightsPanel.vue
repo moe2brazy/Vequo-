@@ -53,7 +53,18 @@ const BLIND_LABEL: Record<string, string> = {
 // 现在加请求序号守卫：只有最新一次请求能写状态。
 let loadSeq = 0
 async function load(which: Tab, force = false) {
-  if (loaded.value[which] && !force) return
+  // 2026-10-03 修复（P2）：已加载过的 tab 再切回来时原实现直接早退、loadSeq 不推进，
+  // 于是上一个 tab 那个还在飞的慢请求（/api/insights/scan 实测 12s，比 blind-spots
+  // 慢一个数量级）依然非 stale、仍持有 loading=true；而 loading 是**跨 tab 共享的
+  // 单值**、模板 `v-if="loading"` 不看当前 tab → 洞察数据明明已加载好，却被 12 秒的
+  // 「正在扫描维度组合…」整块盖住，点刷新都没用（v-else-if 优先级最高）。
+  // 与 10-03 修的「未加载完说成没有盲点」同类，只是方向相反。
+  // 现在早退时也推进序号：让在途慢请求作废（它本就不是当前 tab 要的），并复位 loading。
+  if (loaded.value[which] && !force) {
+    loadSeq++
+    loading.value = false
+    return
+  }
   const my = ++loadSeq
   const isStale = () => my !== loadSeq
   loading.value = true

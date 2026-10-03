@@ -384,6 +384,85 @@ def _pg_numeric(expr: str) -> str:
     return re.sub(r"(SUM|COUNT|AVG)\(([a-z_][a-z0-9_.]*)\)", r"\1(\2)::numeric", expr)
 
 
+def _split_ratio_expr(expr: str) -> tuple[str | None, str | None]:
+    """把比率型算式拆成 (分子, 分母)，用于"加权累计"而非"逐期百分比累加"。
+
+    2026-10-03 新增，配合 compile_cumulative 的比率分支：比率指标求累计时，
+    必须对分子分母分别累加后再相除（= 区间整体比率），不能把各期的百分比相加。
+
+    只处理最常见的四种形态（用 sqlglot 不可靠——注册表算式里大量中文别名与
+    已注册的中文列名，且部分形态 sqlglot 会解析失败）：
+
+        A / B            → (A, B)
+        A * 100.0 / B    → (A, B)         ← 良率的标准形态，*100 留在分子上
+        A / NULLIF(B,0)  → (A, B)         ← 去 NULLIF 包装
+        A * 100.0 / NULLIF(B,0)
+
+    拆不开（多级运算、CASE WHEN 占比等）返回 (None, None)，调用方回退 LLM ——
+    **不猜**，猜错会静默产出错误口径。
+    """
+    s = (expr or "").strip()
+    if not s or "/" not in s:
+        return None, None
+    # 去掉最外层可能的括号
+    while s.startswith("(") and s.endswith(")") and _balanced(s[1:-1]):
+        s = s[1:-1].strip()
+    if "/" not in s:
+        return None, None
+
+    # 找**顶层**除号（不在括号内、不在 NULLIF( ) 的参数位）
+    depth = 0
+    idx = -1
+    for i, ch in enumerate(s):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "/" and depth == 0:
+            idx = i
+            break
+    if idx < 0:
+        return None, None
+
+    num, den = s[:idx].strip(), s[idx + 1:].strip()
+    # 分子末尾的 * 100 / 100.0 / *100.0 保留（百分比语义），但要去掉悬空的乘号
+    num = re.sub(r"[\s*]+$", "", num).strip()
+    if num.endswith("*"):
+        num = num[:-1].strip()
+    # 分子若为纯 100.0（说明原式是 100.0/X），百分比应由调用方另行处理，这里直接判失败
+    if not num or re.fullmatch(r"[\d.]+", num):
+        return None, None
+    # 分母：剥掉 NULLIF(x, 0) → x
+    m = re.fullmatch(r"NULLIF\s*\(\s*(.+?)\s*,\s*0\s*\)", den, re.I | re.S)
+    if m:
+        den = m.group(1).strip()
+    # 允许的形态：纯聚合式 / COALESCE 包裹 / 带 ::numeric 后缀的上述两者。
+    # ⚠️ 不能要求「整串只有一个右括号」—— _pg_numeric 会给每个 SUM/COUNT/AVG 加
+    # ::numeric 后缀，`SUM(a)::numeric / SUM(b)::numeric` 有两个右括号，
+    # 用 `[^()]*` 会导致这条最常见形态被判拆不开（实测踩到过）。
+    if not re.fullmatch(
+            r"(?:SUM|COUNT|AVG|COALESCE)\s*\([^()]*(?:\([^()]*\)[^()]*)*\)(?:\s*::\s*\w+)?"
+            r"|COUNT\s*\(\s*\*\s*\)(?:\s*::\s*\w+)?",
+            den.strip(), re.I):
+        return None, None
+    if not den or not _safe_metric_expr(num) or not _safe_metric_expr(den):
+        return None, None
+    return num, den
+
+
+def _balanced(s: str) -> bool:
+    """括号是否配平（用于剥最外层括号）。"""
+    d = 0
+    for ch in s:
+        if ch == "(":
+            d += 1
+        elif ch == ")":
+            d -= 1
+            if d < 0:
+                return False
+    return d == 0
+
+
 def _agg_override(expr: str, query: str) -> str:
     """按问句中的最高级/平均词覆盖聚合函数（仅对「单一 SUM(col)」形态生效）。
 
@@ -398,12 +477,26 @@ def _agg_override(expr: str, query: str) -> str:
     「总产量最大」（SUM 分组后取最大），覆盖成 MAX(单行) 会返回「单日产量最大」的
     错误答案（v2 题库独立双跑抓到：库存量最大的产品/产量最大的产线 数值不一致）。
     """
-    m = re.fullmatch(r"SUM\(([a-zA-Z_][a-zA-Z0-9_]*)\)", (expr or "").strip())
-    if not m:
-        return expr
-    col = m.group(1)
-    if re.search(r"平均|均值|平均值", query):
-        return f"AVG({col})"
+    # 2026-10-03 修复（P1）：原 fullmatch 只认**裸列名** `SUM(col)`，注册表里绝大多数
+    # 口径写成 `SUM(COALESCE(good_qty, 0))` 形态 → 不匹配就静默原样返回，
+    # 于是「平均」对这类口径完全失效。实测同一句式两种答案：
+    #   「各产线的平均合格数」→ SUM(COALESCE(good_qty,0))（几十万级，实际是合计）
+    #   「各产线的平均不良数」→ AVG(defect_qty)（个位数级，正确均值）
+    # 「合格数量」与「不良数」在注册表里紧邻、口径对称，只因写法差异就分叉。
+    # 现在把 SUM 的参数归一为一个裸列名再判断，两种写法都能识别：
+    #   SUM(good_qty)             → good_qty
+    #   SUM(COALESCE(good_qty,0)) → good_qty
+    #   SUM(DISTINCT col)         → col（AVG(DISTINCT col) 语义等价）
+    inner = (expr or "").strip()[len("SUM("):-1].strip() if (expr or "").strip().upper().startswith("SUM(") else ""
+    if inner:
+        _c = re.sub(r"^DISTINCT\s+", "", inner, flags=re.IGNORECASE).strip()
+        _mc = re.fullmatch(r"COALESCE\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*,.*\)", _c, re.IGNORECASE)
+        if _mc:
+            _c = _mc.group(1)
+        if re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", _c):
+            if re.search(r"平均|均值|平均值", query):
+                return f"AVG({_c})"
+            return expr
     # 最高级词（最长/最大/最短/最小）**不再覆盖聚合函数**（2026-09-14 v4 题库题12 修复）。
     # 原白名单允许 downtime_minutes 被覆盖成 MAX/MIN，但「停机时长最长的设备」正确语义是
     # **按设备分组后 SUM 取最大**（累计停机最久），覆盖成 MAX(downtime_minutes) 返回的是
@@ -416,14 +509,49 @@ def _agg_override(expr: str, query: str) -> str:
 # 编译期表达式白名单：只允许聚合函数/列引用/算术/比较/NULLIF/COALESCE/CASE 与数字等，
 # 出现任何 SQL 注入特征（分号、注释、引号闭合、子查询）一律返回 None 回退 LLM（宁可不编）。
 _EXPR_SAFE_RE = re.compile(r"^[\w\s().,+\-*/%<>=:'_|]*$")
-_EXPR_FORBIDDEN_RE = re.compile(r";|--|/\*|\*/|\b(?:SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|UNION)\b", re.IGNORECASE)
+# 2026-10-03 修复（P0）：WHERE/GROUP BY/HAVING/ORDER BY/LIMIT 等子句关键字补入黑名单。
+# 原黑名单只拦 DML/DDL 与注释，导致 `COUNT(*) WHERE result='fail'`（metric_miner 的
+# 展示串被误存进注册表 sql_expression）被判定为安全 → 编译出
+# `SELECT COUNT(*) WHERE result='fail' AS "…" FROM t`（COUNT 与 WHERE 之间缺逗号）
+# → PG 语法错，且因为「编译成功」而不回退 LLM、无任何日志。
+# 指标算式只能是聚合表达式，出现子句关键字一律拒绝。
+_EXPR_FORBIDDEN_RE = re.compile(
+    r";|--|/\*|\*/|\b(?:SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|GRANT|REVOKE"
+    r"|WHERE|GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT|OFFSET|JOIN|UNION)\b", re.IGNORECASE)
+
+# 2026-10-03 追加：黑名单里的裸 SELECT 关键字过严 —— 它把**聚合标量子查询**
+# （`MAX(col)`，无注入面）一并拦掉了。实测后果：内置指标「库存量」为了只取最新
+# 快照日必须写成
+#   SUM(CASE WHEN snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot)
+#            THEN available_qty ELSE 0 END)
+# 而这会被判为不安全 → 该口径在走表达式校验的路径时被直接拒绝。
+#
+# 现在的判据：先剥掉**受限形态**的聚合标量子查询
+#   `(SELECT <聚合函数>(<单列>) FROM <单标识符>)`
+# 剩下的部分再套「任何 SELECT 一律拒绝」。这样：
+#   · `(SELECT MAX(d) FROM t)`        → 剥掉 → 放行（无注入面：只能是聚合+单列+单表）
+#   · `(SELECT password FROM users)`   → 剥不掉 → 拒绝
+#   · `SUM((SELECT x FROM secrets))`   → 剥不掉 → 拒绝
+#   · `SUM(a) UNION SELECT b FROM t`   → 剥不掉 → 拒绝
+# 白名单 _EXPR_SAFE_RE 仍会挡住引号闭合等注入特征，两层独立生效。
+_EXPR_SCALAR_SUBQUERY_RE = re.compile(
+    r"\(\s*SELECT\s+(?:MAX|MIN|COUNT|SUM|AVG)\s*\(\s*[A-Za-z_][A-Za-z0-9_]*\s*\)"
+    r"\s+FROM\s+[A-Za-z_][A-Za-z0-9_]*\s*\)", re.IGNORECASE)
 
 
 def _safe_metric_expr(expr: str) -> bool:
-    """判断指标表达式是否可安全编译（防注入）。"""
-    if not expr or _EXPR_FORBIDDEN_RE.search(expr):
+    """判断指标表达式是否可安全编译（防注入）。
+
+    2026-10-03：先剥掉受限形态的聚合标量子查询 `(SELECT MAX(col) FROM tbl)`
+    （内置「库存量」口径用它表达「只取最新快照日」，无注入面），
+    剩余部分不允许出现任何 SELECT / DML / DDL / 子句关键字。
+    """
+    if not expr:
         return False
-    return bool(_EXPR_SAFE_RE.fullmatch(expr))
+    probe = _EXPR_SCALAR_SUBQUERY_RE.sub(" ", expr)
+    if _EXPR_FORBIDDEN_RE.search(probe):
+        return False
+    return bool(_EXPR_SAFE_RE.fullmatch(probe))
 
 
 def _detect_dim(query: str, fact_table: str) -> list[str]:
@@ -1027,13 +1155,42 @@ def compile_cumulative(query: str) -> dict | None:
     else:
         return None
 
-    sql = (
-        f"WITH base AS ("
-        f"SELECT to_char(f.{time_col}, '{fmt}') AS \"{period_label}\", {expr} AS v "
-        f"FROM {fact} f WHERE {where} GROUP BY 1) "
-        f'SELECT "{period_label}", SUM(v) OVER (ORDER BY "{period_label}") AS "{name}(累计)" '
-        f'FROM base ORDER BY "{period_label}" LIMIT 200'
-    )
+    # 2026-10-03 修复（P0）：比率型指标**不能**用 SUM(v) OVER 累加。
+    # 原实现把 m["sql_expression"] 原样放进 base 的 v，再对 v 求窗口累加：
+    #   良率 = SUM(good_qty)*100.0/NULLIF(SUM(input_qty),0)   ← 每月都是百分比
+    #   → SUM(v) OVER (...) 逐月把百分比加起来
+    #   → 5 个月各 97% 累加成 485%，12 月累成 1164%
+    # 表现为「良率(累计)」一列一路涨到 1000%+，数字格式完全正常、有图有点，
+    # 且走「确定性编译零 LLM」的可信通道 —— 用户几乎不可能认为这是错的。
+    #
+    # 修法：比率型（算式含除号，或 unit 是 %）改用**加权累计**：
+    # 分子分母各自窗口累加后再相除，等价于「区间内整体良率」，
+    # 这才是「本年累计良率」在业务上真正要的数（分子分母同区间，非各月百分比平均）。
+    is_ratio = bool(re.search(r"/", expr)) or (m.get("unit") or "").strip() in ("%", "％")
+    if is_ratio:
+        num, den = _split_ratio_expr(expr)
+        if not num or not den:
+            # 拆不出分子分母（如 CASE WHEN 占比）→ 不猜，直接回退 LLM
+            return None
+        sql = (
+            f"WITH base AS ("
+            f"SELECT to_char(f.{time_col}, '{fmt}') AS \"{period_label}\", "
+            f"{num} AS vn, {den} AS vd "
+            f"FROM {fact} f WHERE {where} GROUP BY 1) "
+            f'SELECT "{period_label}", '
+            f'SUM(vn) OVER (ORDER BY "{period_label}") '
+            f'/ NULLIF(SUM(vd) OVER (ORDER BY "{period_label}"), 0) AS "{name}(累计)" '
+            f'FROM base ORDER BY "{period_label}" LIMIT 200'
+        )
+    else:
+        # 可加型（产量/不良数/工单数…）沿用原有逐期累加
+        sql = (
+            f"WITH base AS ("
+            f"SELECT to_char(f.{time_col}, '{fmt}') AS \"{period_label}\", {expr} AS v "
+            f"FROM {fact} f WHERE {where} GROUP BY 1) "
+            f'SELECT "{period_label}", SUM(v) OVER (ORDER BY "{period_label}") AS "{name}(累计)" '
+            f'FROM base ORDER BY "{period_label}" LIMIT 200'
+        )
     mql = {
         "metric": name,
         "metric_key": m.get("name"),
@@ -1237,7 +1394,15 @@ def compile_window_rank(query: str) -> dict | None:
     rn = 1
     if (mm := _WIN_RN_RE.search(query)):
         g = mm.group(1)
-        rn = int(g) if g.isdigit() else _CN_NUM.get(g, 1)
+        # 2026-10-03 修复（P0）：原写作 `_CN_NUM.get(g, 1)`，而 _CN_NUM 是**单字**字典
+        # （{"一":1,...,"十":10}），`_WIN_RN_RE` 却能匹配到「十一」「二十」。
+        # 实测：问「第十一高」「第十二高」「第十九高」「第二十高」→ .get() 查不到 → 静默
+        # 返回 1 → SQL 里生成 `WHERE rn = 1`，**用户问第 11/20 名、系统返回第 1 名**，
+        # 且行数正确、0.1s 速出、零 LLM，是典型的高置信错答。
+        # 本文件已有一个正确的 `_cn_num()`（实测 十一→11 十二→12 十九→19 二十→20
+        # 三十二→32 两→2），直接复用，避免再造第三套实现。
+        rn = int(g) if g.isdigit() else (_cn_num(g) or 1)
+
     # 组装：外层/内层各独立 JOIN（同一张维度表复用 alias），度量 + 窗口
     joins: list[str] = []
     group_exprs: list[str] = []
@@ -1411,10 +1576,14 @@ def compile_period_diff(query: str) -> dict | None:
 
     if is_list:
         cur_label, prev_label = f"{cur_m}月", f"{prev_m}月"
+        # 2026-10-03 修复（P1）：列名原来硬编码「产量」，与本次编译的指标无关。
+        # 实测三种指标全部错标：问「不良数」/「投入量」/「停机时长」，列名都是
+        # 「6月产量/7月产量」，而 title 写的是「不良数分月对比」—— 数值与列名
+        # 指向完全不同的业务量，演示时极其刺眼。改为按本次指标名命名。
         sql = (
             f"WITH m AS (SELECT {dim_col} AS \"{dim}\", {cur_agg} AS m_cur, {prev_agg} AS m_prev "
             f"FROM {from_clause} GROUP BY {group}) "
-            f"SELECT \"{dim}\", m_cur AS \"{cur_label}产量\", m_prev AS \"{prev_label}产量\" "
+            f"SELECT \"{dim}\", m_cur AS \"{cur_label}{name}\", m_prev AS \"{prev_label}{name}\" "
             f"FROM m ORDER BY \"{dim}\""
         )
         return {
@@ -1848,6 +2017,208 @@ def compile_multi_fact_bridge(query: str) -> dict | None:
     return None
 
 
+# ── Pearson 相关性（2026-10-03）────────────────────────────────────
+# 「分析 A 和 B 是否相关」此前被 _suppress_multi_metric_compile 拦下 → 回退 LLM 三轮改写，
+# 实测 72~131s，且最终答案的解读文本完全跑偏（把「相关系数」当普通数值列去排名，
+# 输出「统计天数最高的是 L04」这种与相关性无关的结论）。
+#
+# 本编译器把这类问法收敛成一条确定性 SQL：按 [维度 × 日期] 配对两个事实表的聚合值，
+# 交给 PG 的 CORR()（即 Pearson 积矩相关，数学定义与 numpy.corrcoef 逐位一致，已对拍验证）。
+#
+# 为什么必须零 LLM：
+#   ① 耗时：CORR 由数据库算，实测 2ms，替代 72~131s 的 LLM 生成+改写+重查链；
+#   ② 正确性：LLM 产出的 GROUPING SETS 写法把「全部产线」汇总行混进明细行，
+#      解读层又按「统计天数」排序，结论与问题无关；确定性编译杜绝这类漂移。
+#
+# 口径（严格约定，任何一条不满足即 return None 回退 LLM，绝不硬编）：
+#   ① 问句必须是**两个已注册指标**的**线性相关**问法（Pearson 只刻画线性关系，
+#      问「是否存在关系」而不限定线性时，本编译器不接管 → 交 LLM，避免把
+#      「非线性相关」误答成「无相关」）；
+#   ② 两个指标必须落在**不同事实表**（同表双指标走普通编译的关系补全路径）；
+#   ③ 两表必须能通过**同一维度 + 同一日期**配对（无公共维度/无时间列 → 无法配对）；
+#   ④ 配对单元 = 维度值 × 日期。选它而非「维度值」：实测 5 条产线按维度聚合只有
+#      n=5，Pearson 在 n<10 时极不稳定；按 [产线×日] 配对实测 n=171，结论稳��。
+#   ⑤ 输出**必须含样本量 n 与 t 统计量**。只给 r 是危险的误导：实测全局 r=0.0629
+#      若不配 n=171 / t=0.82，用户会读成「几乎不相关」——结论其实对，但缺了
+#      「样本量足够、方向为正」这一层；更关键的是 n 极小时 r 完全不可信。
+# 未点名维度时的配对维度优先级（产线 → 设备 → 产品 → 工序；**不含车间**）。
+# 为什么车间排在产线之后（2026-10-03 实测后修正，初版曾把车间放首位）：
+#   实测 yans 库 3 个车间 / 5 条产线，车间维度虽然多合并了一层，但每组 n 反而
+#   与产线维度相当（30~44 vs 30~38），并没有换来稳定性收益；更关键的是它把结论
+#   口径从「产线级」偷换成「车间级」——用户问「停机时长和不良率是否相关」时，
+#   默认期望的是最细的可配对粒度，向上折叠会丢失信息且与展示层的产线口径不一致。
+#   产线是本演示库两表共有、基数适中、且与前端其他分析页口径一致的最优配对单元。
+_PEARSON_AUTO_DIM_PRIORITY = ("产线", "设备", "产品", "工序")
+
+
+def _pearson_intent(query: str) -> bool:
+    """是否为**线性**相关性问法（Pearson 的适用语义）。"""
+    # 显式线性限定词 → 强意图
+    if re.search(r"线性相关|皮尔逊|pearson|相关系数|相关性系数", query, re.IGNORECASE):
+        return True
+    # 泛化的「是否相关/有没有关系」——只有带明确比较对象（A 和 B 的关系）才接管。
+    # 「是否存在关系」这类不限定线性的问法不接管（见上方口径①）。
+    if re.search(r"是否.{0,12}(?:相关|有关|关联)|有没有.{0,12}(?:关系|关联|相关)|"
+                 r"(?:相关|关联|关系)(?:性)?(?:如何|强不强|大不大)|相不相关", query):
+        # 必须同时出现两个不同指标名（由调用方 find_metrics 判定），这里只管语义
+        return True
+    return False
+
+
+def compile_pearson(query: str) -> dict | None:
+    """「A 与 B 是否相关」→ 确定性 Pearson 相关性 SQL（零 LLM）。
+
+    产物形态（已对拍 numpy 验证 r 与 t 逐位一致）：
+        SELECT <维度> AS "维度", COUNT(*) AS "样本量",
+               CORR(<指标A>, <指标B>) AS "pearson相关系数",
+               r*SQRT((n-2)/(1-r^2)) AS "t统计量"
+        FROM [两表按 维度×日期 聚合后 INNER JOIN] GROUP BY 维度
+    """
+    if get_db_type() == "mysql":
+        return None  # CORR 是 PG 函数；MySQL 无等价内建，交给 LLM
+    q = str(query or "")
+    if not q or not _pearson_intent(q):
+        return None
+    try:
+        from agent.metric_registry import find_metrics
+        hits = find_metrics(q)
+    except Exception:
+        return None
+    # 口径②：必须恰好两个指标（1 个不是相关；3 个以上相关矩阵编译不了）
+    if len(hits) != 2:
+        return None
+    facts: list[str] = []
+    exprs: list[str] = []
+    infos: list[dict] = []
+    for m in hits:
+        tables = m.get("tables") or []
+        if len(tables) != 1 or tables[0] not in _COMPILABLE_TABLES:
+            return None
+        fact = tables[0]
+        # 口径③：两表都必须有可配对的时间列
+        if not _FACT_META[fact].get("time_col"):
+            return None
+        expr = _pg_numeric(_resolve_expr(m.get("sql_expression") or "", fact))
+        if not expr or not _safe_metric_expr(expr):
+            return None
+        mname = m["name"].split("(")[0].strip()
+        if not mname or not re.fullmatch(r"[A-Za-z0-9_一-龥 ]+", mname):
+            return None
+        facts.append(fact)
+        exprs.append(expr)
+        infos.append({"name": mname, "unit": m.get("unit", ""), "key": m.get("name")})
+    # 口径②：同表双指标走普通编译的关系补全（2354 行），不重复接管
+    if len(set(facts)) != 2:
+        return None
+
+    # 口径③：找两表公共维度，且都必须是「直接分组」或同表 JOIN 列。
+    # 排除 via 维度（两跳桥接会放大行数，配对语义不可靠 → 交给 LLM）。
+    common = [d for d in _detect_dim(q, facts[0]) if d in set(_detect_dim(q, facts[1]))]
+    # 问句未点名维度时（「分析停机时间和不良率是否相关」没有任何「各X/按X」信号，
+    # _detect_dim 返回 []）：按 _PEARSON_AUTO_DIM_PRIORITY 挑一个两表共有的维度
+    # 作为**配对单元**（产线优先，见常量处实测结论）。
+    if not common:
+        for cand in _PEARSON_AUTO_DIM_PRIORITY:
+            if (cand in _FACT_META[facts[0]].get("dims", {})
+                    and cand in _FACT_META[facts[1]].get("dims", {})):
+                common = [cand]
+                break
+    if not common:
+        return None
+    dim = None
+    dimdef: dict | None = None
+    for cand in sorted(common, key=len, reverse=True):
+        defs = []
+        ok = True
+        for ft in facts:
+            raw_def = _FACT_META[ft].get("dims", {}).get(cand)
+            if not raw_def:
+                ok = False
+                break
+            dd = _resolve_dim_def(ft, raw_def)
+            if dd.get("via") or not dd.get("fact_col"):
+                ok = False
+                break
+            defs.append(dd)
+        if ok:
+            dim, dimdef = cand, {"defs": defs}
+            break
+    if dim is None or dimdef is None:
+        return None
+    defs = dimdef["defs"]
+
+    # 配对键：两表事实列若都是 VARCHAR 编码（如 line_id），直接按值配对；
+    # 若一侧是 JOIN 维度表展示列，两侧都 JOIN 同一张维度表后按展示列配对（更易读、跨表同义）。
+    j0 = defs[0].get("join")
+    j1 = defs[1].get("join")
+    same_dim_table = bool(j0 and j1 and j0[0] == j1[0] and j0[1] == j1[1])
+
+    def _side(i: int) -> str:
+        """单个事实表 → (按 维度×日期 聚合) 子查询。"""
+        ft, expr, info = facts[i], exprs[i], infos[i]
+        ddef = defs[i]
+        tc = _FACT_META[ft]["time_col"]
+        tf = _build_time_filter(ft, tc, q)
+        where = f" WHERE {tf}" if tf else ""
+        # 时间列统一按日截断：DATE(timestamp) 与 date 型 stat_date 对齐后才能配对
+        tday = f"DATE({tc})"
+        if j0 and j1 and same_dim_table:
+            dt, dk, disp = ddef["join"]
+            dim_expr = f"d.{disp}"
+            frm = (f"{ft} f JOIN {dt} d ON f.{ddef['fact_col']} = d.{dk}{where}")
+        else:
+            fc = ddef["fact_col"]
+            fc = fc if isinstance(fc, str) else fc[0]
+            dim_expr = f"f.{fc}"
+            frm = f"{ft} f{where}"
+        return (f"(SELECT {dim_expr} AS dk, {tday} AS dt, {expr} AS mv "
+                f"FROM {frm} GROUP BY 1, 2)")
+
+    s0, s1 = _side(0), _side(1)
+    label_a, label_b = infos[0]["name"], infos[1]["name"]
+    title = f"{label_a}与{label_b}相关性分析"
+
+    # CASE WHEN COUNT(*)>=3 THEN CORR(...) END：PG 的 CORR 少于 3 行会直接抛错
+    # （cannot calculate correlation with less than three rows），必须加保护。
+    # 已实测 n=1 / n=2 时该写法返回 NULL 且不报错。
+    _corr = 'CASE WHEN COUNT(*) >= 3 THEN CORR(a_mv::float8, b_mv::float8) END'
+    # t = r·sqrt((n-2)/(1-r²))，df = n-2。|t| 越大越显著（df=169 时 |t|>1.98 即 p<0.05）。
+    _t = (f'ROUND(({_corr} * SQRT((COUNT(*) - 2)::float8 / '
+          f'NULLIF(1 - ({_corr}) * ({_corr}), 0)))::numeric, 4)')
+
+    # 按维度分组输出：每行 = 一个维度值在其 [维度×日] 配对样本上的 Pearson r。
+    # 刻意**不输出**「全部产线」汇总行（LLM 原写法用 GROUPING SETS 加了汇总行，
+    # 解读层会把汇总行当普通维度参与排名，产出「统计天数最高的是全部产线」这类污染结论）。
+    sql = (
+        f'WITH a AS {s0}, b AS {s1}, '
+        f'paired AS (SELECT a.dk AS dim, a.mv AS a_mv, b.mv AS b_mv '
+        f'FROM a JOIN b ON a.dk = b.dk AND a.dt = b.dt '
+        f'WHERE a.mv IS NOT NULL AND b.mv IS NOT NULL) '
+        f'SELECT dim AS "维度", COUNT(*) AS "样本量", '
+        f'ROUND(({_corr})::numeric, 4) AS "pearson相关系数", '
+        f'{_t} AS "t统计量" '
+        f'FROM paired GROUP BY dim ORDER BY "pearson相关系数" DESC'
+    )
+
+    mql = {
+        "metric": f"{label_a} × {label_b}（Pearson相关性）",
+        "metric_key": f"{infos[0]['key']} × {infos[1]['key']}",
+        "metric_expression": f"CORR({label_a}, {label_b})",
+        "metric_type": "correlation",
+        "fact_table": facts, "pair_dim": dim, "pair_unit": f"{dim}×日",
+        "metrics": [label_a, label_b],
+        "value_filter": None,
+        "compiled_by": "pearson_corr",
+    }
+    return {
+        "sql": sql, "title": title,
+        "metric": f"{label_a}与{label_b}相关系数",
+        "metrics": [label_a, label_b],
+        "unit": "", "tables": facts,
+        "compiled": True, "mql": mql,
+    }
+
+
 # 双指标分析意图（2026-09-03）：find_metrics 按"最长匹配词"只保留单个指标（如「停机时长和产量」
 # 只留更长的「停机时长」），会把"X 与 Y 是否相关/对比/影响"这类**双指标分析问法压成单指标静默编译**，
 # 秒回一个与问题无关的单指标聚合（答非所问）。检测到 ≥2 个不同已注册指标 + 关系/对比/影响意图时，
@@ -2080,6 +2451,14 @@ def try_compile_metric(query: str) -> dict | None:
         )
         if not _hit_is_ratio:
             return None
+    # Pearson 相关性（「分析设备停机时间和不良率是否相关」）→ 确定性编译。
+    # 必须放在下面的 _suppress_multi_metric_compile **之前**：那个守卫会把所有
+    # 「双指标 + 相关/关系」问法一律回退 LLM（实测 72~131s，且解读文本跑偏）。
+    # 本编译器只接管「两个已注册指标 + 线性相关 + 跨表可按 [维度×日] 配对」的窄口径，
+    # 其余（泛化的「是否存在关系」、3 个以上指标、同表双指标）仍由守卫放行给 LLM。
+    _pr = compile_pearson(query)
+    if _pr:
+        return _pr
     # P0-修复（2026-09-03）：双指标相关性/对比问法禁止被压成单指标编译（见 _suppress_multi_metric_compile）
     if _suppress_multi_metric_compile(query):
         return None
@@ -2181,7 +2560,14 @@ def try_compile_metric(query: str) -> dict | None:
         return None
 
     from agent.metric_registry import find_metrics
-    hits = find_metrics(query)
+    # 2026-10-03 修复（P1）：`find_metrics` 默认 limit=3 已在**函数内部**按命中词长度
+    # 排序截断（metric_registry.py:1421 `return [...][:limit]`），所以 hits 的长度恒 ≤3，
+    # 下面的 `len(hits) > 3` 是**永远为假的死代码** —— 守卫看起来在防「多指标截断丢列」，
+    # 实际完全不生效。实测「产量、合格数量、不良数量、投入量」只返回 3 个，
+    # 被截掉的恰是词最短的「产量」（并列句式里通常是用户第一个问的主诉求），
+    # 标题还变成「合格数量与不良数与投入量查询」，确定性丢列且无提示。
+    # 现在按**真实命中总数**判断（limit=None 不截断），超限才回退 LLM。
+    hits = find_metrics(query, limit=None)
     # 2026-10-01：上限 2→3（黄金题库 id71「产量、合格数量、不良数量」三并列指标被
     # 截断丢列）。编译路径对 N 个同表指标本就是同一机制（metrics_info 循环 + proj 拼列），
     # 3 个同表指标拼 3 列与拼 2 列风险相同；跨表仍由 compile_multi_fact_bridge 接管。
@@ -2361,9 +2747,22 @@ def try_compile_metric(query: str) -> dict | None:
     # 取数：前N名 / Top-1（数值型「X最高/最低/最多/最少的是哪个」）
     limit = 20
     order_dir = "DESC"
-    m2 = re.search(r"前\s*(\d+)(?:\s*(?:名|条|个|张|家|项|台|道|种))?|TOP\s*(\d+)|最(?:大|高|多|久|长|小|低|少|短|晚|早|新|旧)\s*(?:的)?\s*(?:前)?\s*(\d+)\s*(?:个|条|名|张|批|道|台|种|家|项)?", query, re.IGNORECASE)
+    # 2026-10-03 修复（P0）：原正则只接受 `\d+`，中文数词一律落到默认 20。
+    # 实测：产量最高的前三个产品 → LIMIT 20（要 3）；产量前五的产品 → LIMIT 20（要 5）；
+    #       前3个产品的产量 → LIMIT 3（阿拉伯数字正常）—— 同一语义两种结果。
+    # 更糟的是 `elif 各X → 1000` 分支：各产品产量前三 → LIMIT 1000，返回全部产品。
+    # 现在把数词字符集统一成 [0-9一二两三四五六七八九十]+，用本文件已有的 _cn_num 换算。
+    _NUMPAT = r"(\d+|[一二两三四五六七八九十]{1,3})"
+    m2 = re.search(rf"前\s*{_NUMPAT}(?:\s*(?:名|条|个|张|家|项|台|道|种))?"
+                   rf"|TOP\s*{_NUMPAT}"
+                   rf"|最(?:大|高|多|久|长|小|低|少|短|晚|早|新|旧)\s*(?:的)?\s*(?:前)?\s*{_NUMPAT}"
+                   rf"\s*(?:个|条|名|张|批|道|台|种|家|项)?",
+                   query, re.IGNORECASE)
     if m2:
-        limit = int(next(g for g in m2.groups() if g))
+        _g = next(g for g in m2.groups() if g)
+        limit = int(_g) if _g.isdigit() else (_cn_num(_g) or 20)
+        if limit <= 0:
+            limit = 20
     # 2026-09-14：**「各X/按X/每个X」且未指定前 N → 返回全部维度行**。
     # 此前一律默认 20，在真实数据量下会静默截断（yans 实测：各设备实际 40 台只回 20 条、
     # 各产品实际 28 个只回 20 条，占未注册口径失败的 42%），用户拿到的列表是残缺的。

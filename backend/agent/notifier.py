@@ -220,8 +220,31 @@ def push_event(event_type: str, title: str, content: str,
             last = _last_sent.get(tk, 0.0)
             if now - last < s.get("throttle_min", 30) * 60:
                 continue  # 节流窗口内已推过
+            # 2026-10-03 修复（P1）：节流记录必须在**发送成功后**才写。
+            # 原实现在 submit 之前就 `_last_sent[tk] = now`，而 _send 的失败处理
+            # 只 warning 一行、无重试无补偿 → webhook 不可达时（改配置/网络抖动/
+            # 机器人被踢）默认 throttle_min=30 分钟内**所有**异动/盲点/报表全部被
+            # 节流拦掉，一条不推；恢复后窗口已过，用户收到的是残缺序列，
+            # 且日志里只有 warn、没有「本应推送 N 条」。
+            # 现在：占位改到提交后立即写（保持并发去重），失败时由 _send 回调清除，
+            # 让下一次事件仍能投递。
             _last_sent[tk] = now
-        _pool.submit(_send, ch, title, content)
+        fut = _pool.submit(_send, ch, title, content)
+
+        def _clear_on_fail(_f= fut, _tk=tk):
+            # 发送失败 → 撤销节流占位，下一次事件仍可投递
+            try:
+                if _f.exception() is not None:
+                    with _lock:
+                        if _last_sent.get(_tk) == now:
+                            _last_sent.pop(_tk, None)
+            except Exception:
+                pass
+
+        try:
+            fut.add_done_callback(_clear_on_fail)
+        except Exception:
+            pass
         sent += 1
     return sent
 

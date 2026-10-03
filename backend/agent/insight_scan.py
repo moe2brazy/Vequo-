@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 import statistics
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 
 _logger = logging.getLogger("insight_scan")
 
@@ -244,8 +245,31 @@ def scan_table(table_name: str, max_measures: int = 3, max_dims: int = 4,
         # ① 离群 + ② 失衡：逐 (度量 × 维度) 组合探查
         jobs = [(m, d) for m in measures for d in dims]
         if jobs:
+            # 2026-10-03 修复（ACL 传播，fail-open）：ACL 存在 security/context.py 的
+            # ContextVar 里，而 ThreadPoolExecutor **不传播 contextvars**
+            # （实测：主线程 get_acl() 返回对象、worker 线程返回 None）。
+            # `_probe_dim` 是 ①② 两类洞察**唯一**的取数入口，整个在 worker 线程执行
+            # → get_acl() 为 None → monitor.py 里的 `if acl is not None: rewrite_sql(...)`
+            # 整段跳过 → 洞察数值是**全表口径**，而同一张表在主问数链路是带行过滤的。
+            # 表现：受限账号（如仅可见本车间）看到「某工序缺陷数显著高于同类（22690 vs …）」
+            # 这是全厂口径的结论，文案里还带具体数值，用户无从发现口径被放大。
+            # 表级白名单由 scan_table 的 _table_allowed 独立拦住了，所以没报「无权访问」，
+            # 只是数值范围悄悄变大了 —— 与文件头「每条 SQL 都走行/列级 ACL 改写」的声明矛盾。
+            # 修法：submit 前 copy_context()，把当前 ContextVar 复制进 worker。
             with ThreadPoolExecutor(max_workers=min(4, len(jobs))) as ex:
-                results = list(ex.map(lambda j: _probe_dim(table_name, j[0]["name"], j[1]["name"]), jobs))
+                futs = []
+                for _j in jobs:
+                    # 默认参数绑定 _j，避免 lambda 闭包延迟求值导致全部拿到同一个 job
+                    _ctx = copy_context()
+                    futs.append(ex.submit(
+                        lambda jj=_j: _ctx.run(_probe_dim, table_name, jj[0]["name"], jj[1]["name"])))
+                results = []
+                for f in futs:
+                    try:
+                        results.append(f.result())
+                    except Exception as e:
+                        _logger.warning("维度探查失败(%s)：%s", table_name, e)
+                        results.append([])
             for (m, d), rows in zip(jobs, results):
                 scanned += 1
                 if len(rows) < MIN_DIM_VALUES:

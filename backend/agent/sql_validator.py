@@ -98,11 +98,19 @@ def validate_sql_safety(sql: str, dialect: str = "postgres") -> tuple[bool, str,
             pass  # 格式化失败不影响合法性
 
     except ImportError:
-        # sqlglot 未安装，只做基础检查
-        pass
-    except Exception:
-        # sqlglot 解析异常，但不一定是 SQL 问题（可能是复杂语法）
-        pass
+        # 2026-10-03 修复（P0，fail-open → fail-close）：
+        # 原实现是 `pass`，即「sqlglot 没装 → 跳过 AST 层语句类型校验 → 放行」。
+        # 但第 1 步的正则关键词表只有 12 个词，是**词面匹配**：sqlglot 解析不了的
+        # 语法（DISTINCT ON、MySQL 特有 hint、WITH RECURSIVE 变体…）一旦同时躲过
+        # 这 12 个词，就完全没有任何语句类型校验了 —— 与 enforcer.py:740 的
+        # fail-close 设计原则完全相反。
+        # 修法：AST 校验不可用时必须拒绝，而不是放行。
+        return False, "服务端缺少 sqlglot，无法完成语句类型安全校验，已拒绝执行", original
+    except Exception as e:
+        # 2026-10-03 修复（P0）：同上。解析失败不等于 SQL 合法 —— 恰恰可能是
+        # 用了校验器不认识的语法，此时 AST 层的 INSERT/DELETE/UPDATE/DROP 拦截
+        # （第 89 行）被整段跳过。fail-close 拒绝，并把原因写进 detail 便于排障。
+        return False, f"SQL 解析失败，无法完成语句类型安全校验，已拒绝：{str(e)[:120]}", original
 
     # 5. 强制 LIMIT 检查（并校验取值：拒绝负数/超大/非法，防 LLM 幻觉的 LIMIT -1 全量排序）
     m_limit = re.search(r"\bLIMIT\s+(-?\d+)", cleaned, re.IGNORECASE)

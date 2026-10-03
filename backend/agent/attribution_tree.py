@@ -37,6 +37,10 @@ _logger = logging.getLogger("attribution_tree")
 
 # 比率型指标的识别线索：列名命中 → 判为比率；否则按取值范围兜底
 _RATIO_HINTS = ("率", "占比", "比例", "百分比", "达成", "rate", "ratio", "pct", "percent", "yield")
+# 2026-10-03 新增：列名带这些量词后缀 → 是加性计数/累计量，绝不是比率。
+# 用于挡住「0/1 计数列因取值落在 [0,1] 被误判为比率型」的坑（见 _is_ratio_metric）。
+_COUNT_HINTS = ("次数", "数量", "个数", "台数", "条数", "单数", "人数", "工单数", "不良数",
+                "count", "qty", "quantity", "num", "total", "sum", "件数", "批次数")
 # 明显不是指标的列（主键 / 外键 / 纯编号），即使数值型也排除
 _ID_HINTS = ("id", "编号", "编码", "code", "no", "序号")
 
@@ -81,10 +85,23 @@ def _is_ratio_metric(col: str, rows: list[dict]) -> bool:
     cl = col.lower()
     if any(h in cl for h in _RATIO_HINTS):
         return True
+    # 2026-10-03 修复（P1）：0/1 计数列不得判为比率型。
+    # 大量注册口径是 0/1 计数（如 `SUM(CASE WHEN is_planned = FALSE THEN 1 ELSE 0 END)`
+    # = 非计划停机次数）。按设备分组后多数取值为 0 或 1，全部落在 [0,1] → 原实现
+    # 命中「高度可能是比率」→ root_mode 被设成 "avg" → 求和变加权平均。实测：
+    #   sum 模式 -> (1.0, 2.0, 1.0)   真实：1 → 2，+100%
+    #   avg 模式 -> (0.5, 1.0, 0.5)   产出：0.5 → 1.0（底层从计数变成比率）
+    # 且 weight_metric 会挑一个无关加性列当权重，把「次数变化率」算成
+    # 「按停机时长加权的次数变化率」。现在：列名带量词后缀 → 直接判为加性。
+    if any(h in cl for h in _COUNT_HINTS):
+        return False
     vals = [_to_num(r.get(col)) for r in rows[:20]]
     nums = [v for v in vals if v is not None]
     # 取值全部落在 [0,1] 且至少有 3 个样本 → 高度可能是比率
     if len(nums) >= 3 and all(0.0 <= v <= 1.0 for v in nums):
+        # 若取值全是整数（0/1 计数形态），不是比率
+        if all(float(v).is_integer() for v in nums):
+            return False
         return True
     return False
 

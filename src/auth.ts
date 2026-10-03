@@ -69,11 +69,17 @@ export function canDo(action: string): boolean {
 /** 改昵称/头像后同步本地用户信息（右上角即时刷新） */
 export function updateLocalUser(partial: Partial<AuthUser>): AuthUser | null {
   const cur = getUser()
-  if (!cur) return null
+  if (!cur) return null   // 真正未登录 → null
   const next = { ...cur, ...partial }
   if (!safeSetItem(USER_KEY, JSON.stringify(next))) {
-    console.warn('[auth] 更新本地用户信息失败（本地存储已满，已尝试自动清理）')
-    return null
+    // 2026-10-03 修复（P2）：原实现写入失败也 return null，而 null 有两种语义
+    // （「未登录」与「localStorage 已满」），调用方（App.vue onAccountUpdated）
+    // 不区分、一律覆盖 authUser → 全站权限外观塌成未登录：侧栏「管理专区」整组消失、
+    // 管理员徽标消失、停在权限页会被弹回总览。用户会以为权限被收了，实际只是
+    // 一个本地 key 没写进去，刷新一下又回来。
+    // 现在区分语义：写入失败时保留内存态可用（仅提示刷新后生效），只有真未登录才 null。
+    console.warn('[auth] 更新本地用户信息失败（本地存储已满，已尝试自动清理）；本次会话内生效，刷新后可能丢失')
+    return next
   }
   return next
 }

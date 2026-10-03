@@ -145,8 +145,18 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
     # 通过 data_note 透出到结果卡。
     # 2026-10-03 修复（P0）：df.dropna() 无参数 =丢弃**任一列**含 NaN 的行。特征里只要
     # 有一列（如order_status 这类文本列）缺失率高，5000 行会被砍到几十行，且 len(df)<10
-    # 的门槛拦不住"砍到 200 行"这种更糟的情况。而 DecisionTree/LogisticRegression 本身
-    # 能处理 NaN（KMeans 不行）。改为按任务区分：有监督只补齐不删行，无监督才清理数值列。
+    # 的门槛拦不住"砍到 200 行"这种更糟的情况。改为按任务区分：有监督只补齐不删行，
+    # 无监督才清理数值列。
+    #
+    # 追加修复（同一处的注释前提是错的）：
+    #   原注释称「树模型/线性模型容忍 NaN」—— 实测（sklearn 1.9.0）**不成立**：
+    #     LinearRegression    → ValueError: Input X contains NaN.
+    #     LogisticRegression  → ValueError: Input X contains NaN.
+    #     DecisionTree        → OK
+    #   且**全 NaN 列**的 median() 返回 NaN，`fillna(NaN)` 是空操作 → NaN 原样进模型
+    #   → 英文异常经 llm_service `"建模执行失败: {e}"` 原样糊到界面，而 data_note 里
+    #   还写着「缺失值已按列中位数补齐」，自相矛盾。
+    # 现在：全 NaN 列直接剔除；补齐后再校验，仍有 NaN 的列也剔除。
     rows_before = len(df)
     _na_counts = df.isna().sum()
     _num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
@@ -154,10 +164,22 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
         # 无监督：KMeans 不接受 NaN，必须清理，且只清数值列（文本列后面要 LabelEncoder）
         df = df.dropna(subset=_num_cols) if _num_cols else df.dropna()
     else:
-        # 有监督：树模型/线性模型容忍 NaN，改为按列中位数补齐，避免整表被砍光
+        # 有监督：树模型容忍 NaN，线性模型不容忍 → 统一用中位数补齐；
+        # 全 NaN 列 median 仍是 NaN，必须剔除而非补齐。
+        _allna_cols = [c for c in _num_cols if df[c].isna().all()]
+        if _allna_cols:
+            df = df.drop(columns=_allna_cols)
+            _num_cols = [c for c in _num_cols if c not in _allna_cols]
         for c in _num_cols:
             if df[c].isna().any():
-                df[c] = df[c].fillna(df[c].median())
+                med = df[c].median()
+                df[c] = df[c].fillna(0.0 if pd.isna(med) else med)
+        # 线性模型不容忍 NaN：补齐后仍有缺失的列直接剔除
+        if str(model_type or "").lower() in ("linear", "logistic", "ridge", "lasso"):
+            _still = [c for c in _num_cols if df[c].isna().any()]
+            if _still:
+                df = df.drop(columns=_still)
+                _num_cols = [c for c in _num_cols if c not in _still]
     data_note = ""
     if rows_before - len(df) > 0:
         _worst = _na_counts.idxmax() if _na_counts.max() > 0 else ""

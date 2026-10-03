@@ -62,6 +62,16 @@ def extract_entities(rows: list[dict] | None, columns: list[str] | None,
             continue
         if all(_is_date(v) for v in non_null):
             continue
+        # 2026-10-03 修复（P0）：**混合列（原注释说"保守跳过"，代码却 append）**。
+        # 部分行数值 + 部分行文本的列是生产常态（前端把 NULL 显示成 0、或上游口径
+        # 变更留下的历史脏值）。它一旦被当维度列，entity_hits 会把该列里的**数值**
+        # 当成用户提到的维度取值写进 prompt：
+        #   entities={'产线': ['L01', '5']} + 问句「良率大于5的产线」
+        #   → 命中 ('产线', '5') → prompt 注入「用户提到的『5』（产线）来自上一轮…」
+        #   → LLM 很可能生成 WHERE line_name = '5' → 0 行或无关数据。
+        # 这里按注释的原意补上：含任何数值的列都不作为维度列。
+        if any(_is_num(v) for v in non_null):
+            continue
         cat_cols.append(c)
         if len(cat_cols) >= 3:
             break
@@ -88,7 +98,13 @@ def entity_hits(query: str, entities: dict[str, list[str]]) -> list[str]:
     hits: list[str] = []
     for col, vals in entities.items():
         for v in vals:
-            if v and len(v) >= 1 and v in q:
+            # 2026-10-03 修复（P0）：`len(v) >= 1` 太松 —— 任何单字符都能命中，
+            # 而问句里的单字符通常是阈值/序号（「良率大于5」「取前3行」）而不是维度值。
+            # 收紧为 >= 2，与 `conversation_memory.py:155` 的口径对齐；
+            # 并额外排除纯数字（即便上游漏了混合列，这里再加一道闸）。
+            if not v or len(v) < 2 or v.isdigit():
+                continue
+            if v in q:
                 hits.append(f"「{v}」（{col}）")
                 break  # 每列最多一条，避免同一列多个取值刷屏
     return hits

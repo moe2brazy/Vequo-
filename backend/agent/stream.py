@@ -14,6 +14,7 @@ from decimal import Decimal
 from typing import AsyncGenerator
 
 from agent.llm_service import LLMService, generate_analysis, generate_predict, cache_result
+from agent.llm_service import drain_thought_events
 from langchain_openai import ChatOpenAI
 
 
@@ -52,6 +53,9 @@ async def ask_stream(query: str, history: list[dict] | None = None,
     权限上下文由 run() 内部的 _bind_acl() 在线程内重新绑定。
     """
     event_queue: queue.Queue = queue.Queue()
+    # 报告分支（rr is not None）不走 LLMService，service 为 None；
+    # 下面轮询循环里的旁路思考流抽干必须判空，否则报告链会 NameError。
+    service = None
 
     # ── 报告意图分流（提问即报告）：问句本身就是要一份报告（如"生产周报"）→
     # 走 periodic_report 的固定口径模板链路，不进 LLMService 的问数管道。
@@ -79,9 +83,11 @@ async def ask_stream(query: str, history: list[dict] | None = None,
                     pass
                 event_queue.put(None)  # 结束信号
     else:
+        # take_step_thought=True：让 run() 的每一步都带上可读「思考」文本，
+        # 前端据此逐字累积显示（像聊天一样的推理过程）。2026-10-03 新增。
         service = LLMService(query, history, allowed_tables=allowed_tables,
                              row_filters=row_filters, column_whitelist=column_whitelist,
-                             acl=acl, no_confirm=no_confirm)
+                             acl=acl, no_confirm=no_confirm, take_step_thought=True)
 
         def _bg_runner():
             try:
@@ -111,11 +117,36 @@ async def ask_stream(query: str, history: list[dict] | None = None,
     cancelled = False
     try:
         while True:
+            # ── 2026-10-03：先抽干旁路思考流 ─────────────────────────────
+            # 主链 service.run() 在 LLM 调用期间是阻塞的（SQL 生成实测 30~100s），
+            # 阻塞时它一个事件都吐不出来 —— 此前这段时间前端只能看到一句静态的
+            # 「正在生成 SQL…」，像卡死。旁路线程把模型的 reasoning token 写进
+            # service._thought_out，这里每轮（~20ms）抽干一次转成 SSE 推给前端，
+            # 于是**主链阻塞期间用户依然能看到思考逐字浮现**。
+            # 任何异常都不冒泡：展示层故障不影响主链路（fail-open）。
+            if service is not None:
+                try:
+                    for _ev in drain_thought_events(service):
+                        yield _sse(_ev["type"],
+                                   {k: v for k, v in _ev.items() if k != "type"})
+                except Exception:
+                    pass
+
             try:
                 item = event_queue.get_nowait()
             except queue.Empty:
                 # 队列空：让出 event loop，让 uvicorn 把已 yield 的数据真正 flush 出去
                 if not thread.is_alive() and event_queue.empty():
+                    # 主链已结束，但旁路可能还有尾巴（token 还在路上）→ 再抽一次再收尾
+                    try:
+                        _tail = drain_thought_events(service) if service is not None else []
+                    except Exception:
+                        _tail = []
+                    if _tail:
+                        for _ev in _tail:
+                            yield _sse(_ev["type"],
+                                       {k: v for k, v in _ev.items() if k != "type"})
+                        continue
                     break
                 await asyncio.sleep(0.02)
                 continue

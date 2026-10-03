@@ -13,6 +13,7 @@
  * 保证任何数据形态下结果都可见，绝不出现空白图表区。
  */
 import echarts from '../echarts'
+import type { EChartsType } from '../echarts'
 import { isG2PlotType, renderG2Plot, PALETTE, OPS_PALETTE, hexToRgba } from './g2plot'
 
 export { PALETTE, OPS_PALETTE }
@@ -379,11 +380,24 @@ export async function renderChart(
     // G2Plot 失败 → ECharts 兜底（用 bar 这种通用类型，至少结果可见）
     const fb = buildEChartOption('bar', cols, rows, palette)
     if (fb) {
+      // 2026-10-03 修复（内存泄漏，与下方 ECharts 常规图分支对称）：原实现
+      // `echarts.init(el).setOption(fb)` 把实例句柄直接丢弃，isStale() 时 return null
+      // 也不 dispose。调用方拿 null 后执行 el.innerHTML = fallback —— innerHTML 只移除
+      // 子节点、**不会 dispose 实例**，其动画循环 / resize 监听 / zrender 事件绑定全部存活。
+      // 这条路径正是「扩展图表（G2Plot 渲染失败时）的兜底」，即失败一次泄漏一个完整实例。
+      let fbInst: EChartsType | null = null
       try {
-        echarts.init(el).setOption(fb)
-        if (isStale()) return null
-        return 'echarts'
-      } catch { /* 继续回退 */ }
+        fbInst = echarts.init(el)
+        fbInst.setOption(fb)
+      } catch {
+        try { fbInst?.dispose() } catch { /* ignore */ }
+        return null
+      }
+      if (isStale()) {
+        try { fbInst.dispose() } catch { /* ignore */ }
+        return null
+      }
+      return 'echarts'
     }
     return null
   }
@@ -397,7 +411,7 @@ export async function renderChart(
     // 调用方拿 null 后会把 el.innerHTML 改成 fallback SVG —— innerHTML 只移除子节点，
     // **不会 dispose 实例**，其动画循环/resize 监听/事件绑定全部存活。
     // G2Plot 分支早已在 stale 时 destroy()，这里补齐对称处理。
-    let inst: echarts.EChartsType | null = null
+    let inst: EChartsType | null = null
     try {
       inst = echarts.init(el)
       inst.setOption(option)

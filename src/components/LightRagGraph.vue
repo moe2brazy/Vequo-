@@ -6,29 +6,35 @@
 </template>
 
 <!--
-  LightRAG 知识图谱组件：1:1 复刻 D:\LightRAG\LightRAG\knowledge_graph.html 的渲染效果
-  - vis-network 物理模拟布局（barnesHut + 稳定化动画）
+  知识图谱组件：vis-network 物理模拟布局（barnesHut + 稳定化动画）
   - 节点可拖拽、滚轮缩放、悬停显示 title 提示（名称 + 描述）
   - 动态平滑连线（smooth: dynamic），边色继承节点色
-  - 数据来源：public/knowledge_graph.json（由 knowledge_graph.html 内嵌的 vis.DataSet 导出）
+  - 数据来源（2026-10-03 改）：**默认走实时接口 /api/tables/relationships**，
+    读 PostgreSQL information_schema 的真实外键关系，随当前库自动变化。
+    原实现默认读 public/knowledge_graph.json —— 那是 LightRAG 离线工具导出的
+    静态快照（entity_type=data、file_path=unknown_source），与当前数据库**无任何连接**，
+    演示时节点与实际库表对不上。静态文件仅在显式传 src 时才使用（保留为离线兜底/对照）。
 -->
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount } from 'vue'
 
 const props = withDefaults(
   defineProps<{
-    /** 图谱数据地址（默认从 public 目录加载 LightRAG 导出的 JSON） */
+    /**
+     * 图谱数据来源。为空（默认）→ 走**实时** /api/tables/relationships（真实外键）。
+     * 显式传 URL（如 '/knowledge_graph.json'）→ 读该静态 JSON（离线兜底/对照用）。
+     */
     src?: string
     /** 画布高度（px），不传则填满父容器 */
     height?: number
     /**
      * 适配视图后的放大倍数（初始加载 / 重置均生效）：
-     * vis-network 的 fit() 会把全图缩到刚好放下，44 个节点时标签过小；
+     * vis-network 的 fit() 会把全图缩到刚好放下，节点多时标签过小；
      * 1 = 完全适配（不放大），1.4 = 在适配基础上再放大 40%。
      */
     fitZoom?: number
   }>(),
-  { src: '/knowledge_graph.json', height: 0, fitZoom: 1 },
+  { src: '', height: 0, fitZoom: 1 },
 )
 
 const emit = defineEmits<{ (e: 'node-click', id: string): void }>()
@@ -69,6 +75,60 @@ const buildOptions = () => ({
   },
 })
 
+/** 实时接口：读 PG information_schema 的真实表与外键（2026-10-03）。 */
+const LIVE_API = '/api/tables/relationships'
+
+/** 按业务域上色，让图谱一眼能区分生产/质量/设备/库存/基础数据。 */
+const SCENE_COLOR: Record<string, string> = {
+  生产: '#4f9cf9',
+  质量: '#f59e0b',
+  设备: '#ef4444',
+  库存: '#10b981',
+  销售: '#8b5cf6',
+  基础数据: '#64748b',
+}
+
+/**
+ * 把 /api/tables/relationships 的返回转成 vis-network 的 {nodes, edges}。
+ * 后端结构：{nodes:[{id,name,label,columns,scene,nodeType}], relationships:
+ *           [{source_table,source_column,target_table,target_column,type,description}]}
+ */
+const adaptLive = (data: any) => {
+  const rawNodes: any[] = data?.nodes || []
+  const rels: any[] = data?.relationships || []
+  const nodes = rawNodes.map((n) => {
+    const scene = String(n.scene || '')
+    const color = SCENE_COLOR[scene] || '#64748b'
+    return {
+      id: String(n.id ?? n.name),
+      label: String(n.label || n.name || n.id),
+      // 字段多的表画大一点，图谱层次更清楚
+      size: Math.min(46, 16 + Math.sqrt(Number(n.columns) || 1) * 7),
+      color,
+      shape: 'dot',
+      title: `${n.label || n.name}\n表名：${n.name}\n字段数：${n.columns ?? '-'}\n业务域：${scene || '-'}`,
+    }
+  })
+  const known = new Set(nodes.map((n) => n.id))
+  // 只保留两端都在节点集里的边，避免悬空连线（跨 schema 的外键会出现这种情况）
+  const edges = rels
+    .filter((r) => known.has(String(r.source_table)) && known.has(String(r.target_table)))
+    .map((r) => {
+      // type: 'foreign_key' = information_schema 里的真实外键（实线加粗）
+      //       'inferred'   = 按同名 _id 字段推导（虚线细线，置信度低）
+      //       'business'   = 预定义业务关系
+      const inferred = r.type === 'inferred'
+      return {
+        from: String(r.source_table),
+        to: String(r.target_table),
+        title: r.description || `${r.source_column} → ${r.target_column}`,
+        dashes: inferred,
+        width: inferred ? 1 : 2,
+      }
+    })
+  return { nodes, edges }
+}
+
 const draw = async () => {
   if (!containerRef.value) return
   // 取消上一次仍在途的加载（组件重建 / 手动重绘时）
@@ -76,11 +136,22 @@ const draw = async () => {
   const ac = new AbortController()
   abortCtrl = ac
   try {
-    const res = await fetch(props.src, { signal: ac.signal })
-    if (!res.ok) throw new Error(`加载 ${props.src} 失败（HTTP ${res.status}）`)
+    // 默认实时接口；显式 src 时才读静态 JSON（离线兜底/对照）
+    const url = props.src || LIVE_API
+    const res = await fetch(url, { signal: ac.signal })
+    if (!res.ok) throw new Error(`加载 ${url} 失败（HTTP ${res.status}）`)
     const data = await res.json()
-    const rawNodes: any[] = data.nodes || []
-    const rawEdges: any[] = data.edges || []
+
+    let rawNodes: any[]; let rawEdges: any[]
+    if (props.src) {
+      // 静态 LightRAG 导出格式：本身就是 vis.DataSet 的 {nodes, edges}
+      rawNodes = data.nodes || []
+      rawEdges = data.edges || []
+    } else {
+      const adapted = adaptLive(data)
+      rawNodes = adapted.nodes
+      rawEdges = adapted.edges
+    }
     if (!rawNodes.length) throw new Error('图谱数据为空')
 
     // 【守卫】两处 await 之后、动手建图之前：卸载了 / 本次加载已被更新的加载取代 / 容器没了，
@@ -177,7 +248,49 @@ const downloadPng = () => {
   link.click()
 }
 
-defineExpose({ fitView, relayout, downloadPng })
+// getNodePositions：返回每个节点在**页面坐标系**里的中心点。
+// 用途：① 自动化测试要按真实坐标点击节点（网格盲扫点不中，测出来的结论不可信）；
+//      ② 后续若要做「点击画布空白处关闭详情」之类的交互，也需要节点位置。
+// 返回 [{id, label, x, y}]，坐标已加上画布相对页面的偏移，可直接喂给
+// dispatchEvent 的 clientX/clientY。
+const getNodePositions = () => {
+  const out: Array<{ id: string; label: string; x: number; y: number }> = []
+  if (!network || !containerRef.value) return out
+  try {
+    const canvasRect = containerRef.value.getBoundingClientRect()
+    // vis-network 把节点集挂在 body.data.nodes（DataSet 实例）。
+    // 不同版本暴露形式不同：可能是 DataSet（有 .get()/.length），也可能已是数组，
+    // 这里两种都兼容，避免拿到 undefined 后整个函数静默返回空数组。
+    const ds: any = (network as any).body?.data?.nodes
+    let ids: string[] = []
+    if (Array.isArray(ds)) {
+      ids = ds.map((n: any) => String(n.id))
+    } else if (ds && typeof ds.get === 'function') {
+      const arr = ds.get() || []
+      ids = arr.map((n: any) => String(n.id ?? n))
+    } else if (ds && typeof ds.length === 'number') {
+      ids = Array.from({ length: ds.length }, (_, i) => String(ds[i]?.id ?? i))
+    }
+    for (const id of ids) {
+      if (!id) continue
+      const p = network.getPosition(id)
+      if (!p) continue
+      const domPos = network.canvasToDOM(p)
+      if (!domPos) continue
+      out.push({
+        id,
+        label: id,
+        x: canvasRect.left + domPos.x,
+        y: canvasRect.top + domPos.y,
+      })
+    }
+  } catch (e) {
+    console.warn('[LightRagGraph] getNodePositions 失败:', e)
+  }
+  return out
+}
+
+defineExpose({ fitView, relayout, downloadPng, getNodePositions })
 
 // 容器尺寸自适应：vis-network 自带的 autoResize 只监听 window resize，
 // 父级布局变化（「节点中文解释」面板展开把图挤小/恢复、右侧面板收起等）不会触发重绘，

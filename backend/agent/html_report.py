@@ -416,11 +416,22 @@ def build_html_report(db: Session, allowed_tables: set[str] | None = None,
     except Exception:
         summary_md = "（报告生成失败，可稍后重试）"
 
-    total_rows = sum(t["rows"] for t in tables_info)
+    # 2026-10-03 修复（P1）：上面行级过滤不可用时 rows 被置成字符串 "?"（有意为之，
+    # card_html 会把它拼进 HTML 说明"行数未知"），但这里无条件求和 + 无条件按它排序：
+    #   sum  → TypeError: unsupported operand type(s) for +: 'int' and 'str'
+    #   sorted → TypeError: '<' not supported between instances of 'int' and 'str'
+    # 任何配了行级过滤的账号，只要有一条 row_filter 未通过 validate_sql_safety（或
+    # count 查询失败），整份数据总览报告 500。现在用「排序键」把非数值行数排到末尾、
+    # 求和时跳过，"?" 语义与 card_html 保持一致。
+    def _rows_num(t):
+        v = t.get("rows")
+        return v if isinstance(v, (int, float)) else -1
+
+    total_rows = sum(t["rows"] for t in tables_info if isinstance(t.get("rows"), (int, float)))
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
     # 重点高亮：行数最多的表 / 关系最多的节点
-    top_tables = sorted(tables_info, key=lambda x: x["rows"], reverse=True)[:3]
+    top_tables = sorted(tables_info, key=_rows_num, reverse=True)[:3]
     top_names = {t["name"] for t in top_tables}
 
     summary_html = _render_summary(summary_md)

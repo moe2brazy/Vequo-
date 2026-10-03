@@ -131,8 +131,13 @@ def _run_predict(query: str, query_step: dict) -> dict:
             return {"status": "skipped", "title": "预测", "summary": "依赖查数结果，查数未完成",
                     "elapsed_ms": int((_now() - t0) * 1000)}
         from agent.llm_service import generate_predict
-        sql_result = {"success": True, "columns": query_step.get("columns", []),
-                      "rows": query_step.get("rows", [])}
+        # 2026-10-03 修复（P0）：与 _run_attribution / _run_insight 保持一致 ——
+        # 预测必须基于**全量**行。原实现取的是展示用的 8 行，于是 generate_predict
+        # 里的 rows[-12:] 与最小二乘拟合都只拿到 8 个点（且通常是 SQL 原始顺序的
+        # 「各维度首行」而非时间序列），结论建立在残缺样本上。
+        sql_result = {"success": True,
+                      "columns": query_step.get("_full_columns") or query_step.get("columns", []),
+                      "rows": query_step.get("_full_rows") or query_step.get("rows", [])}
         out = []
         for ev in generate_predict(sql_result):
             if isinstance(ev, dict):

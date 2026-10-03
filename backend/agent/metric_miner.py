@@ -436,9 +436,19 @@ def mine_candidates(limit: int = 20, use_llm: bool = True) -> dict:
             c = bucket.get(cid)
             if c is None:
                 # 带过滤聚合：表达式附上过滤语义便于展示与命名（如 COUNT(*) WHERE result='fail'）
+                # 2026-10-03 修复（P0）：`disp`（含 WHERE）是**给人看的展示串**，不是合法
+                # SQL 表达式。修复前它被原样写进候选的 "expr" 字段，而 adopt_candidate /
+                # create_user_metric 直接取 c["expr"] 存进注册表 sql_expression →
+                # 采纳一条带过滤的候选即永久写入坏口径。编译产物实测为
+                #   SELECT COUNT(*) WHERE result='fail' AS "…" FROM …   （COUNT 与 WHERE
+                # 之间缺逗号，PG 直接语法错），而 _safe_metric_expr 对它返回 True
+                # （WHERE 不在黑名单）→ try_compile_metric 返回非 None → 不回退 LLM
+                # → 整条查询硬失败且无日志。
+                # 现在：expr 存**干净的可执行表达式**，disp 另存到 display 字段供 UI 展示。
                 disp = expr if not f_sig else f"{expr} WHERE {f_sig.replace('|', ' AND ')}"
                 c = bucket[cid] = {
-                    "id": cid, "expr": disp, "tables": list(agg["tables"]),
+                    "id": cid, "expr": expr, "display": disp,
+                    "tables": list(agg["tables"]),
                     "dims": agg.get("dims") or [], "hit_count": 0,
                     "sample_question": item["question"],
                     "name": agg.get("alias") or "", "aliases": [], "unit": "",
@@ -504,19 +514,30 @@ def adopt_candidate(cid: str, name: str = "", aliases: list | None = None,
         return {"success": False, "error": "候选不存在或已被处理"}
     try:
         from agent.metric_registry import create_user_metric
+        # 2026-10-03 修复（P0）：兜底剥离展示串里的 WHERE 子句。
+        # 候选池在本次修复前已经落盘过含「COUNT(*) WHERE result='fail'」这类
+        # 展示串（expr 字段），修源头只挡新挖掘的，存量脏数据仍会被采纳进注册表。
+        _expr_src = c.get("expr") or ""
+        _expr_clean = re.split(r"\bWHERE\b", _expr_src, flags=re.IGNORECASE)[0].strip() or _expr_src
+        if not _expr_clean:
+            return {"success": False, "error": "该候选的表达式为空，请重新挖掘后再采纳"}
         metric = {
             "name": (name or c.get("name") or "").strip(),
             "aliases": aliases if aliases is not None else (c.get("aliases") or []),
             "unit": unit if unit != "" else (c.get("unit") or ""),
             "tables": c.get("tables") or [],
-            "sql_expression": c.get("expr") or "",
-            "formula": c.get("expr") or "",
+            "sql_expression": _expr_clean,
+            "formula": _expr_clean,
             "description": (description or c.get("description") or "").strip()
-                           or ("自动挖掘：%s" % (c.get("expr") or "")),
+                           or ("自动挖掘：%s" % (c.get("display") or _expr_clean)),
             "dims": c.get("dims") or [],
         }
         if not metric["name"]:
             return {"success": False, "error": "指标名不能为空，请先填写"}
+        if _expr_clean != _expr_src:
+            # 说明写进 description，**不污染 sql_expression**（算式必须保持可执行）
+            metric["description"] = (metric["description"]
+                                     + "（已自动剥离展示串中的过滤条件，如需保留请改为 CASE WHEN 形式）")
         created = create_user_metric(metric)
         # 采纳留痕归档（重启后可回溯治理历史），再从候选池移除
         _ADOPTED.append({
