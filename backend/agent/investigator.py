@@ -93,8 +93,18 @@ def _safe_execute(sql: str) -> dict:
                 if acl_err:
                     return {"success": False, "error": f"权限校验未通过：{acl_err}"}
                 cleaned = eff
-        except Exception:
-            pass  # ACL 模块异常不阻断（最坏退化为只读校验）
+        except ImportError:
+            # 只有「ACL 模块压根没装」（离线脚本/评测环境）才允许降级为只读校验，
+            # 与 agent/monitor.py:103 保持一致。
+            pass
+        except Exception as e:
+            # 2026-10-04 修复（P0·fail-open）：原为 `except Exception: pass`，
+            # 注释写「最坏退化为只读校验」—— 但实际是**权限完全失效**。
+            # 故障注入实测（让 rewrite_sql 抛异常）：行过滤、列脱敏、deny 全部失效，
+            # SQL 原样执行，deny 列与 mask 列**明文返回**。
+            # 权限模块「内部出错」与「模块没装」是完全不同的两件事，不能混为一谈：
+            # 前者必须 fail-close（宁可不返回，也不能返回未脱敏的敏感数据）。
+            return {"success": False, "error": f"权限校验异常，已阻断执行：{type(e).__name__}: {str(e)[:120]}"}
         return execute_sql(cleaned)
     except Exception as e:
         return {"success": False, "error": str(e)[:200]}

@@ -104,8 +104,38 @@ s._exec_sql = lambda sql: {"success": False, "error": "boom", "rows": [], "row_c
 check("C8 执行失败的候选被跳过", s._cross_validate(n=2) is False and s.sql == orig_sql, "")
 
 print("═══ D. 复杂查询判定（auto 模式门控复用）═══")
+# 2026-10-04 更正：原断言「含 GROUP BY 判为复杂」自2026-09-28 起已**有意失效**。
+# llm_service._is_complex_query 当时把六类信号拆成「结构复杂度」与「聚合」两组，
+# 后者默认不再单独触发（config.RESULT_CHECK_AGG_COUNTS_COMPLEX 默认 False）。
+# 收窄理由（见该函数 docstring）：纯聚合查询的错法集中在**业务口径**，而同模型 LLM
+# 再审一遍「既拦不住系统性口径偏差（同源共偏），又有把正确结果改坏的风险」；
+# 且口径已由指标注册表 + 10 道确定性前置校验把关。
+# 于是原断言必然失败 —— 是测试没跟上这次**有意的能力收窄**，不是代码 bug。
 s = _svc()
-check("D1 含 GROUP BY 判为复杂", s._is_complex_query(), "")
+_have_flag = False
+try:
+    from config import RESULT_CHECK_AGG_COUNTS_COMPLEX as _agg_flag
+    _have_flag = bool(_agg_flag)
+except Exception:
+    pass
+_d1 = s._is_complex_query()
+check("D1 纯 GROUP BY 按配置决定（默认不判复杂）", _d1 == _have_flag,
+      f"_is_complex_query={_d1} RESULT_CHECK_AGG_COUNTS_COMPLEX={_have_flag}")
+# 结构复杂度信号仍必须生效（这是真正该守的红线，不能被上面的收窄带跑）
+for _label, _sql, _want in [
+    ("多事实表 JOIN 判复杂",
+     "SELECT a.line_id FROM mes_process_output a JOIN qms_inspection b ON a.line_id=b.line_id", True),
+    ("UNION 判复杂", "SELECT a FROM t UNION SELECT b FROM u", True),
+    ("CTE 判复杂", "WITH x AS (SELECT a FROM t) SELECT * FROM x", True),
+    ("子查询判复杂", "SELECT * FROM t WHERE a IN (SELECT b FROM u)", True),
+    ("单表明细不判复杂", "SELECT * FROM mes_process_output LIMIT 10", False),
+    ("单事实+维度表 JOIN 不判复杂",
+     "SELECT d.line_name, SUM(f.good_qty) FROM mes_process_output f "
+     "JOIN dim_production_line d ON f.line_id=d.line_id GROUP BY d.line_name", False),
+]:
+    s.sql = _sql
+    check("D1x %s" % _label, s._is_complex_query() == _want,
+          f"sql={_sql[:56]} -> {s._is_complex_query()}")
 s.sql = "SELECT * FROM mes_process_output LIMIT 10"
 check("D2 单表明细不判复杂", not s._is_complex_query(), "")
 

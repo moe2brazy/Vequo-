@@ -46,6 +46,28 @@ def _build_sentence_transformers_fn(model_name: str):
 
     def _encode(text: str) -> list[float]:
         vec = _model.encode(text, normalize_embeddings=True)
+        # 2026-10-04 加的维度归一（防御性加固，非修复正在发生的崩溃）。
+        # ⚠️ 自查更正：原注释说「sentence-transformers 6.x 传标量时返回 2D (1, dim)，
+        # 所以 `float(x)` 抛 TypeError、整个 embedding 通路不可用」—— **该叙述与实测不符**：
+        # 本机 sentence-transformers 6.1.0 + numpy 2.4.6 实测 `encode("产量")` 返回
+        # **1D (512,)**，`get_embedding_fn()('产量')` 也正常返回 512 维、L2 范数 1.0。
+        # 也就是说这个分支**当前不会触发**，属预防性加固。保留它的理由是
+        # sentence-transformers 历史上确实有过「传标量返回 2D」的版本差异，
+        # 跨版本/跨 numpy 时不能假设形状；但注释里那句「整条通路不可用」会误导
+        # 后来者以为本项目曾经因此崩过，故改成如实描述。
+        # 另：>=3 维（理论上不可能来自 encode(单字符串)）也要正确降维 ——
+        # 自查实测发现我第一版写 `elif arr >= 2: vec = vec[0]` 对 3 维只能降**一维**
+        # （(1,1,384) → (1,384) 仍是 2D），随后 float(x) 照样抛 TypeError。
+        # 改为循环降到 1 维。
+        arr = getattr(vec, "ndim", None)
+        if arr is None:
+            arr = 1 if hasattr(vec, "__iter__") else 0
+        if arr == 0:
+            vec = [vec]
+        else:
+            # 反复取第 0 ���直到 1 维（2D (1,dim) 只取一次；3D/4D 多次）
+            while getattr(vec, "ndim", 1) > 1:
+                vec = vec[0]
         return [float(x) for x in vec]
 
     return _encode

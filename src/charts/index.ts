@@ -2,8 +2,9 @@
  * 图表渲染统一入口 —— Apache ECharts + AntV G2Plot 双引擎按类型分工
  *
  * 路由规则（自动，用户无感知）：
- *   ECharts  → bar / barh / line / area / stacked / pie / donut / scatter
+ *   ECharts  → bar / barh / line / area / stacked / dual / pie / donut / scatter
  *              （常规统计图表，成熟稳定、按需引入体积可控）
+ *              dual = 双轴组合（左轴柱 + 右轴折线），专供「不同量纲的两指标对比」
  *   G2Plot   → radar / funnel / gauge / liquid / rose / heatmap / sunburst / treemap /
  *              waterfall / sankey / box / histogram / radial-bar / ring-progress /
  *              bullet / wordcloud
@@ -76,7 +77,7 @@ const toNumOrNull = (v: any): number | null => {
  */
 /** ECharts 侧显式支持的图型白名单（修复用途，见 buildEChartOption 内注释） */
 const ECHARTS_TYPES = new Set([
-  'bar', 'barh', 'line', 'area', 'stacked', 'pie', 'donut', 'scatter',
+  'bar', 'barh', 'line', 'area', 'stacked', 'dual', 'pie', 'donut', 'scatter',
 ])
 
 export function buildEChartOption(type: string, cols: string[], rows: any[], palette?: string[]): any {
@@ -181,6 +182,74 @@ export function buildEChartOption(type: string, cols: string[], rows: any[], pal
     }
   }
 
+  // ── 双轴组合（2026-10-04 新增）：两个**不同量纲**的指标各占一条 Y 轴 ──
+  // 场景：「产量(件, ~1e5) 和 良率(%, ~97) 的对比」——量纲差三个数量级，
+  // 放同一根轴上必有一方被压成贴地线；而 **堆叠是明确错误**（两者相加无业务含义）。
+  // 画法：第一个数值列走左轴柱状，其余指标走右轴折线 —— 这类"量纲不可比"对比的标准形态。
+  if (type === 'dual') {
+    if (numCols.length < 2) return null
+    const dualCats = rows.map((r) => String(r?.[catCol] ?? ''))
+    const dualSeries = numCols.map((c, i) => {
+      const color = pal[i % pal.length]
+      if (i === 0) {
+        // 左轴：柱状（顶部圆角 + 竖向渐变，与单指标柱状视觉一致）
+        return {
+          name: c,
+          type: 'bar',
+          yAxisIndex: 0,
+          barMaxWidth: 34,
+          itemStyle: {
+            borderRadius: [6, 6, 0, 0],
+            color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+              { offset: 0, color: hexToRgba(color, 0.95) },
+              { offset: 1, color: hexToRgba(color, 0.45) },
+            ]),
+          },
+          data: rows.map((r) => toNum(r?.[c])),
+        }
+      }
+      // 右轴：折线（NULL 断线，不画假 0）
+      return {
+        name: c,
+        type: 'line',
+        yAxisIndex: 1,
+        smooth: true,
+        symbol: 'circle',
+        symbolSize: 7,
+        showSymbol: rows.length <= 30,
+        lineStyle: { width: 3, color },
+        itemStyle: { color, borderColor: '#fff', borderWidth: 2 },
+        data: rows.map((r) => toNumOrNull(r?.[c])),
+      }
+    })
+    return {
+      color: pal,
+      animationDuration: 800,
+      animationEasing: 'cubicOut',
+      tooltip,
+      legend,
+      grid: { left: 16, right: 20, top: 40, bottom: 12, containLabel: true },
+      xAxis: {
+        type: 'category',
+        data: dualCats,
+        axisLine: { show: false },
+        axisTick: { show: false },
+        axisLabel: { color: AXIS_COLOR, fontSize: 11, rotate: dualCats.length > 8 ? 30 : 0 },
+      },
+      // 两条独立 Y 轴：左=第一个指标，右=其余指标（各按自身量纲铺满画布）
+      yAxis: [
+        { ...valueAxis, name: numCols[0], position: 'left' },
+        {
+          ...valueAxis,
+          name: numCols.slice(1).join(' / '),
+          position: 'right',
+          splitLine: { show: false },
+        },
+      ],
+      series: dualSeries,
+    }
+  }
+
   if (numCols.length === 0) return null
   const cats = rows.map((r) => String(r?.[catCol] ?? ''))
   const horizontal = type === 'barh'
@@ -278,6 +347,7 @@ export function buildEChartOption(type: string, cols: string[], rows: any[], pal
  * - scatter 需要 ≥2 个数值列（x/y），单指标 → null（下拉禁用）
  * - stacked 需要 ≥2 个数值列：单系列堆叠在视觉上与普通柱状完全相同
  *   （没有第二个系列可叠），用户会当成"切换没生效"→ null（禁用）
+ * - dual 需要 ≥2 个数值列（左轴柱 + 右轴折线），单指标无第二条轴 → null（禁用）
  * - pie/donut 数值列全 0 画不出扇区 → null（禁用）
  */
 export function coerceRenderableType(type: string, cols: string[], rows: any[]): string | null {
@@ -287,6 +357,7 @@ export function coerceRenderableType(type: string, cols: string[], rows: any[]):
   if (!numCols.length) return null
   if (t === 'scatter' && numCols.length < 2) return null
   if (t === 'stacked' && numCols.length < 2) return null
+  if (t === 'dual' && numCols.length < 2) return null
   if (t === 'pie' || t === 'donut') {
     const v = numCols[0]
     if (rows && rows.length && rows.every((r) => !toNum(r?.[v]))) return null

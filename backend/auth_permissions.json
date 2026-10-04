@@ -16,24 +16,17 @@
       "system": true
     },
     {
-      "key": "prod_staff",
-      "name": "生产人员",
-      "description": "生产岗位：产量、良率、工单执行。只看生产域及其维表，看不到质量明细与设备停机。",
-      "priority": 30,
+      "key": "region_manager",
+      "name": "区域销售经理",
+      "description": "只看本区域订单与工厂；客户名称脱敏；销售口径按合同总额",
+      "priority": 50,
       "system": false
     },
     {
-      "key": "eqp_staff",
-      "name": "设备人员",
-      "description": "设备岗位：设备台账与停机记录。只看设备域及其维表，看不到产量明细与质检明细。",
-      "priority": 30,
-      "system": false
-    },
-    {
-      "key": "qc_staff",
-      "name": "质量人员",
-      "description": "质量岗位：抽检结果与缺陷明细。只看质量域及其维表，看不到产量明细与库存。",
-      "priority": 30,
+      "key": "analyst",
+      "name": "分析师",
+      "description": "数据分析岗（测试期望角色）",
+      "priority": 40,
       "system": false
     }
   ],
@@ -90,58 +83,35 @@
       ],
       "description": "订单与工厂（含客户、单价，敏感）",
       "sensitive": true
-    },
-    {
-      "key": "erp",
-      "name": "经营数据(123库)",
-      "tables": [
-        "factory.sales_order",
-        "factory.sales_order_item",
-        "factory.product",
-        "factory.purchase_order",
-        "factory.purchase_order_item",
-        "factory.material",
-        "factory.quality_inspection",
-        "factory.production_record",
-        "factory.production_line",
-        "factory.workshop",
-        "factory.work_order",
-        "factory.inventory",
-        "factory.equipment",
-        "factory.equipment_maintenance"
-      ],
-      "description": "123库 ERP 经营数据（销售/采购/生产/质检/设备/库存）",
-      "sensitive": true
-    },
-    {
-      "key": "hr",
-      "name": "人事(123库)",
-      "tables": [
-        "factory.attendance",
-        "factory.employee"
-      ],
-      "description": "考勤与员工主数据（敏感）",
-      "sensitive": true
-    },
-    {
-      "key": "dim_common",
-      "name": "公共维表",
-      "tables": [
-        "dim_production_line",
-        "dim_product",
-        "dim_process",
-        "dim_equipment"
-      ],
-      "description": "产线 / 产品 / 工序 / 设备四张描述性维表。各岗位共享，用于按维度下钻；不含产量、质检、停机等业务明细。",
-      "sensitive": false
     }
   ],
   "policies": {
     "viewer": {
+      "datasets": [],
+      "tables": [],
+      "rows": {},
+      "columns": {
+        "dim_production_line": {
+          "supervisor": {
+            "mode": "mask",
+            "note": "负责人姓名脱敏",
+            "mask": "partial_1_1",
+            "agg_ok": false
+          }
+        },
+        "test_materials": {
+          "unit_cost": {
+            "mode": "deny",
+            "note": "成本价对普通员工不可见"
+          }
+        }
+      },
+      "metrics": {},
+      "actions": {}
+    },
+    "region_manager": {
       "datasets": [
-        "equipment",
-        "quality",
-        "inventory",
+        "sales",
         "prod_core"
       ],
       "tables": [],
@@ -149,427 +119,53 @@
         "test_factories": {
           "expr": "city = ${user.region}",
           "enabled": true,
-          "note": "快捷向导-只看本区域工厂",
-          "rule": {
-            "field": "city",
-            "op": "eq",
-            "source": "user.region"
-          }
+          "note": "只看本人所属区域的工厂"
         },
         "test_orders": {
           "expr": "factory_id IN (SELECT factory_id FROM test_factories WHERE city = ${user.region})",
           "enabled": true,
-          "note": "快捷向导-只看本区域订单",
-          "rule": {
-            "op": "in_subquery",
-            "ref_table": "test_factories",
-            "on": {
-              "left": "factory_id",
-              "right": "factory_id"
-            },
-            "where": {
-              "field": "city",
-              "op": "eq",
-              "source": "user.region"
-            }
-          }
+          "note": "只看本区域工厂的订单"
         }
       },
       "columns": {
         "test_orders": {
           "customer_name": {
             "mode": "mask",
-            "note": "快捷向导-客户名脱敏",
+            "note": "客户名称脱敏",
             "mask": "partial_1_1",
-            "agg_ok": false
-          }
-        },
-        "test_materials": {
-          "unit_cost": {
-            "mode": "mask",
-            "note": "快捷向导-成本价模糊化",
-            "mask": "round_100",
-            "agg_ok": false
-          }
-        },
-        "dim_production_line": {
-          "supervisor": {
-            "mode": "mask",
-            "note": "快捷向导-负责人脱敏",
-            "mask": "partial_1_1",
-            "agg_ok": false
-          }
-        },
-        "dim_equipment": {
-          "equipment_id": {
-            "mode": "mask",
-            "note": "",
-            "mask": "partial_1_1",
-            "agg_ok": false
-          },
-          "equipment_code": {
-            "mode": "mask",
-            "note": "",
-            "mask": "partial_3_4",
             "agg_ok": false
           }
         }
       },
-      "metrics": {},
-      "actions": {
-        "export": true,
-        "share": true,
-        "download": true
-      }
-    },
-    "prod_staff": {
-      "datasets": [
-        "prod_core",
-        "dim_common"
-      ],
-      "tables": [],
-      "rows": {},
-      "columns": {},
-      "metrics": {},
-      "actions": {}
-    },
-    "eqp_staff": {
-      "datasets": [
-        "equipment",
-        "dim_common"
-      ],
-      "tables": [],
-      "rows": {},
-      "columns": {},
-      "metrics": {},
-      "actions": {}
-    },
-    "qc_staff": {
-      "datasets": [
-        "quality",
-        "dim_common"
-      ],
-      "tables": [],
-      "rows": {},
-      "columns": {},
-      "metrics": {},
+      "metrics": {
+        "产量": {
+          "mode": "override",
+          "note": "销售视角口径",
+          "sql_expression": "SUM(good_qty + defect_qty)",
+          "formula": "合格产出 + 不良产出（总产出口径）",
+          "description": "区域销售口径：产量按总产出计（含不良），用于产能承诺"
+        }
+      },
       "actions": {}
     }
   },
   "sensitive": {
     "columns": [
-      "dim_production_line.supervisor",
       "test_materials.unit_cost",
+      "test_orders.unit_price",
       "test_orders.customer_name",
-      "test_orders.unit_price"
+      "dim_production_line.supervisor"
     ],
     "metrics": [
       "产量"
     ],
     "datasets": [
-      "erp",
-      "hr",
-      "inventory",
-      "sales"
+      "sales",
+      "inventory"
     ]
   },
-  "updated_at": "2026-09-28T13:59:46.763073+00:00",
-  "updated_by": "admin",
-  "user_grants": {
-    "viewer": {
-      "dim_equipment": [
-        "equipment_id",
-        "equipment_code",
-        "equipment_name",
-        "equipment_type",
-        "line_id",
-        "install_date",
-        "equipment_status"
-      ],
-      "dim_process": [
-        "process_id",
-        "process_code",
-        "process_name",
-        "process_seq",
-        "standard_yield_rate",
-        "is_key_process"
-      ],
-      "dim_product": [
-        "product_id",
-        "product_code",
-        "product_name",
-        "product_model",
-        "product_category",
-        "unit",
-        "is_active"
-      ],
-      "dim_production_line": [
-        "line_id",
-        "line_code",
-        "line_name",
-        "workshop_name",
-        "line_manager",
-        "line_status"
-      ],
-      "eqp_downtime_record": [
-        "downtime_id",
-        "equipment_id",
-        "line_id",
-        "start_time",
-        "end_time",
-        "downtime_minutes",
-        "downtime_reason",
-        "is_planned"
-      ],
-      "inv_inventory_snapshot": [
-        "snapshot_id",
-        "snapshot_date",
-        "product_id",
-        "warehouse_code",
-        "available_qty",
-        "frozen_qty",
-        "safety_stock_qty"
-      ],
-      "mes_process_output": [
-        "output_id",
-        "work_order_id",
-        "product_id",
-        "process_id",
-        "line_id",
-        "stat_date",
-        "input_qty",
-        "good_qty",
-        "defect_qty",
-        "rework_qty",
-        "shift_code"
-      ],
-      "mes_work_order": [
-        "work_order_id",
-        "work_order_no",
-        "product_id",
-        "line_id",
-        "plan_qty",
-        "start_date",
-        "end_date",
-        "order_status"
-      ],
-      "qms_defect_detail": [
-        "defect_id",
-        "inspection_id",
-        "defect_type",
-        "defect_code",
-        "defect_qty",
-        "severity_level",
-        "responsible_process_id"
-      ],
-      "qms_inspection": [
-        "inspection_id",
-        "inspection_no",
-        "work_order_id",
-        "product_id",
-        "process_id",
-        "inspection_date",
-        "sample_qty",
-        "defect_qty",
-        "inspection_result"
-      ]
-    },
-    "123456": {
-      "dim_product": [
-        "product_id",
-        "product_code",
-        "product_name",
-        "product_model",
-        "product_category",
-        "unit",
-        "is_active"
-      ],
-      "dim_process": [
-        "process_id",
-        "process_code",
-        "process_name",
-        "process_seq",
-        "standard_yield_rate",
-        "is_key_process"
-      ],
-      "dim_production_line": [
-        "line_id",
-        "line_code",
-        "line_name",
-        "workshop_name",
-        "line_manager",
-        "line_status"
-      ],
-      "dim_equipment": [
-        "equipment_id",
-        "equipment_code",
-        "equipment_name",
-        "equipment_type",
-        "line_id",
-        "install_date",
-        "equipment_status"
-      ],
-      "mes_work_order": [
-        "work_order_id",
-        "work_order_no",
-        "product_id",
-        "line_id",
-        "plan_qty",
-        "start_date",
-        "end_date",
-        "order_status"
-      ],
-      "mes_process_output": [
-        "output_id",
-        "work_order_id",
-        "product_id",
-        "process_id",
-        "line_id",
-        "stat_date",
-        "input_qty",
-        "good_qty",
-        "defect_qty",
-        "rework_qty",
-        "shift_code"
-      ],
-      "qms_inspection": [
-        "inspection_id",
-        "inspection_no",
-        "work_order_id",
-        "product_id",
-        "process_id",
-        "inspection_date",
-        "sample_qty",
-        "defect_qty",
-        "inspection_result"
-      ],
-      "qms_defect_detail": [
-        "defect_id",
-        "inspection_id",
-        "defect_type",
-        "defect_code",
-        "defect_qty",
-        "severity_level",
-        "responsible_process_id"
-      ],
-      "eqp_downtime_record": [
-        "downtime_id",
-        "equipment_id",
-        "line_id",
-        "start_time",
-        "end_time",
-        "downtime_minutes",
-        "downtime_reason",
-        "is_planned"
-      ],
-      "inv_inventory_snapshot": [
-        "snapshot_id",
-        "snapshot_date",
-        "product_id",
-        "warehouse_code",
-        "available_qty",
-        "frozen_qty",
-        "safety_stock_qty"
-      ]
-    },
-    "mask_8989@qq.com": {
-      "dim_product": [
-        "product_id",
-        "product_code",
-        "product_name",
-        "product_model",
-        "product_category",
-        "unit",
-        "is_active"
-      ],
-      "dim_process": [
-        "process_id",
-        "process_code",
-        "process_name",
-        "process_seq",
-        "standard_yield_rate",
-        "is_key_process"
-      ],
-      "dim_production_line": [
-        "line_id",
-        "line_code",
-        "line_name",
-        "workshop_name",
-        "line_manager",
-        "line_status"
-      ],
-      "dim_equipment": [
-        "equipment_id",
-        "equipment_code",
-        "equipment_name",
-        "equipment_type",
-        "line_id",
-        "install_date",
-        "equipment_status"
-      ],
-      "mes_work_order": [
-        "work_order_id",
-        "work_order_no",
-        "product_id",
-        "line_id",
-        "plan_qty",
-        "start_date",
-        "end_date",
-        "order_status"
-      ],
-      "mes_process_output": [
-        "output_id",
-        "work_order_id",
-        "product_id",
-        "process_id",
-        "line_id",
-        "stat_date",
-        "input_qty",
-        "good_qty",
-        "defect_qty",
-        "rework_qty",
-        "shift_code"
-      ],
-      "qms_inspection": [
-        "inspection_id",
-        "inspection_no",
-        "work_order_id",
-        "product_id",
-        "process_id",
-        "inspection_date",
-        "sample_qty",
-        "defect_qty",
-        "inspection_result"
-      ],
-      "qms_defect_detail": [
-        "defect_id",
-        "inspection_id",
-        "defect_type",
-        "defect_code",
-        "defect_qty",
-        "severity_level",
-        "responsible_process_id"
-      ],
-      "eqp_downtime_record": [
-        "downtime_id",
-        "equipment_id",
-        "line_id",
-        "start_time",
-        "end_time",
-        "downtime_minutes",
-        "downtime_reason",
-        "is_planned"
-      ],
-      "inv_inventory_snapshot": [
-        "snapshot_id",
-        "snapshot_date",
-        "product_id",
-        "warehouse_code",
-        "available_qty",
-        "frozen_qty",
-        "safety_stock_qty"
-      ]
-    }
-  },
+  "updated_at": "2026-10-04T15:41:16.524346+00:00",
+  "updated_by": "unit-fixture",
+  "user_grants": {},
   "strict_mode": false
 }

@@ -111,7 +111,31 @@ class MetricMemory:
 
     # 相关性下限：combined 分数低于此值视为「不相关」直接丢弃，避免弱相关指标污染 prompt。
     # floor = max(ABS_FLOOR, top * REL_RATIO) → 既保证绝对下限，又保证只保留相对最强的若干项。
+    #
+    # 2026-10-04 修复（真 bug，由「装上真embedding」暴露）：
+    # 原 ABS_FLOOR=0.12 是**照 n-gram兜底向量**的分布定的 —— embeddings.py:96-100 承诺
+    # 「无共享 token 时余弦精确为 0」，所以 0.12 足以滤掉一切不相关项。
+    # 换成真embedding（bge-small-zh-v1.5）后这个前提不成立：中文无意义串与业务指标
+    # 之间存在**基础语义相似度**（同属中文/制造业语境），实测：
+    #   「qwezxc随机串无意义」 vs「质检不合格率」= 0.4855
+    #   「asdfghjkl」           vs「产量」       = 0.3987
+    #   「lorem ipsum dolor」  vs「活跃产品数」   = 0.3484
+    #   无意义串 top1 区间 [0.3484, 0.4855]，均值 0.4235 —— 全部高于 0.12，
+    # 于是 `retrieve("qwezxc随机串无意义")` 稳定召回「安全库存/库存预警数/一次直通率」，
+    # 弱相关指标被注入 prompt（白盒误报 / 幻觉诱因）。
+    #
+    # 真embedding 的实测分界（10 组无意义串 vs 20 组业务词与近义词）：
+    #   无意义串 top1: [0.3484, 0.4855]   top3 最大 0.4609
+    #   业务词   top1: [0.5291, 0.7817]   top3 最小 0.5172
+    # → 干净的分界在 [0.4609, 0.5172]，取中位 0.49 留出两侧余量。
+    # ngram 模式仍用原值（它的不相关项精确为 0，0.12 已足够严格）。
     ABS_FLOOR = 0.12
+    # local embedding 专用的**纯向量分**下限（2026-10-04 实测标定，见 retrieve() 内注释）：
+    #   噪声 10 组 top1 = [0.3310, 0.5175]
+    #   真实 33 组 top1 = [0.4886, 0.7905]
+    # 0.52 能滤掉全部噪声；真实里贴近此值的两个样本（「采购金额」0.4929 /
+    # 「销售金额」0.4886）是**词库里本就没有的指标**，召不到不属误伤。
+    VEC_FLOOR_LOCAL_EMBED = 0.52
     REL_RATIO = 0.35
 
     def retrieve(self, query: str, top_k: int = 5, threshold: float | None = None,
@@ -193,9 +217,49 @@ class MetricMemory:
         else:
             combined = bm25_scaled
 
-        # ── 相关性下限过滤（绝对阈值，杜绝噪声放大）──
+        # ── 相关性下限过滤 ──
         top = max(combined) if combined else 0.0
-        floor = threshold if threshold is not None else max(self.ABS_FLOOR, top * self.REL_RATIO)
+        # 2026-10-04：floor 按向量模式分三种情况。
+        #   ngram / BM25 兜底 → 沿用 ABS_FLOOR=0.12（其不相关项精确为 0，0.12 已足够严格）
+        #   local embedding  → 不能用单一绝对阈值，见下方长注释
+        #   调用方显式传 threshold → 以传入值为准（不改原语义）
+        local_vec = bool(use_vec and self._embed_mode == "local")
+        # 2026-10-04 自查修正（P1·闸门曾是死代码）：
+        # 向量闸门原先放在 `else` 分支里，而**两个生产调用方都传了 threshold**
+        # （metric_registry.get_metric_hint / _retrieve_for_query 传 _HINT_RAG_FLOOR=0.40）
+        # → 永远走 `if threshold is not None` 分支，闸门形同不存在。
+        # 实测：`retrieve(threshold=0.40)` 下「qwezxc随机串无意义」仍召回「安全库存」，
+        # 而 `retrieve()`（无 threshold）返回 []。也就是说上午标定的那套分界
+        # （噪声 ≤0.5175/ 真实 ≥0.4886，闸门 0.52）对 prompt 注入这条主链路**完全没生效**。
+        # 现在把闸门提到threshold 判断**之前**：它是「这条查询是否与任何指标相关」的
+        # 总体判断，不该被调用方的分数阈值覆盖 —— 否则噪声查询只要 combined 过 0.40 就漏进来。
+        # 闸门只否决「整条查询都不该召回」，一旦通过仍用 combined 正常排序与相对过滤。
+        if local_vec:
+            vec_top = max(vec_scores) if vec_scores else 0.0
+            if vec_top < self.VEC_FLOOR_LOCAL_EMBED:
+                # 整条查询与词库里任何指标都不相关（纯噪声）→ 直接空返回，
+                # 避免弱相关指标被注入 prompt 造成白盒误报/幻觉诱因。
+                return []
+        if threshold is not None:
+            floor = threshold
+        elif not local_vec:
+            floor = max(self.ABS_FLOOR, top * self.REL_RATIO)
+        else:
+            # 真 embedding 下**对 combined 设单一绝对阈值必然二选一**（实测）：
+            #   「这是一段毫无业务含义的文字」（纯噪声）= 0.5541
+            #   「废品率」（真实业务词）             = 0.5268  ← 噪声反而更高
+            # 根因：combined = 0.65*向量 + 0.35*BM25，两路对「噪声」都有贡献 ——
+            # embedding 侧「任何中文都有约 0.5 语义基线」，
+            # BM25 侧中文 2-gram 切分会让「毫无/业务/含义」这类字面撞上候选。
+            #
+            # **纯向量分**分得干净得多。实测 top1：
+            #   噪声 10 组：[0.3310, 0.5175]
+            #   真实 33 组：[0.4886, 0.7905]
+            #   （0.4886/0.4929 对应「采购金额」「销售金额」—— 词库 103 个指标里
+            #     **本就没有**这两个，召不到属正常，不是误伤）
+            # 取 0.52：滤掉全部噪声，不误伤任何词库内指标。
+            # （向量闸门已提到 threshold 判断之前，见上方注释 —— 这里只算 floor）
+            floor = max(top * self.REL_RATIO, self.ABS_FLOOR)
         scored: list[tuple[dict, float]] = []
         for i in range(n):
             if combined[i] > 0 and combined[i] >= floor:

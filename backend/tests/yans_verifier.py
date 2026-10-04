@@ -21,8 +21,13 @@ from gen_yans_bank import build_bank
 # ═══ 独立权威口径（手写，与编译器无关）═══
 
 # 表 → 指标 → 独立聚合表达式（f 为事实表别名）
+# ⚠️ 口径必须与 agent/metric_registry.py 的当前声明一致。
+#    口径同步自检：python tests/test_verifier_consistency.py（不一致时该测试直接失败）
 REF_AGG = {
-    ("mes_process_output", "产量"): "SUM(f.good_qty)",
+    # 2026-10-04 口径同步：原为 SUM(f.good_qty)，漏计不良数。
+    # 注册表口径「产量 = 合格 + 不良（总产出，不含损耗）」。
+    # 实测证据：8 道工序「新口径 − 旧口径」差值精确等于该工序 SUM(defect_qty)。
+    ("mes_process_output", "产量"): "SUM(COALESCE(f.good_qty, 0) + COALESCE(f.defect_qty, 0))",
     ("mes_process_output", "良率"): "SUM(f.good_qty)::numeric * 100.0 / NULLIF(SUM(f.input_qty), 0)",
     ("mes_process_output", "不良数"): "SUM(f.defect_qty)",
     ("mes_process_output", "投入量"): "SUM(f.input_qty)",
@@ -31,7 +36,10 @@ REF_AGG = {
     ("mes_process_output", "合格数量"): "SUM(f.good_qty)",
     ("qms_defect_detail", "缺陷数"): "COUNT(*)",
     ("qms_defect_detail", "缺陷件数"): "SUM(COALESCE(f.defect_qty, 0))",
-    ("qms_defect_detail", "严重缺陷数"): "SUM(CASE WHEN f.severity_level = 'critical' THEN 1 ELSE 0 END)",
+    # 2026-10-04 口径同步：原为 Σ(severity='critical' 计 1 条)，等级范围与计量单位双重不符。
+    # 注册表口径「严重缺陷数 = severity ∈ {critical, major} 的 defect_qty 求和（件）」；
+    # critical 单一等级对应注册表的「致命缺陷数」，是不同指标。
+    ("qms_defect_detail", "严重缺陷数"): "SUM(CASE WHEN f.severity_level IN ('critical', 'major') THEN COALESCE(f.defect_qty, 0) ELSE 0 END)",
     ("qms_inspection", "抽检数"): "SUM(f.sample_qty)",
     ("qms_inspection", "质检合格率"): "SUM(f.sample_qty - COALESCE(f.defect_qty,0))::numeric * 100.0 / NULLIF(SUM(f.sample_qty), 0)",
     ("qms_inspection", "质检不合格率"): "SUM(f.defect_qty)::numeric * 100.0 / NULLIF(SUM(f.sample_qty), 0)",
@@ -50,12 +58,27 @@ REF_AGG = {
     ("eqp_downtime_record", "计划内停机次数"): "SUM(CASE WHEN f.is_planned THEN 1 ELSE 0 END)",
     ("eqp_downtime_record", "计划内停机时长"): "SUM(CASE WHEN f.is_planned THEN f.downtime_minutes ELSE 0 END)",
     ("eqp_downtime_record", "非计划停机占比"): "SUM(CASE WHEN f.is_planned = FALSE THEN f.downtime_minutes ELSE 0 END)::numeric * 100.0 / NULLIF(SUM(f.downtime_minutes), 0)",
-    ("inv_inventory_snapshot", "库存量"): "SUM(f.available_qty)",
-    ("inv_inventory_snapshot", "总库存"): "SUM(f.available_qty + COALESCE(f.frozen_qty, 0))",
-    ("inv_inventory_snapshot", "安全库存"): "SUM(f.safety_stock_qty)",
+    # 2026-10-04 口径同步：原为 SUM(f.available_qty)（全历史求和）。
+    # inv_inventory_snapshot 是每日快照表，全历史求和会按天重复累加
+    # （实测 3,366,671 vs 最新快照 73,781，差 46 倍，注册表已标注旧口径废弃）。
+    # 注册表口径「库存量 = 最新快照日 的 可用 + 冻结」。
+    ("inv_inventory_snapshot", "库存量"):
+        "SUM(CASE WHEN f.snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) "
+        "THEN f.available_qty + COALESCE(f.frozen_qty, 0) ELSE 0 END)",
+    # 2026-10-04 二次同步：注册表把「总库存 / 安全库存 / 冻结库存」也改成
+    # **最新快照日**（快照表全历史求和会按天重复累加，注册表已注明旧口径废弃），
+    # 验证器此前只有「库存量」跟着改了 → 一致性自检报 3 处分歧。此处一并对齐。
+    ("inv_inventory_snapshot", "总库存"):
+        "SUM(CASE WHEN f.snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) "
+        "THEN f.available_qty + COALESCE(f.frozen_qty, 0) ELSE 0 END)",
+    ("inv_inventory_snapshot", "安全库存"):
+        "SUM(CASE WHEN f.snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) "
+        "THEN f.safety_stock_qty ELSE 0 END)",
     ("inv_inventory_snapshot", "缺货量"): "SUM(CASE WHEN f.available_qty < f.safety_stock_qty THEN f.safety_stock_qty - f.available_qty ELSE 0 END)",
     ("inv_inventory_snapshot", "库存预警数"): "SUM(CASE WHEN f.available_qty < f.safety_stock_qty THEN 1 ELSE 0 END)",
-    ("inv_inventory_snapshot", "冻结库存"): "SUM(f.frozen_qty)",
+    ("inv_inventory_snapshot", "冻结库存"):
+        "SUM(CASE WHEN f.snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) "
+        "THEN COALESCE(f.frozen_qty, 0) ELSE 0 END)",
     ("dim_equipment", "设备数"): "COUNT(*)",
     ("dim_equipment", "运行设备数"): "SUM(CASE WHEN f.equipment_status = 'running' THEN 1 ELSE 0 END)",
     ("dim_equipment", "维护设备数"): "SUM(CASE WHEN f.equipment_status = 'maintenance' THEN 1 ELSE 0 END)",

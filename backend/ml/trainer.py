@@ -131,6 +131,16 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
     join_spec: 目标列不在 table 里时，按公共主键从另一张表汇总（见 _load_data_joined）。
     """
     params = _clamp_train_params(params)
+    # 2026-10-04 修复（真实用户可见错误，实测复现）：
+    # features 为空时原实现直接往下走 → `_load_data(table, [target])` 拼出 `SELECT , FROM t`
+    # 之类的坏 SQL，或让 sklearn拿到空数组后抛
+    #   ValueError: at least one array or dtype is required
+    # （sklearn/utils/validation.py:check_array）。该 ValueError 被 main.py 的
+    # `except ValueError → HTTPException(400, detail=str(e))` 原样透出，
+    # 于是管理员建模页传空特征 → 界面显示 sklearn 英文内部报错。
+    # 此前从未暴露：TrainRequest.features 没有长度约束，且没人真的提交过空列表。
+    if not features or not [c for c in features if str(c).strip()]:
+        raise ValueError("请至少选择一个特征字段（features 不能为空）")
     if model_type not in MODEL_TYPES:
         raise ValueError(f"不支持的模型类型 '{model_type}'，可用: {', '.join(MODEL_TYPES)}")
     info = MODEL_TYPES[model_type]

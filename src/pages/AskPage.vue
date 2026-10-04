@@ -2645,6 +2645,7 @@ const chartTypeOptions = [
   { v: 'bar', label: '柱状图' },
   { v: 'barh', label: '横向柱状' },
   { v: 'stacked', label: '堆叠柱' },
+  { v: 'dual', label: '双轴组合' },
   { v: 'line', label: '折线图' },
   { v: 'area', label: '面积图' },
   { v: 'pie', label: '饼图' },
@@ -2667,7 +2668,7 @@ const chartTypeRenderable = (msg: any, v: string) => {
 }
 // 禁用项的悬停说明（告知用户为何灰掉，而不是让用户反复点击怀疑坏了）
 const chartTypeDisabledTip = (msg: any, v: string) =>
-  chartTypeRenderable(msg, v) ? '' : '当前数据不支持该图型（如散点/堆叠需要两个及以上数值列），请先查询多指标数据'
+  chartTypeRenderable(msg, v) ? '' : '当前数据不支持该图型（散点/堆叠/双轴需要两个及以上数值列），请先查询多指标数据'
 
 const switchChartType = (msg: any, type: string) => {
   if (!msg || !type) return

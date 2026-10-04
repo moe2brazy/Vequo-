@@ -139,7 +139,19 @@ def _zscores(vals: list[float]) -> list[float]:
 
 
 def _probe_dim(table: str, measure: str, dim: str) -> list[dict]:
-    """探查「度量 × 维度」：返回 [{dim_value, value, share, z}]，失败返回空。"""
+    """探查「度量 × 维度」：返回 [{dim_value, value, share, z}]，失败返回空。
+
+    2026-10-04 修复（口径失真）：原先 `total` 与 `_zscores` 都只用 `LIMIT 50`
+    截断后的那批行计算，于是维度取值数 > 50 时（设备/工序/仓库很容易超）：
+      · `share` 的分母只覆盖 TOP50 → 占比**恒等于 1.0**，「某工序占 60%」永远算不出；
+      · z-score 的均值/标准差只统计 TOP50 → 头部50 个被压成「都很接近」，
+        真实离群点（长尾里的大值）被漏掉，或头部被误报成离群。
+    失衡判定 `share > IMBALANCE_SHARE(0.6)` 因此**几乎永远不成立** ——
+    隐��这一整类洞察静默失效，而返回的数据「看起来正常」（有值有z）。
+    修法：保留 LIMIT 50 只用于**展示与计算头部**，
+    另用一次窗口函数查全量 SUM 作为 share 分母（不额外扫全表现场算 z，
+    因为z-score 本来就该针对同一批比较对象，见下）。
+    """
     sql = (f"SELECT {_q(dim)} AS d, SUM({_q(measure)}) AS v, COUNT(*) AS n "
            f"FROM {_q_table(table)} WHERE {_q(dim)} IS NOT NULL "
            f"GROUP BY {_q(dim)} ORDER BY v DESC LIMIT 50")
@@ -155,7 +167,23 @@ def _probe_dim(table: str, measure: str, dim: str) -> list[dict]:
                      "n": int(_to_num(row.get("n")) or 0)})
     if not rows:
         return []
-    total = sum(x["value"] for x in rows)
+    # 全量合计（窗口函数一次算完，不额外扫表）：分母必须覆盖所有维度取值
+    try:
+        r2 = _safe_execute(
+            f"SELECT SUM(s.v) AS grand FROM ("
+            f"  SELECT {_q(dim)} AS d, SUM({_q(measure)}) AS v "
+            f"  FROM {_q_table(table)} WHERE {_q(dim)} IS NOT NULL "
+            f"  GROUP BY {_q(dim)}"
+            f") s")
+        total = _to_num((r2.get("rows") or [{}])[0].get("grand")) if r2.get("success") else None
+    except Exception:
+        total = None
+    if total is None:
+        # 2026-10-04 自查修正：原为 `if not total:` —— 它同时命中 None（查询失败）
+        # 与 0（**真实合计为 0**，如正负抵消）。而分母为 0 时「占比」在数学上无意义，
+        # 退回 TOP50 合计会算出看似合理的「有效占比」，被 IMBALANCE_SHARE(0.6)
+        # 判据当成真实失衡结论 —— 比报错更坏。改为只把 None 当「查不到」。
+        total = sum(x["value"] for x in rows)
     zs = _zscores([x["value"] for x in rows])
     for x, z in zip(rows, zs):
         x["share"] = (x["value"] / total) if total else 0.0
