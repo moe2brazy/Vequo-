@@ -45,7 +45,10 @@ BUILTIN_METRICS: list[dict] = [
         "name": "产量",
         # 2026-09-29 摘除别名「产量占比」：本口径是绝对值（SUM good+defect），
         # 「占比」是除法语义，挂在这里会让「X产量占比」命中后把占比静默降级成绝对值。
-        "aliases": ["产出量", "总产量", "产出", "产出数量", "产量最多", "实际产量"],
+        "aliases": ["产出量", "总产量", "产出", "产出数量", "产量最多", "实际产量",
+                    # 2026-10-04：口语化的「生产趋势」问法（「分析一下这几个月的生产趋势」）
+                    # 此前零命中 → 编译回退 LLM。属产量按时间的趋势口径。
+                    "生产趋势", "产出趋势"],
         "unit": "件",
         "tables": ["mes_process_output"],
         # 企业口径（2026-09-09 数据介绍.md）：产量 = 合格 + 不良（总产出，不含损耗）
@@ -132,7 +135,9 @@ BUILTIN_METRICS: list[dict] = [
     },
     {
         "name": "不良数",
-        "aliases": ["生产不良数", "不良数量", "不良品数"],
+        "aliases": ["生产不良数", "不良数量", "不良品数",
+                    # 2026-10-04：口语「查一下各工序的不良情况」零命中 → 编译回退 LLM。
+                    "不良情况", "不良状况"],
         "unit": "件",
         "tables": ["mes_process_output"],
         "sql_expression": "SUM(defect_qty)",
@@ -201,7 +206,10 @@ BUILTIN_METRICS: list[dict] = [
         # 无「产线」维度与桥接 → 编译失败回退 LLM，慢且答非所问）。已转交「不良类型排行」（带产线桥接）。
         # 2026-10-01 补别名：「严重程度分布」= 各严重度的缺陷数（dims 含「严重度」，维度别名「严重程度」已注册）。
         # 原表无此词，实测零命中走 LLM。
-        "aliases": ["缺陷条数", "缺陷明细数", "不良记录数", "缺陷分布", "不良分布", "缺陷类型分布", "严重程度分布", "缺陷最多", "出了几个缺陷", "缺陷有几条"],
+        "aliases": ["缺陷条数", "缺陷明细数", "不良记录数", "缺陷分布", "不良分布", "缺陷类型分布", "严重程度分布", "缺陷最多", "出了几个缺陷", "缺陷有几条",
+                    # 2026-10-04：补「严重度分布」（词表里只有全称「严重程度分布」，
+                    # 「各缺陷类型的严重度分布」因此零命中 → 编译回退 LLM）。
+                    "严重度分布", "缺陷严重度分布"],
         # 2026-09-29 审计修正：原单位「次」不准确——本口径是 COUNT(*) 记录条数（yans 实测 2115 条），
         # 且易与「缺陷件数」(5273 件) 混淆，故改为「条」。
         "unit": "条",
@@ -291,7 +299,9 @@ BUILTIN_METRICS: list[dict] = [
         # 2026-10-01 补别名：「停机原因分析/分布/排行」= 各停机原因的停机时长（dims 含「停机原因」）。
         # 原表无此词，「停机原因」只是维度名不是别名，实测「停机原因分析」零命中走 LLM。
         "aliases": ["停机时间", "停机分钟", "停机总时长", "停了多久", "设备停了多久", "停机了多少", "一共停机多长时间",
-                    "停机原因分析", "停机原因分布", "停机原因排行"],
+                    "停机原因分析", "停机原因分布", "停机原因排行",
+                    # 2026-10-04：「哪个车间的停机问题最严重」= 停机时长最多的车间，此前零命中。
+                    "停机问题"],
         "unit": "分钟",
         "tables": ["eqp_downtime_record"],
         "sql_expression": "SUM(downtime_minutes)",
@@ -305,10 +315,190 @@ BUILTIN_METRICS: list[dict] = [
         # 支撑「各车间的停机原因排行」这类跨维问法（_FACT_META 已注册该桥接，此前 dims 漏声明）。
         "dims": ["设备", "产线", "车间", "停机原因", "计划类型"],
     },
+    # ── 2026-10-04 新增：分母可确定性推导的「率」类复合指标 ──────────────────────
+    # 背景（用户产品决策）：AI 兜底路径的第一硬标准是「出结果」，不接受「拒绝生成」。
+    # 「停机率」原被 _UNDERIVABLE_METRIC_RULES 判为「缺源字段 → 源头拒绝」，理由是库里
+    # 没有「计划/日历工时」列。复核后确认**分母可由现有数据确定性推导**，属可算口径：
+    #     日历工时 = 统计期天数 × 设备台数 × 1440（分钟/天/台）
+    #       · 统计期天数 = eqp_downtime_record 的 (MAX(start_time)::date − MIN(start_time)::date)
+    #       · 设备台数   = dim_equipment 记录数
+    # 于是不再回退 LLM、更不拒绝，登记为确定性口径（exec_sql），走 render_exec_sql_metric。
+    # 真库实测（yans，2026-08-01~09-15）：15600 分钟 ÷ (45 天 × 48 台 × 1440) → 停机率 0.50%、
+    # 稼动率 99.50%；按设备类型 0.36%~0.80%、按产线 0.53%~0.67%，量级合理。
+    {
+        "name": "停机率",
+        # 只收不与他项别名冲突的写法：「停机占比」会与「故障停机占比」构成子串冲突，故不收录。
+        "aliases": ["停机时间占比", "设备停机率", "综合设备停机率", "设备综合停机率",
+                    "全厂停机率", "设备停机时间占比"],
+        "unit": "%",
+        "tables": ["eqp_downtime_record", "dim_equipment"],
+        "exec_sql": (
+            'SELECT ROUND(SUM(d.downtime_minutes) * 100.0 / NULLIF('
+            '(SELECT (MAX(start_time)::date - MIN(start_time)::date) FROM eqp_downtime_record)'
+            ' * (SELECT COUNT(*) FROM dim_equipment) * 1440, 0), 2) AS "停机率" '
+            'FROM eqp_downtime_record d'),
+        "exec_sql_by_dim": {
+            "_default": (
+                'SELECT ROUND(SUM(d.downtime_minutes) * 100.0 / NULLIF('
+                '(SELECT (MAX(start_time)::date - MIN(start_time)::date) FROM eqp_downtime_record)'
+                ' * (SELECT COUNT(*) FROM dim_equipment) * 1440, 0), 2) AS "停机率" '
+                'FROM eqp_downtime_record d'),
+            "设备类型": (
+                'SELECT e.equipment_type AS "设备类型", ROUND(SUM(d.downtime_minutes) * 100.0 / NULLIF('
+                '(SELECT (MAX(start_time)::date - MIN(start_time)::date) FROM eqp_downtime_record)'
+                ' * COUNT(DISTINCT e.equipment_id) * 1440, 0), 2) AS "停机率" '
+                'FROM eqp_downtime_record d JOIN dim_equipment e ON e.equipment_id = d.equipment_id '
+                'GROUP BY e.equipment_type ORDER BY "停机率" DESC'),
+            "设备": (
+                'SELECT e.equipment_name AS "设备", ROUND(SUM(d.downtime_minutes) * 100.0 / NULLIF('
+                '(SELECT (MAX(start_time)::date - MIN(start_time)::date) FROM eqp_downtime_record)'
+                ' * 1440, 0), 2) AS "停机率" '
+                'FROM eqp_downtime_record d JOIN dim_equipment e ON e.equipment_id = d.equipment_id '
+                'GROUP BY e.equipment_name ORDER BY "停机率" DESC'),
+            "产线": (
+                'SELECT l.line_name AS "产线", ROUND(SUM(d.downtime_minutes) * 100.0 / NULLIF('
+                '(SELECT (MAX(start_time)::date - MIN(start_time)::date) FROM eqp_downtime_record)'
+                ' * COUNT(DISTINCT e.equipment_id) * 1440, 0), 2) AS "停机率" '
+                'FROM eqp_downtime_record d JOIN dim_equipment e ON e.equipment_id = d.equipment_id '
+                'JOIN dim_production_line l ON l.line_id = e.line_id '
+                'GROUP BY l.line_name ORDER BY "停机率" DESC'),
+            "车间": (
+                'SELECT l.workshop_name AS "车间", ROUND(SUM(d.downtime_minutes) * 100.0 / NULLIF('
+                '(SELECT (MAX(start_time)::date - MIN(start_time)::date) FROM eqp_downtime_record)'
+                ' * COUNT(DISTINCT e.equipment_id) * 1440, 0), 2) AS "停机率" '
+                'FROM eqp_downtime_record d JOIN dim_equipment e ON e.equipment_id = d.equipment_id '
+                'JOIN dim_production_line l ON l.line_id = e.line_id '
+                'GROUP BY l.workshop_name ORDER BY "停机率" DESC'),
+            "日期": (
+                'SELECT to_char(d.start_time::date, \'YYYY-MM-DD\') AS "日期", '
+                'ROUND(SUM(d.downtime_minutes) * 100.0 / NULLIF((SELECT COUNT(*) FROM dim_equipment) * 1440, 0), 2) AS "停机率" '
+                'FROM eqp_downtime_record d GROUP BY d.start_time::date ORDER BY d.start_time::date'),
+        },
+        "formula": "SUM(downtime_minutes) ÷ (统计期天数 × 设备台数 × 1440) × 100",
+        "description": "设备停机率（**日历工时口径**，yans 实测 0.50%）：停机总时长 ÷ 日历工时，"
+                       "日历工时 = 统计期天数 × 设备台数 × 1440 分钟（天数取停机表时间跨度、"
+                       "台数取 dim_equipment 记录数）。⚠️ 这是「停机时长占日历时间」的口径，"
+                       "与「停机时长占计划运行时间」的车间口径在分母上不同——注册表无计划工时数据，"
+                       "如需该口径请登记。确定性执行（exec_sql），不走 LLM。",
+        "dims": ["设备类型", "设备", "产线", "车间", "日期"],
+    },
+    {
+        "name": "稼动率",
+        "aliases": ["开动率", "设备稼动率", "设备开动率", "设备运转率"],
+        "unit": "%",
+        "tables": ["eqp_downtime_record", "dim_equipment"],
+        "exec_sql": (
+            'SELECT ROUND(100 - SUM(d.downtime_minutes) * 100.0 / NULLIF('
+            '(SELECT (MAX(start_time)::date - MIN(start_time)::date) FROM eqp_downtime_record)'
+            ' * (SELECT COUNT(*) FROM dim_equipment) * 1440, 0), 2) AS "稼动率" '
+            'FROM eqp_downtime_record d'),
+        "exec_sql_by_dim": {
+            "_default": (
+                'SELECT ROUND(100 - SUM(d.downtime_minutes) * 100.0 / NULLIF('
+                '(SELECT (MAX(start_time)::date - MIN(start_time)::date) FROM eqp_downtime_record)'
+                ' * (SELECT COUNT(*) FROM dim_equipment) * 1440, 0), 2) AS "稼动率" '
+                'FROM eqp_downtime_record d'),
+            "设备类型": (
+                'SELECT e.equipment_type AS "设备类型", ROUND(100 - SUM(d.downtime_minutes) * 100.0 / NULLIF('
+                '(SELECT (MAX(start_time)::date - MIN(start_time)::date) FROM eqp_downtime_record)'
+                ' * COUNT(DISTINCT e.equipment_id) * 1440, 0), 2) AS "稼动率" '
+                'FROM eqp_downtime_record d JOIN dim_equipment e ON e.equipment_id = d.equipment_id '
+                'GROUP BY e.equipment_type ORDER BY "稼动率" DESC'),
+            "设备": (
+                'SELECT e.equipment_name AS "设备", ROUND(100 - SUM(d.downtime_minutes) * 100.0 / NULLIF('
+                '(SELECT (MAX(start_time)::date - MIN(start_time)::date) FROM eqp_downtime_record)'
+                ' * 1440, 0), 2) AS "稼动率" '
+                'FROM eqp_downtime_record d JOIN dim_equipment e ON e.equipment_id = d.equipment_id '
+                'GROUP BY e.equipment_name ORDER BY "稼动率" DESC'),
+            "产线": (
+                'SELECT l.line_name AS "产线", ROUND(100 - SUM(d.downtime_minutes) * 100.0 / NULLIF('
+                '(SELECT (MAX(start_time)::date - MIN(start_time)::date) FROM eqp_downtime_record)'
+                ' * COUNT(DISTINCT e.equipment_id) * 1440, 0), 2) AS "稼动率" '
+                'FROM eqp_downtime_record d JOIN dim_equipment e ON e.equipment_id = d.equipment_id '
+                'JOIN dim_production_line l ON l.line_id = e.line_id '
+                'GROUP BY l.line_name ORDER BY "稼动率" DESC'),
+            "日期": (
+                'SELECT to_char(d.start_time::date, \'YYYY-MM-DD\') AS "日期", '
+                'ROUND(100 - SUM(d.downtime_minutes) * 100.0 / NULLIF((SELECT COUNT(*) FROM dim_equipment) * 1440, 0), 2) AS "稼动率" '
+                'FROM eqp_downtime_record d GROUP BY d.start_time::date ORDER BY d.start_time::date'),
+        },
+        "formula": "100 − 停机率（日历工时口径）",
+        "description": "设备稼动率（**日历工时口径近似**，yans 实测 99.50%）：100 − 停机率。"
+                       "⚠️ 严格定义的「稼动率 = 运行时间 ÷ 计划时间」需要计划工时数据，本库没有，"
+                       "此处以「日历时间 − 停机时间」占日历时间的比例近似，已在结果中声明。"
+                       "确定性执行（exec_sql），不走 LLM。",
+        "dims": ["设备类型", "设备", "产线", "车间", "日期"],
+    },
+    # ── 2026-10-05 新增：产能利用率 / 设备利用率 ──────────────────────────────
+    # 为什么要登记（实测驱动，不是预防性加指标）：
+    #   用户实测「产能利用率是多少」→ LLM 生成
+    #     SELECT ... FROM mes_work_order WHERE w.order_status IN ('COMPLETED','IN_PROGRESS')
+    #   返回 **NULL**，洞察层只能说「数据缺失，无法提供具体数值」。
+    #   实测根因：**状态值大小写不匹配**——库里的值是小写 completed / in_progress，
+    #   LLM 写的是大写 → WHERE 过滤掉全部行 → 分母为 NULL。
+    #   而它本来选的口径（计划量 ÷ 产线×天数×8h×60）**根本不是产能利用率**：
+    #   产能利用率的真分母是「设计产能 / 理论节拍」，本库既无 design_capacity 也无 cycle_time
+    #   （已核 dim_equipment 7 列 / dim_production_line 6 列，均无基准列）。
+    #   ⇒ 既要修可算性，也要修口径。
+    # 本次登记的口径（**可确定性算出 + 显式声明差异**）：
+    #   产能利用率 ≈ 投入产出率 = SUM(good_qty) ÷ SUM(input_qty) × 100
+    #   为什么这个近似成立：投入量(input_qty) 本身已扣除工艺损耗，等于「实际吃进去的产能」；
+    #   故 投入产出率 在多数场景下**高于**真产能利用率，但两者同向、可用于趋势与对比。
+    #   yans 实测：97.56%。
+    #   ⚠️ 局限已写进 description，且结果卡片会展示 —— 属「标注着估」，不是冒充。
+    {
+        "name": "产能利用率",
+        # ⚠️ 别名刻意**不含**「设备利用率」：设备维度的利用率语义上等于稼动率
+        # （运行时间 ÷ 可用时间），已由上面的「稼动率」用 exec_sql 精确覆盖。
+        # 若把「设备利用率」收进本指标，问「设备利用率」会拿到「投入产出率」97.56%，
+        # 而稼动率明明算得出来（99.50%）——那是**用一个可算口径换掉另一个可算口径**，
+        # 比缺口径更糟。「设备利用率」无专属别名时交由 LLM 兜底 + 声明口径。
+        "aliases": ["设备产能利用率", "产线利用率", "产能利用情况",
+                    "综合产能利用率", "产能利用占比"],
+        "unit": "%",
+        "tables": ["mes_process_output", "dim_production_line"],
+        "exec_sql": (
+            'SELECT ROUND(SUM(COALESCE(good_qty, 0)) * 100.0 / '
+            'NULLIF(SUM(COALESCE(input_qty, 0)), 0), 2) AS "产能利用率" '
+            'FROM mes_process_output'),
+        "exec_sql_by_dim": {
+            "_default": (
+                'SELECT ROUND(SUM(COALESCE(good_qty, 0)) * 100.0 / '
+                'NULLIF(SUM(COALESCE(input_qty, 0)), 0), 2) AS "产能利用率" '
+                'FROM mes_process_output'),
+            "产线": (
+                'SELECT d.line_name AS "产线", ROUND(SUM(COALESCE(f.good_qty, 0)) * 100.0 / '
+                'NULLIF(SUM(COALESCE(f.input_qty, 0)), 0), 2) AS "产能利用率" '
+                'FROM mes_process_output f JOIN dim_production_line d ON d.line_id = f.line_id '
+                'GROUP BY d.line_name ORDER BY "产能利用率" DESC'),
+            "车间": (
+                'SELECT d.workshop_name AS "车间", ROUND(SUM(COALESCE(f.good_qty, 0)) * 100.0 / '
+                'NULLIF(SUM(COALESCE(f.input_qty, 0)), 0), 2) AS "产能利用率" '
+                'FROM mes_process_output f JOIN dim_production_line d ON d.line_id = f.line_id '
+                'GROUP BY d.workshop_name ORDER BY "产能利用率" DESC'),
+            "日期": (
+                'SELECT to_char(f.stat_date, \'YYYY-MM-DD\') AS "日期", '
+                'ROUND(SUM(COALESCE(f.good_qty, 0)) * 100.0 / '
+                'NULLIF(SUM(COALESCE(f.input_qty, 0)), 0), 2) AS "产能利用率" '
+                'FROM mes_process_output f GROUP BY f.stat_date ORDER BY f.stat_date'),
+        },
+        "formula": "SUM(good_qty) ÷ SUM(input_qty) × 100（投入产出率口径）",
+        "description": "设备/产线产能利用率（**投入产出率近似口径**，yans 实测 97.56%）："
+                       "合格产出 ÷ 投入产出。⚠️ **这不是严格定义的产能利用率**"
+                       "（严格定义 = 实际产出 ÷ 设计产能，需「设计产能/理论节拍」基准，"
+                       "本库 dim_equipment / dim_production_line 均无该字段）。"
+                       "此处以「投入量已含工艺损耗」为依据做近似：通常**高于**真产能利用率，"
+                       "但两者同向，适合看趋势与横向对比，不可直接用于产能考核。"
+                       "确定性执行（exec_sql），不走 LLM。",
+        "dims": ["产线", "车间", "日期"],
+    },
     {
         "name": "停机次数",
         "aliases": ["停机记录数", "停机总次数", "停了几次机", "停机了几次", "停了多少次",
-                    "多少次停机", "发生几次停机", "发生了多少次停机"],
+                    "多少次停机", "发生几次停机", "发生了多少次停机",
+                    # 2026-10-04：补「停机最多」（「看看哪些设备停机最多」= 停机次数最多），
+                    # 此前零命中 → 编译回退 LLM。
+                    "停机最多", "故障最多"],
         "unit": "次",
         "tables": ["eqp_downtime_record"],
         "sql_expression": "COUNT(*)",
@@ -405,7 +595,10 @@ BUILTIN_METRICS: list[dict] = [
         # 注入红线）→ 确定性执行由 exec_sql/exec_sql_by_dim 承担（与「安全库存达标率」同模式）。
         # 别名「可用库存」「库存变化」移除：前者语义应为不含冻结（防混），后者是时序语义
         # （趋势问法交 LLM 画每日序列，不该落到单值口径）。
-        "aliases": ["库存数量"],
+        "aliases": ["库存数量",
+                    # 2026-10-04：口语「库存变化」「库存情况」「还有多少货」零命中 → 编译回退 LLM。
+                    # 均指库存量本身（含按时间的库存变化趋势），不改变口径语义。
+                    "库存变化", "库存情况", "库存状况", "还有多少货"],
         "unit": "件",
         "tables": ["inv_inventory_snapshot"],
         # 2026-10-03 修复：原值是 `SUM(available_qty)` —— 已被本条 description 明确
@@ -445,9 +638,15 @@ BUILTIN_METRICS: list[dict] = [
         "aliases": ["冻结量", "冻结数量"],
         "unit": "件",
         "tables": ["inv_inventory_snapshot"],
-        "sql_expression": "SUM(COALESCE(frozen_qty,0))",
-        "formula": "SUM(frozen_qty)",
-        "description": "冻结库存合计（口径：inv_inventory_snapshot.frozen_qty 求和）",
+        "sql_expression": "SUM(CASE WHEN snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) THEN COALESCE(frozen_qty,0) ELSE 0 END)",
+        "formula": "最新快照日 Σ(frozen_qty)",
+        "description": "冻结库存合计（口径：**最新快照日**的 frozen_qty 求和）。"
+                       "2026-10-04 修复：原表达式 `SUM(COALESCE(frozen_qty,0))` **不带日期条件**，"
+                       "而 inv_inventory_snapshot 是每日快照表（yans 45 个快照日）→ "
+                       "跨全部快照日累计。实测 **40180 vs 正确 820（49 倍）**，"
+                       "而 description 当时只写了「不带日期条件会累计」的提示、**字段本身没改**，"
+                       "于是确定性编译（0.1s、格式完全正常、无任何提示）下发给用户的就是 40180。"
+                       "与「库存量」的同款 bug（2026-10-03 已修）同型。",
         "dims": ["仓库", "产品", "日期"],
     },
     {
@@ -455,11 +654,23 @@ BUILTIN_METRICS: list[dict] = [
         "aliases": ["库存总量", "总库存量", "总库存多少"],
         "unit": "件",
         "tables": ["inv_inventory_snapshot"],
-        "sql_expression": "SUM(available_qty + COALESCE(frozen_qty,0))",
-        "formula": "可用库存 + 冻结库存",
-        # 2026-09-25 审计修正：注明全历史快照口径，当前时点引导到「当前总库存量」
-        "description": "总库存 = 可用库存 + 冻结库存（口径：inv_inventory_snapshot **全历史快照**求和，"
-                       "yans 实测 3406851；问当前时点请用「当前总库存量」口径，最新快照 73781）",
+        # 2026-10-04 修复（P0·用户可见矛盾）：
+        # 本指标算式与「库存量」**完全相同**（Σ(available+frozen)），但口径相反 ——
+        # 「库存量」收敛到最新快照日=73781，本指标跨 45 个快照日累加 = 3406851（46 倍）。
+        # 而两者的业务别名高度重叠（「库存量」别名含「总产量」型问法，本指标别名含
+        # 「总库存多少/库存总量/总库存量」），于是同一个业务问题会因措辞不同得到差 46 倍的答案：
+        #   问「库存量是多少」→ 73781（对）；问「总库存是多少」→ 3406851（错）。
+        # 2026-09-25 审计只改了 description（注明全历史口径 + 引导到「当前总库存量」），
+        # 但表达式没改 → 用户仍会拿到错值。
+        # 现在统一收敛到最新快照日；「跨快照累加」这种口径本身没有业务意义
+        # （库存是时点值，不是流量），若确需历史累计应另起明确命名的指标。
+        "sql_expression": "SUM(CASE WHEN snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) THEN available_qty + COALESCE(frozen_qty,0) ELSE 0 END)",
+        "formula": "最新快照日 Σ(available_qty + frozen_qty)",
+        "description": "总库存 = 可用库存 + 冻结库存（口径：**最新快照日**求和，yans 实测 73781）。"
+                       "2026-10-04 修复：原为全历史快照累加（3406851，差 46 倍），"
+                       "且与「库存量」算式相同却口径相反，导致同一问题因措辞不同返回差 46 倍的结果"
+                       "（实测「库存量是多少」→73781、「总库存是多少」→3406851）。"
+                       "库存是时点值不是流量，跨快照累加无业务意义，已统一收敛。",
         "dims": ["仓库", "产品", "日期"],
     },
     {
@@ -467,9 +678,15 @@ BUILTIN_METRICS: list[dict] = [
         "aliases": ["安全库存量"],
         "unit": "件",
         "tables": ["inv_inventory_snapshot"],
-        "sql_expression": "SUM(safety_stock_qty)",
-        "formula": "SUM(safety_stock_qty)",
-        "description": "安全库存合计（口径：inv_inventory_snapshot.safety_stock_qty 求和）",
+        "sql_expression": "SUM(CASE WHEN snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) THEN safety_stock_qty ELSE 0 END)",
+        "formula": "最新快照日 Σ(safety_stock_qty)",
+        "description": "安全库存合计（口径：**最新快照日**的 safety_stock_qty 求和，yans 实测 16100）。"
+                       "2026-10-04 修复：原表达式 `SUM(safety_stock_qty)` 不带日期条件，"
+                       "跨 45 个快照日累计 → 实测 **879300 vs 正确 16100（54.6 倍）**。"
+                       "⚠️ 旧 description 曾辩解「安全库存是配置值、数值稳定所以累计无妨」——"
+                       "**该辩解已被数据否证**：真库检查发现每个产品都有 **4 个不同的"
+                       " safety_stock_qty 值**（P001~P005 均为 4 个），说明期间安全线被上调过，"
+                       "并非配置值恒定。库存/安全库存都是时点值，跨快照累加无业务意义。",
         "dims": ["仓库", "产品", "日期"],
     },
     {
@@ -477,12 +694,16 @@ BUILTIN_METRICS: list[dict] = [
         "aliases": ["库存预警", "预警数", "预警项数", "预警库存"],
         "unit": "项",
         "tables": ["inv_inventory_snapshot"],
-        "sql_expression": "SUM(CASE WHEN available_qty < safety_stock_qty THEN 1 ELSE 0 END)",
-        "formula": "Σ(可用库存 < 安全库存的行数)",
-        "description": "库存低于安全库存的预警条目数（口径：available_qty < safety_stock_qty 计数）。"
-                       "⚠️ inv_inventory_snapshot 是**每日快照**：不带日期条件时该计数跨全部快照日期累计"
-                       "（同一产品多天预警会重复计），如需「当前预警」应按每产品最新快照判断"
-                       "（见「库存分档统计」的 latest-snapshot 口径）。yans 实测当前全部高于安全线，预警数=0。",
+        "sql_expression": "SUM(CASE WHEN snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) AND available_qty < safety_stock_qty THEN 1 ELSE 0 END)",
+        "formula": "Σ(最新快照日里 可用库存 < 安全库存 的行数)",
+        "description": "库存低于安全库存的预警条目数（口径：**最新快照日**里 available_qty < safety_stock_qty 计数）。"
+                       "2026-10-04 修复：原表达式 `SUM(CASE WHEN available_qty < safety_stock_qty THEN 1 ELSE 0 END)` "
+                       "**不带日期条件**，而 inv_inventory_snapshot 是每日快照表（yans 45 个快照日）→ "
+                       "同一产品只要连续 45 天预警不足，就被计 45 次，**这个数是错的**"
+                       "（分母意义上的重复计数，不是「有多少种产品缺货」）。"
+                       "已加上 snapshot_date = MAX(snapshot_date) 收敛到当前时点。"
+                       "另：安全库存本身是配置值，某产品的安全线跨快照通常不变，故旧口径恰好"
+                       "等于「当前预警数 × 快照日数」，很难被肉眼发现。yans 实测当前全部高于安全线，预警数=0。",
         "dims": ["仓库", "产品"],
     },
     # ── 返工域（mes_process_output.rework_qty，yans 大赛数据特有）──
@@ -945,7 +1166,10 @@ def get_all_metrics() -> list[dict]:
         mtime = _REGISTRY_PATH.stat().st_mtime if _REGISTRY_PATH.exists() else None
     except Exception:
         mtime = None
-    if _all_metrics_cache["mtime"] == mtime and _all_metrics_cache["value"] is not None:
+    # 用 .get 而非直接下标：dict 被清空/被测试代码 reset 时不会 KeyError
+    # （2026-10-04 自查时用 `_all_metrics_cache.clear()` 触发了 KeyError: 'mtime'。
+    #  正常路径不会清这个 dict，但一行 .get 就能换来健壮性）。
+    if _all_metrics_cache.get("mtime") == mtime and _all_metrics_cache.get("value") is not None:
         return _all_metrics_cache["value"]
     out = []
     for m in BUILTIN_METRICS + _load_user_metrics():
@@ -1079,6 +1303,63 @@ def _metric_applicable(metric: dict, current_tables: set[str] | None = None) -> 
     return True
 
 
+def _resolve_candidates_in(m: dict) -> dict:
+    """把口径文本里的 `{a|b}` 候选语法解析为**当前库真实列**（返回新 dict，不改入参）。
+
+    2026-10-04 新增。`{standard_yield_rate|std_yield_rate}` 这类候选语法是给编译器
+    `_resolve_expr` 用的，但本函数是「全链路唯一取指标的地方」，于是占位符原样流到
+    下游展示层：
+      · `get_metric_hint` 注入 LLM 的「业务公式」字段（`formula` 里也可能有占位符）
+      · `try_compile_metric` 返回的 `mql.metric_expression` / `metrics[].definition`
+        —— 这两项是前端「本次命中哪个指标、口径是什么」的可解释性展示与审计依据
+    实测症状：同一段提示里「口径算式 SQL = MAX(standard_yield_rate)」是干净 SQL，
+    「业务公式 = COUNT(DISTINCT {downtime_reason|reason})」却是内部模板语法。
+
+    解析规则与编译器 `_resolve_expr` 对齐：按候选顺序取第一个真实存在的列，
+    都不存在时保留第一个候选（交由编译器按同规则处理，行为不变）。
+    查不到列结构时**原样返回**（绝不因为探测失败而改写口径文本）。
+
+    ⚠️ 2026-10-04 自查修正（P0·切库后口径永久错库）：
+    首版是「就地改」(`m[_k] = ...; return m`)，而 `get_all_metrics()` 返回的是
+    `_all_metrics_cache["value"]` 里**同一批 dict 对象**（该缓存只按
+    metrics_registry.json 的 mtime 失效，**切库不会失效**）。于是：
+      1. 在 yans 库调一次 get_effective_metrics() → 缓存里的
+         `{standard_yield_rate|std_yield_rate}` 被就地改成 `standard_yield_rate`；
+      2. 界面切到 postgres 库 → 缓存直接返回**已污染的值** → 该库真实列是
+         `std_yield_rate` → 编译出 `MAX(standard_yield_rate)` → PG 报
+         `字段不存在`，确定性编译整条失败。
+    实测两个方向的顺序都必现。
+    根因是「把依赖运行时上下文（当前库）的结果写进了跨库共享的缓存」。
+    修法：**返回新 dict**，绝不动入参 —— 缓存始终保持原始占位符，
+    每次调用按当时的库重新解析。
+    """
+    try:
+        from agent.metric_compiler import _resolve_col
+    except Exception:
+        return m
+    tables = [str(t).split(".")[-1] for t in (m.get("tables") or [])]
+    fact = tables[0] if tables else ""
+    if not fact:
+        return m
+    out = None          # 懒拷贝：只有真的需要改时才建新 dict，避免无谓开销
+    for _k in ("sql_expression", "formula"):
+        s = m.get(_k)
+        if not isinstance(s, str) or "{" not in s:
+            continue
+        try:
+            fixed = re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_|]*)\}",
+                           lambda mm: _resolve_col(fact, mm.group(1).split("|")),
+                           s)
+        except Exception:
+            # 探测失败 → 保持原文，绝不猜
+            continue
+        if fixed != s:
+            if out is None:
+                out = dict(m)      # 浅拷贝：不碰入参与缓存
+            out[_k] = fixed
+    return out if out is not None else m
+
+
 def get_effective_metrics(asof=None) -> list[dict]:
     """返回指定日期（默认今天）下有效的指标（口径可变：valid_from/valid_to 时间版本）。
 
@@ -1086,12 +1367,16 @@ def get_effective_metrics(asof=None) -> list[dict]:
     对应口径、或直接过滤掉被禁用的指标。这是全链路唯一取指标的地方，
     因此 prompt 注入、确定性编译器、MQL 白盒、向量检索的口径天然一致。
     权限上下文来自 ContextVar（无 acl 时原样返回，零回归）。
+
+    2026-10-04：出口处统一解析 `{a|b}` 候选语法（见 `_resolve_candidates_in`），
+    使 prompt 注入 / MQL 展示 / 审计三处的口径字符串完全一致，不再外泄内部模板语法。
     """
     metrics = [m for m in get_all_metrics() if _is_effective(m, asof)]
     # 按当前数据库过滤：只保留事实表存在于当前库的指标（多库隔离，防 postgres 口径泄漏到 123 库）。
     # P0 性能优化：_current_db_tables() 只算一次传入，避免对每个指标重复查表列表（49 次 → 1 次）。
     current_tables = _current_db_tables()
     metrics = [m for m in metrics if _metric_applicable(m, current_tables)]
+    metrics = [_resolve_candidates_in(m) for m in metrics]
     try:
         from security.enforcer import apply_metric_acl
         return apply_metric_acl(metrics)
@@ -1221,7 +1506,23 @@ def _left_guard_vocab() -> set[str]:
                   # 同时 metric_compiler.compile_period_compare_grouped 已放开「同比/环比
                   # + 维度」入口，命中后正确产出本期/上期两期对比 SQL（见同次改动）。
                   "同比", "环比", "去年同期", "较去年同期", "较上月", "较上期",
-                  "较上季", "较上季度", "同比增长", "环比增长"])
+                  "较上季", "较上季度", "同比增长", "环比增长",
+                  # 2026-10-04 修复：口语祈使动词「看」与时间粒度词「周度/月度」缺位。
+                  # 实测「按周看产量」命中"产量"后左侧 run="按周看" —— 词表只有"看看"/
+                  # "看一下"、没有裸"看"，剥不掉 → suspect → find_metrics 零命中 →
+                  # 编译整体回退 LLM。同类「周度产量趋势」run="周度"，词表只有"周"，
+                  # "周度".endswith("周") 为假 → 同样剥不掉。
+                  # 这些是句法功能词/粒度词，不改变口径语义（真修饰语"出货""来料"
+                  # 仍不在词表，防偷换能力不受影响）。
+                  "看", "周度", "月度",
+                  # 「这几个X分别有多少」句式的指示代词短语（run="这几个" 剥不掉）。
+                  # 与已有的"哪些/哪条/每个/各个"同类，属句法功能词。
+                  "这几个", "这几种", "这几种状态",
+                  # 2026-10-04 第二批：口语祈使/指示成分缺位（均属句法功能词，非口径修饰语）。
+                  #   「库存那边让我看下各仓库还有多少货」→ run="库存那边让我看下各仓库"
+                  #   逐字剥到"库存"后停住（"看下/那边/让我/库存"缺位）→ 命中被误杀。
+                  # "库存" 与已有 "停机/记录/检验记录/工单记录" 同类，是事实表的口语指代。
+                  "看下", "看一下情况", "那边", "让我", "分别", "库存", "数据"])
     return vocab
 
 
@@ -1263,8 +1564,17 @@ def _left_modifier_suspect(q: str, pos: int) -> bool:
     changed = True
     while changed and run:
         changed = False
-        # 近N天/近N个月 等动态时间窗口词（_CUMULATIVE_NDAYS_RE 同源）：固定词表无法枚举
-        _stripped = re.sub(r"(?:近|最近)\s*\d+\s*(?:天|个月|周)", "", run)
+        # 近N天/近N个月 等动态时间窗口词（_CUMULATIVE_NDAYS_RE 同源）：固定词表无法枚举。
+        # 2026-10-04 修复：原正则只认阿拉伯数字 `\d+`，**中文数词一律漏剥** ——
+        # 「找出最近一个月不良数量最高的产品」的命中词「不良数量」左侧 run="找出最近一个月"，
+        # 剥掉"找出"后残留"最近一个月"，`\d+` 匹配不到"一" → 判定为未注册口径修饰语
+        # → find_metrics 零命中 → 整条确定性编译链根本不起步 → 回退 LLM（且该题在 LLM 侧
+        # 也生成失败，用户看到的就是"AI 未能生成查询 SQL"）。
+        # 而 metric_compiler._build_time_filter 本就支持中文数词窗口
+        # （实测「最近一个月」→ INTERVAL '1 months'），故此处补齐数词字符集即可，
+        # 不改变口径语义、也不存在"丢掉时间条件"的风险。
+        _NUM = r"(?:\d+|[一两二三四五六七八九十百]+)"
+        _stripped = re.sub(rf"(?:近|最近)\s*{_NUM}\s*(?:天|日|周|个月|月|年)", "", run)
         if _stripped != run:
             run = _stripped
             changed = True
@@ -1590,11 +1900,24 @@ def render_exec_sql_metric(query: str) -> dict | None:
         # 顺序即 产线→车间→产品→日期 中在问题里命中的第一个）。
         # 2026-09-25：补「仓库」维度词（当前库存量等库存口径按仓库分组模板）。
         tpl = ""
+        # 2026-10-04：「设备/设备类型」是**指标名自身的组成部分**（「综合设备停机率」里就有
+        # 「设备」）。实测无分组信号时会被误判成「按设备分组」——「综合设备停机率」返回了
+        # 40 行设备明细而非 1 个整体值。故这两个**新增**维度键仅在问句确有分组意图时启用；
+        # 历史维度键（产线/车间/产品/日期/仓库）保持原判据，确保零回归。
+        _group_sig = bool(re.search(
+            r"各|每|按|分别|逐|排行|排名|最高|最低|TOP|top|前\s*\d+", query))
         for dim_word, key in (("产线", "产线"), ("车间", "车间"),
+                              # 2026-10-04：新增「设备类型/设备」两个维度键（停机率/稼动率按设备分组）。
+                              # 此前无此键，「各设备类型的停机率/稼动率」会落到 _default 模板 →
+                              # 用户问分组却拿到一个整体单值（静默降级）。顺序上「设备类型」先于
+                              # 「设备」，保证「各设备类型…」不会被更短的「设备」抢先命中。
+                              ("设备类型", "设备类型"), ("设备", "设备"),
                               ("产品", "产品"), ("日期", "日期"),
                               ("每天", "日期"), ("每日", "日期"), ("按月", "日期"),
                               ("仓库", "仓库")):
             if dim_word in query and str(by_dim.get(key) or "").strip():
+                if key in ("设备", "设备类型") and not _group_sig:
+                    continue
                 tpl = str(by_dim[key]).strip()
                 break
         if not tpl:

@@ -280,21 +280,61 @@ def _generate_table_desc(table_name: str, columns: List[Dict]) -> str:
 
 
 def _get_core_tables(db: Session) -> set:
-    """从数据库获取核心表（通过是否有外键关联来判断）"""
-    inspector = inspect(db.get_bind())
-    core_tables = set()
-    all_tables = inspector.get_table_names()
+    """识别核心表（业务主干 = 主数据/维度表）。
 
+    原实现只看「有无外键」，在**没有物理外键约束**的库（本项目的 yans 库实测 0 个 FK，
+    业务关联全靠字段同名约定）上恒返回空集 → 前端「核心表」徽标永不出现。
+
+    兜底判据（按优先级）：
+      1. 有物理外键 → 直接采用（最可信）
+      2. 表名是维度/主数据表前缀（dim_ / mst_ / md_ / sys_ 等）→ 业务主干
+      3. 出现在多张表的同名列里（弱外键约定，如 line_id 被多表引用）
+
+    注意**不能**把 mes_/qms_/inv_/eqp_ 等事实表也算进来：实测那样会让
+    本库 10/10 张表全是 core=true，徽标等于没有区分度，反而是噪声。
+    """
+    inspector = inspect(db.get_bind())
+    all_tables = [t for t in inspector.get_table_names()
+                  if not t.startswith(("_", "pg_"))]
+
+    # 1. 物理外键
+    fk_tables = set()
     for table in all_tables:
-        if table.startswith("_") or table.startswith("pg_"):
-            continue
         try:
-            fk = inspector.get_foreign_keys(table)
-            if fk:
-                core_tables.add(table)
+            if inspector.get_foreign_keys(table):
+                fk_tables.add(table)
         except Exception:
             pass
-    return core_tables
+    if fk_tables:
+        return fk_tables
+
+    # 2. 维度/主数据表前缀 —— 这是数据建模的通用约定，比「有没有外键」更贴近
+    #    「核心表」的业务含义：主数据被大量事实表引用，本身就是主干。
+    dim_prefixes = ("dim_", "mst_", "md_", "sys_", "master_", "dim.")
+    core = {t for t in all_tables
+            if not t.startswith("metadata_") and t.lower().startswith(dim_prefixes)}
+    if core:
+        return core
+
+    # 3. 弱外键：同名列出现在 ≥2 张表里
+    col_owner: dict[str, set] = {}
+    table_cols: dict[str, set] = {}
+    for table in all_tables:
+        if table.startswith("metadata_"):
+            continue
+        try:
+            cols = {c["name"] for c in inspector.get_columns(table)}
+        except Exception:
+            continue
+        table_cols[table] = cols
+        for c in cols:
+            if c.endswith("_id") or c in ("line_id", "product_id"):
+                col_owner.setdefault(c, set()).add(table)
+    shared = {c for c, ts in col_owner.items() if len(ts) >= 2}
+    for table, cols in table_cols.items():
+        if cols & shared:
+            core.add(table)
+    return core
 
 
 def _classify_table(table_name: str) -> Optional[str]:
@@ -320,6 +360,13 @@ def _row_count(db: Session, table_name: str) -> int:
         result = db.execute(text(f'SELECT COUNT(*) FROM {qref}'))
         return int(result.scalar() or 0)
     except Exception:
+        # 这里既是「行数变 0」的**最终掩盖点**（异常被吞成 0，前端无从分辨
+        # 「表真的空」与「查询失败」），也必须 rollback —— 不回滚会让本 Session
+        # 后续所有查询继续被拒(25P02)，把一次失败放大成整页行数全 0。
+        try:
+            db.rollback()
+        except Exception:
+            pass
         return 0
 
 
@@ -2219,6 +2266,14 @@ def export_knowledge(scope: str = "terms", format: str = "md",
     _require_action_export(authorization)
     fmt = (format or "md").lower()
     username = _username_of(authorization)
+
+    # 白名单：原先只判断 `scope == "terms"`，任何非法值都静默落到 metrics 分支
+    # 并返回 200 + 指标口径文件 —— 调用方拼错参数时完全无从察觉。
+    scope = (scope or "terms").strip().lower()
+    if scope not in ("terms", "metrics"):
+        raise HTTPException(status_code=400, detail=f"不支持的导出范围：{scope}（仅支持 terms / metrics）")
+    if fmt not in ("md", "csv"):
+        raise HTTPException(status_code=400, detail=f"不支持的导出格式：{fmt}（仅支持 md / csv）")
 
     if scope == "terms":
         data = _cached("terms", _build_terms, db)

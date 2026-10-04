@@ -118,9 +118,9 @@
     "tables": [
       "inv_inventory_snapshot"
     ],
-    "sql_expression": "SUM(CASE WHEN available_qty < safety_stock_qty THEN safety_stock_qty - available_qty ELSE 0 END)",
-    "formula": "仅统计 available_qty < safety_stock_qty 的行，合计 (安全库存 - 可用库存)；不缺货行计 0",
-    "description": "库存缺口合计（口径：对低于安全库存的行求和 safety_stock_qty - available_qty，正值表示缺口；不满足条件的行不计入）",
+    "sql_expression": "SUM(CASE WHEN snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) AND available_qty < safety_stock_qty THEN safety_stock_qty - available_qty ELSE 0 END)",
+    "formula": "最新快照日，仅统计 available_qty < safety_stock_qty 的行，合计 (安全库存 - 可用库存)；不缺货行计 0",
+    "description": "库存缺口合计（口径：**最新快照日**里低于安全库存的行求和 safety_stock_qty - available_qty，正值表示缺口）。2026-10-04 修复：原表达式不带日期条件，而 inv_inventory_snapshot 是每日快照表（yans 45 个快照日）→ 同一产品的缺口会按它在快照表里出现的天数被**重复累加**（与「库存预警数」同型 bug）。当前演示库无低于安全线的行，故修复前后都是 0，属潜伏问题；但一旦出现缺货行就会按 45 倍放大。",
     "dims": [
       "产品",
       "仓库",

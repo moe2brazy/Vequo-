@@ -292,7 +292,8 @@ def _build_funnel(table: str, tlab: str, fields: list[dict]) -> dict | None:
     d_lab = _field_label(_field_by_name(fields, dim), dim)
     m_lab = _field_label(_field_by_name(fields, measure), measure)
     sql = (f"SELECT {_q(dim)} AS d, SUM({_q(measure)}) AS v "
-           f"FROM {_q_table(table)} WHERE {_q(dim)} IS NOT NULL "
+           f"FROM {_q_table(table)} "
+           f"{_where_with_snapshot(table, f'{_q(dim)} IS NOT NULL')} "
            f"GROUP BY {_q(dim)} ORDER BY {_q(dim)}")
     r = _safe_execute(sql)
     data = []
@@ -331,7 +332,8 @@ def _build_sunburst(table: str, tlab: str, fields: list[dict]) -> dict | None:
     if not sev_col or not type_col:
         return None
     sql = (f"SELECT {_q(sev_col)} AS s, {_q(type_col)} AS t, COUNT(*) AS n "
-           f"FROM {_q_table(table)} WHERE {_q(sev_col)} IS NOT NULL AND {_q(type_col)} IS NOT NULL "
+           f"FROM {_q_table(table)} "
+           f"{_where_with_snapshot(table, f'{_q(sev_col)} IS NOT NULL', f'{_q(type_col)} IS NOT NULL')} "
            f"GROUP BY {_q(sev_col)}, {_q(type_col)} ORDER BY n DESC")
     r = _safe_execute(sql)
     rows = r.get("rows") if r.get("success") else []
@@ -391,7 +393,8 @@ def _build_pareto(table: str, tlab: str, fields: list[dict]) -> dict | None:
     if not reason_col or not duration_col:
         return None
     sql = (f"SELECT {_q(reason_col)} AS d, SUM({_q(duration_col)}) AS v "
-           f"FROM {_q_table(table)} WHERE {_q(reason_col)} IS NOT NULL "
+           f"FROM {_q_table(table)} "
+           f"{_where_with_snapshot(table, f'{_q(reason_col)} IS NOT NULL')} "
            f"GROUP BY {_q(reason_col)} ORDER BY v DESC")
     r = _safe_execute(sql)
     data = []
@@ -437,6 +440,59 @@ def _build_pareto(table: str, tlab: str, fields: list[dict]) -> dict | None:
     }
 
 
+def _snapshot_grain_clause(table: str) -> str:
+    """周期快照表 → 返回「只看最新快照日」的 WHERE 片段；非快照表返回空串。
+
+    2026-10-04 新增。本项目已连续4 次在 `inv_inventory_snapshot` 上犯同一个错：
+    该表每个 snapshot_date 对每个产品存一份**全量状态**（不是一次事件），
+    库存是**时点值**不是流量，所以不带 `snapshot_date` 限定的 SUM 会把N 个快照日累加。
+    实测偏差：总库存 46.2×、冻结库存 49.0×、安全库存 54.6×（yans 45 个快照日）。
+
+    本模块原先完全绕过指标注册表、只按字段名猜列自己拼 SQL，于是同样的错
+    在这里又犯了一次（库存健康度图：WH-A 1,191,314 vs 正确 42,837，27.8×；
+    WH-QA 108万 vs 9434，**114.7×**）。
+
+    判据复用编译器那份元数据（`metric_compiler._FACT_META`的 `snapshot_grain` 标记），
+    避免两处各写一份、再次漂移。查不到元数据时按"不是快照表"处理（保守：
+    宁可少加过滤，也不能给非快照表加上 MAX(...) 把数据全过滤掉）。
+    """
+    bare = str(table).split(".")[-1].strip().lower()
+    try:
+        from agent.metric_compiler import _FACT_META
+        meta = _FACT_META.get(bare) or {}
+    except Exception:
+        return ""
+    if not meta.get("snapshot_grain"):
+        return ""
+    tcol = meta.get("time_col") or ""
+    if not tcol:
+        return ""
+    return (f"{_q(tcol)} = (SELECT MAX({_q(tcol)}) "
+            f"FROM {_q_table(bare)})")
+
+
+def _where_with_snapshot(table: str, *conds: str, skip_snapshot: bool = False) -> str:
+    """拼 WHERE 子句：调用方给若干个「列 IS NOT NULL」条件，自动补快照表限定。
+
+    2026-10-04：本模块 10 处图表函数都是「按字段名猜列 + 自己拼 SQL」，
+    完全绕过指标注册表 —— 于是注册表里修好的口径（库存类 4 个指标）在图表侧
+    又原样犯错。逐处加 `AND snapshot_date=MAX(...)` 容易漏，
+    故统一收口到这里：**任何图表函数碰到底层是周期快照表，自动收敛到最新快照日**。
+    非快照表时行为与原来完全一致（只是多一个恒真的空条件）。
+
+    ⚠️ `skip_snapshot=True` 用于**趋势图**：它的时间列本身就是 snapshot_date，
+    语义是「看最近 N 期的走势」，加 MAX 过滤会让图只剩一个点（等于把折线图毁掉）。
+    这类「以时间为轴」的查询必须显式声明跳过，不能靠自动识别 ——
+    「周期限定」与「时间序列」在语义上就是冲突的。
+    """
+    parts = [c for c in conds if c]
+    if not skip_snapshot:
+        _snap = _snapshot_grain_clause(table)
+        if _snap:
+            parts.append(_snap)
+    return ("WHERE " + " AND ".join(parts)) if parts else ""
+
+
 def _build_stock_health(table: str, tlab: str, fields: list[dict]) -> dict | None:
     """库存健康度：可用库存 vs 安全库存，低于安全线的仓库标红。"""
     avail_col = _find_field(fields, "available_qty", "available", "stock_qty", "quantity")
@@ -444,8 +500,13 @@ def _build_stock_health(table: str, tlab: str, fields: list[dict]) -> dict | Non
     dim = _find_field(fields, "warehouse_code", "warehouse", "location")
     if not avail_col or not safe_col or not dim:
         return None
+    # 2026-10-04 修复：周期快照表必须限定到最新快照日，否则把 45 天的库存全加起来
+    # （实测 WH-A 119万 vs 正确 4.3万，27.8×；WH-QA 108万 vs 9434，**114.7×**）。
+    # 与注册表口径（库存量/冻结库存/安全库存，2026-10-03~04 逐个修过）对齐。
+    _snap = _snapshot_grain_clause(table)
+    _where = f"WHERE {_q(dim)} IS NOT NULL" + (f" AND {_snap}" if _snap else "")
     sql = (f"SELECT {_q(dim)} AS d, SUM({_q(avail_col)}) AS a, SUM({_q(safe_col)}) AS s "
-           f"FROM {_q_table(table)} WHERE {_q(dim)} IS NOT NULL "
+           f"FROM {_q_table(table)} {_where} "
            f"GROUP BY {_q(dim)} ORDER BY d")
     r = _safe_execute(sql)
     data = []
@@ -495,7 +556,8 @@ def _build_stacked(table: str, tlab: str, fields: list[dict]) -> dict | None:
         return None
     d_lab = _field_label(_field_by_name(fields, dim), dim)
     sql = (f"SELECT {_q(dim)} AS d, SUM({_q(good_col)}) AS g, SUM({_q(defect_col)}) AS b "
-           f"FROM {_q_table(table)} WHERE {_q(dim)} IS NOT NULL "
+           f"FROM {_q_table(table)} "
+           f"{_where_with_snapshot(table, f'{_q(dim)} IS NOT NULL')} "
            f"GROUP BY {_q(dim)} ORDER BY g DESC")
     r = _safe_execute(sql)
     cats, goods, defects = [], [], []
@@ -568,7 +630,8 @@ def _g_dim_measure(table, tlab, dim_f, measure_f, limit=12, order="DESC"):
     d, m = dim_f["name"], measure_f["name"]
     d_lab, m_lab = _g_friendly(dim_f), _g_friendly(measure_f)
     sql = (f"SELECT {_q(d)} AS {_q(d_lab)}, SUM({_q(m)}) AS {_q(m_lab)} "
-           f"FROM {_q_table(table)} WHERE {_q(d)} IS NOT NULL "
+           f"FROM {_q_table(table)} "
+           f"{_where_with_snapshot(table, f'{_q(d)} IS NOT NULL')} "
            f"GROUP BY {_q(d)} ORDER BY SUM({_q(m)}) {order} LIMIT {limit}")
     r = _g_exec(sql)
     if not r:
@@ -606,8 +669,10 @@ def _g_trend(table, tlab, time_f, measure_f, limit=30):
         texpr = _q(t)
     # 数据正确性修复（P0）：原为 ORDER BY 时间 ASC LIMIT n —— 取到的是**最早** n 期，
     # 而趋势图/分析语义是"最近走势"。改为倒序取最新 n 期后反转回时间正序。
+    # skip_snapshot=True：以时间为轴的查询**不能**收敛到单期，否则折线图只剩一个点。
     sql = (f"SELECT {texpr} AS {_q(t_lab)}, SUM({_q(m)}) AS {_q(m_lab)} "
-           f"FROM {_q_table(table)} WHERE {_q(t)} IS NOT NULL "
+           f"FROM {_q_table(table)} "
+           f"{_where_with_snapshot(table, f'{_q(t)} IS NOT NULL', skip_snapshot=True)} "
            f"GROUP BY {texpr} ORDER BY {texpr} DESC LIMIT {limit}")
     r = _g_exec(sql)
     if not r:

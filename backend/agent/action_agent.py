@@ -40,8 +40,17 @@ ACTIONS: dict[str, dict] = {
         "name": "更新产品安全库存阈值",
         "description": "把某产品的安全库存阈值调整为指定数值（低于该值的库存会触发预警）",
         "target_table": "inv_inventory_snapshot",
-        "set_columns": {"safety_stock": {"label": "安全库存阈值", "type": "number"}},
+        # 2026-10-04 修复：列名原为 `safety_stock`，但该表真实列是 **safety_stock_qty**
+        # （information_schema 实查确认 `safety_stock` 不存在）→ 编译出的 UPDATE 必然报
+        # "column does not exist"，功能完全不可用。
+        "set_columns": {"safety_stock_qty": {"label": "安全库存阈值", "type": "number"}},
         "where_columns": {"product_id": {"label": "产品ID", "type": "string"}},
+        # 2026-10-04 修复（数据污染级）：原 where 只有 product_id，而目标表是**每日快照表**
+        # （每期对每产品存一份全量状态）→ `WHERE product_id='P006' SET safety_stock_qty=…`
+        # 会把该产品**全部 45 个历史快照行**一起改掉，即回溯篡改历史数据，且不可逆。
+        # 现在对快照表自动补`snapshot_date = (SELECT MAX(snapshot_date) …)`，
+        # 只改当前时点行。历史行要改需另建「库存配置表」建模（配置值本不该存在快照事实表里）。
+        "snapshot_scoped": True,
         "require_approval": True,
     },
     "update_order_status": {
@@ -109,6 +118,28 @@ def compile_action(action_id: str, params: dict) -> dict:
         key = f"w_{col}"
         where_sql.append(f"{col} = :{key}")
         binds[key] = v
+
+    # 2026-10-04 修复（防历史数据污染）：目标表是**每日快照表**时，
+    # 仅按 product_id 定位会命中该产品**全部历史快照行**（实测 40~42 行/产品），
+    # 把「改当前安全库存」变成「回溯篡改全部历史」且不可逆。
+    # 现在自动补 `snapshot_date = (SELECT MAX(snapshot_date) …)`，只改当前时点行。
+    # 判据复用 metric_compiler._FACT_META 的 snapshot_grain 标记（唯一事实来源）。
+    if act.get("snapshot_scoped"):
+        _tcol = None
+        try:
+            from agent.metric_compiler import _FACT_META
+            _meta = _FACT_META.get(str(act["target_table"]).split(".")[-1].lower()) or {}
+            if _meta.get("snapshot_grain"):
+                _tcol = _meta.get("time_col")
+        except Exception:
+            _tcol = None
+        if not _tcol:
+            # 标了snapshot_scoped 却查不到时间列 → 宁可不执行，也不做无范围的全表改写
+            return {"success": False,
+                    "error": "目标表是周期快照表但无法确定时间列，已拒绝编译"
+                             "（避免误改全部历史行）",
+                    "sql": "", "bind_params": {}}
+        where_sql.append(f'{_tcol} = (SELECT MAX({_tcol}) FROM {act["target_table"]})')
 
     sql = f"UPDATE {act['target_table']} SET {', '.join(set_sql)} WHERE {' AND '.join(where_sql)}"
     return {"success": True, "sql": sql, "bind_params": binds, "error": "",

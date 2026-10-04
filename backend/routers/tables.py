@@ -563,7 +563,12 @@ def _build_tables_list(db: Session):
             result = db.execute(text("SELECT table_name, table_chinese_name FROM metadata_tables"))
             table_labels = {row[0]: (row[1] or "") for row in result}
     except Exception:
-        pass
+        # 同 _build_relationships：metadata_tables 不存在时 PG 会中止整个事务，
+        # 不回滚则后续 row_count 查询全被拒、行数静默变 0。
+        try:
+            db.rollback()
+        except Exception:
+            pass
     # metadata.py 中文别名兜底（123 库 factory.* 等）
     try:
         from db.metadata import TABLES as _MD_TABLES
@@ -1413,7 +1418,14 @@ def _build_relationships(db: Session) -> dict:
             result = db.execute(text("SELECT table_name, table_chinese_name FROM metadata_tables"))
             table_labels = {row[0]: row[1] or row[0] for row in result}
     except Exception:
-        pass
+        # 与下方外键查询同理：metadata_tables 缺失时 PG 会把**整个事务**置为
+        # aborted(25P02)，不 rollback 则本 Session 后续所有查询全被拒
+        # （实测：此处不���滚，同 Session 再查 row_count 全部抛 ProgrammingError，
+        #  被上层 _row_count 的 except:return 0 吞掉 → 所有表行数静默变 0）。
+        try:
+            db.rollback()
+        except Exception:
+            pass
     
     # 1. 从 information_schema 获取外键关系（覆盖所有业务 schema：public + factory 等）
     try:
@@ -1477,7 +1489,11 @@ def _build_relationships(db: Session) -> dict:
                     "description": f"{row[0]}.{row[1]} → {row[2]}.{row[3]}" + (f"（{note}）" if note else "")
                 })
         except Exception:
-            pass
+            # 事务终止后必须回滚，否则本 Session 后续查询全部被拒（同上）
+            try:
+                db.rollback()
+            except Exception:
+                pass
     
     table_names = [
         name for name in inspector.get_table_names()
@@ -1513,6 +1529,11 @@ def _build_relationships(db: Session) -> dict:
                     if source_name in primary_keys.get(target_table, set()):
                         pair = (source_table, source_name, target_table, source_name)
                         if pair not in known_pairs:
+                            # 与 foreign_key 分支对齐：inferred 也带上 note，
+                            # 否则无物理外键的库（本项目 yans 库实测 0 FK，全部关系都是
+                            # inferred）上 RELATION_NOTES 里那 15 条业务注释一条都用不上，
+                            # 前端 relDisplay 只能显示裸「推导关系：a.x → b.x」。
+                            _note = RELATION_NOTES.get(pair)
                             relationships.append({
                                 "source_table": source_table,
                                 "source_column": source_name,
@@ -1520,7 +1541,8 @@ def _build_relationships(db: Session) -> dict:
                                 "target_column": source_name,
                                 "type": "inferred",
                                 "constraint_name": None,
-                                "description": f"推导关系：{source_table}.{source_name} → {target_table}.{source_name}",
+                                "note": _note,
+                                "description": f"推导关系：{source_table}.{source_name} → {target_table}.{source_name}" + (f"（{_note}）" if _note else ""),
                             })
                             known_pairs.add(pair)
 

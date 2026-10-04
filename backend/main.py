@@ -370,7 +370,10 @@ class RecommendChartRequest(BaseModel):
 class TrainRequest(BaseModel):
     table: str
     target: str
-    features: list[str]
+    # 2026-10-04：加min_length=1，空特征列表此前会一路传到 sklearn 才炸，
+    # 界面显示 `at least one array or dtype is required` 英文内部报错。
+    # 双层防护：这里挡住 API 直调，ml/trainer.train_model 内部再挡一次（防内部调用）。
+    features: list[str] = Field(..., min_length=1)
     model_type: str  # linear/decision_tree/random_forest/logistic/kmeans/isolation
     params: dict | None = None
 
@@ -3011,6 +3014,21 @@ def overview_report_download(authorization: str = Header(None), format: str = "d
     acl = build_acl_context(u)
     fp = acl_fingerprint(acl)
     from database import get_db
+    # 2026-10-04 修复（误导性错误归因）：原先下面 4 个 import 共用一个 try，
+    # `except ImportError` 统一提示「缺少文档生成依赖（python-docx / reportlab）」。
+    # 但 `routers.knowledge._cached` / `agent.html_report.build_html_report`
+    # 与文档生成**毫无关系** —— 它们将来若缺依赖，运维会被引导去装 docx/reportlab，
+    # 与真实原因完全相反（静默错误归因，比直接报错更难查）。
+    # 现在把「文档生成依赖」单独前置检查并给出精确提示，其余 import 失败按通用 500。
+    try:
+        import docx  # noqa: F401
+        import reportlab  # noqa: F401
+    except ImportError as _e_doc:
+        raise HTTPException(
+            status_code=500,
+            detail="服务器缺少文档生成依赖（python-docx / reportlab），"
+                   f"请在服务器后端目录执行：pip install python-docx reportlab 后重启服务"
+                   f"（原始错误：{_e_doc}）")
     try:
         db = next(get_db())
         try:
@@ -3026,12 +3044,15 @@ def overview_report_download(authorization: str = Header(None), format: str = "d
                 db.close()
             except Exception:
                 pass
-    except ImportError:
-        # 服务器缺少 docx/reportlab 依赖时的可操作提示
+    except ImportError as e:
+        # 2026-10-04：文档生成依赖已在前置 try 里单独检查过了；走到这里的 ImportError
+        # 来自 routers.knowledge / agent.html_report / agent.report_export 内部，
+        # 与 docx/reportlab 无关。原先这里也提示「装 python-docx/reportlab」，
+        # 会把排障方向带偏（静默错误归因）。现在给出准确的模块名。
         raise HTTPException(
             status_code=500,
-            detail="服务器缺少文档生成依赖（python-docx / reportlab），"
-                   "请在服务器后端目录执行：pip install python-docx reportlab 后重启服务。")
+            detail=f"报告生成模块依赖缺失：{e}。请检查后端依赖是否完整"
+                   f"（该错误与 python-docx / reportlab 无关，那两项已单独校验）")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"报告导出失败：{e}")
 

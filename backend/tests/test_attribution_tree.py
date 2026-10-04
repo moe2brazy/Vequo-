@@ -48,8 +48,24 @@ check("B5 加性子节点识别（投入量）", any(c["name"] == "input_qty" fo
 check("B6 比率子节点识别（良率）", any(c["name"] == "yield_rate" for c in rat), str([c["name"] for c in rat]))
 check("B7 比率节点 contribution 为 None（不参与加和）",
       all(c.get("contribution_pct") is None for c in rat), "")
-s = sum(c.get("contribution_pct") or 0 for c in add)
-check("B8 加性贡献度加总 = 100%", abs(s - 100.0) < 0.5, f"{s}%")
+# 2026-10-04 更正：原断言是 `sum(contribution_pct) == 100`，实测得 -100 → 判失败。
+# 根因是**测试没跟上 2026-10-03 那次修复**：那次把 contribution_pct 改成**带符号**
+# （正=推高主指标，负=反向拖累），另加了 contribution_abs_pct 承载「绝对值占比」。
+# 原因见 attribution_tree.py:312-318 —— 早期用 abs(delta) 算贡献度会让
+# 「不良数上升 200」显示成「正贡献 60%」，符号与业务含义相反。
+# 本例主指标 delta=-130（产量下降），子节点全为负，带符号之和自然 = -100%，
+# 这**恰恰是正确的**；「绝对值占比合计 100%」由 contribution_abs_pct 承载。
+s_signed = sum(c.get("contribution_pct") or 0 for c in add)
+s_abs = sum(c.get("contribution_abs_pct") or 0 for c in add)
+check("B8 加性贡献度绝对值占比加总 = 100%", abs(s_abs - 100.0) < 0.5,
+      f"abs_pct={s_abs}% (signed={s_signed}%)")
+# 符号方向必须与主指标一致：产量下降 → 所有加性子节点贡献度均为负
+check("B8b 下降场景贡献度带负号", s_signed < 0,
+      f"signed={s_signed}（主指标 delta={root['delta']}）")
+check("B8c 带符号与绝对值占比逐项对应",
+      all(abs(abs(c.get("contribution_pct") or 0) - (c.get("contribution_abs_pct") or 0)) < 0.05
+          for c in add),
+      str([(c["name"], c.get("contribution_pct"), c.get("contribution_abs_pct")) for c in add]))
 
 print("═══ C. 维度下钻 ═══")
 dims = [c for c in root["children"] if c.get("kind") == "dimension"]

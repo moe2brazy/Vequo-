@@ -23,6 +23,16 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+# 2026-10-04 补：模块级引入 sqlglot 的 exp。
+# 起因：新增的 `_resolve_star_base_tables` 用 `exp.Subquery` / `exp.Table` 判定 AST 节点，
+# 而 rewrite_sql 里的 `from sqlglot import exp` 只让它成为**该函数的局部变量**，
+# 模块级函数看不到 → 函数体第一行就 NameError → 被自身的 `except Exception: return []`
+# 吞掉 → 恒返回空列表 → 派生表/CTE 的 SELECT * 一律走 fail-close 拒绝。
+# 即「因错误原因得到正确结果」：安全上没漏，但把本该能裁剪+脱敏的合法查询也一起拒了
+# （这正是我在该函数 docstring 里专门警告过的失败模式，却自己又复现了一次）。
+# 教训：模块级新增的函数若用到第三方类型，必须在该模块顶部 import，不能依赖调用方的局部 import。
+from sqlglot import exp
+
 from security import model as perm_model
 
 # ── 脱敏算法目录（供前端下拉与后端生成 SQL 共用一份定义）──
@@ -602,6 +612,79 @@ def _table_columns(table: str) -> list[str]:
     return cols
 
 
+def _resolve_star_base_tables(node, cte_names: set[str] | None = None,
+                              ast=None) -> list[str]:
+    """解析星号所在层的**真实基表**（穿透派生表与 CTE）。
+
+    2026-10-04 新增，配合 rewrite_sql 的星号 fail-close 使用。
+    背景：星号裁剪逻辑只认「该 SELECT 层直接 FROM/JOIN 的 exp.Table」，
+    遇到 `FROM (SELECT …) s`（`_frm.this` 是 exp.Subquery）或
+    `FROM cte_name`（CTE 名不是受管表）时，会得出「基表未知」，
+    于是 `SELECT *` 被静默放行 → deny 列不裁剪、mask 列不脱敏 → **明文泄露**
+    （实测：test_orders deny unit_price / mask customer_name，
+      `SELECT * FROM (SELECT * FROM test_orders) s` 两种字段都明文返回）。
+
+    这里把 Subquery / CTE 逐层穿透，还原出最终的真实基表名，
+    拿不到就返回空列表，由调用方 fail-close 拒绝。
+
+    ⚠️ `cte_names` / `ast` 必须**由调用方显式传入**（rewrite_sql 的局部变量，
+    模块级不可见）。早期版本误以为能闭包捕获，结果永远返回 []，
+    变成「一律拒绝」——安全上没错但误伤合法查询，这里显式化避免该陷阱。
+    """
+    out: list[str] = []
+    _ctes = {str(c).lower() for c in (cte_names or set())}
+    _ast = ast
+
+    def _walk(n) -> None:
+        # 派生表：穿透到子查询内部
+        if isinstance(n, exp.Subquery):
+            for t in n.find_all(exp.Table):
+                nm = (t.name or "").split(".")[-1].lower()
+                if nm and nm not in _ctes and nm not in out:
+                    out.append(nm)
+            return
+        # CTE 引用：找定义再穿透
+        if isinstance(n, exp.Table):
+            nm = (n.name or "").split(".")[-1].lower()
+            if nm in _ctes:
+                if _ast is not None:
+                    for cte in _ast.find_all(exp.CTE):
+                        if (cte.alias_or_name or "").lower() == nm:
+                            for t2 in cte.find_all(exp.Table):
+                                n2 = (t2.name or "").split(".")[-1].lower()
+                                if n2 and n2 not in _ctes and n2 not in out:
+                                    out.append(n2)
+                return
+            if nm and nm not in out:
+                out.append(nm)
+            return
+        for ch in (getattr(n, "args", {}) or {}).values():
+            if isinstance(ch, (list, tuple)):
+                for x in ch:
+                    if hasattr(x, "args"):
+                        _walk(x)
+            elif hasattr(ch, "args"):
+                _walk(ch)
+
+    try:
+        _walk(node)
+    except Exception:
+        # 2026-10-04：原本是静默 `return []`，把「代码错误」（如缺 import 导致的 NameError）
+        # 与「确实查不到基表」压成同一个结果 —— 运维看到的只是「基表无法确定」，
+        # 完全猜不到是代码坏了。现在**记日志**：既保留 fail-close 的安全方向，
+        # 又让这类问题在日志里说话（否则只能靠猜）。
+        # 教训：本函数首版就因为 `exp` 未在模块级 import 而恒返回 []，且毫无痕迹。
+        try:
+            import logging as _lg
+            _lg.getLogger("enforcer").warning(
+                "星号基表解析失败，按 fail-close 拒绝: %s: %s",
+                type(Exception).__name__, "", exc_info=True)
+        except Exception:
+            pass
+        return []
+    return out
+
+
 # ── 脱敏 SQL 生成 ────────────────────────────────────────
 def mask_expression(col_sql: str, mask: str, dialect: str) -> str:
     """生成脱敏后的 SQL 表达式（保持列语义，不落库、只改写查询）"""
@@ -883,14 +966,42 @@ def rewrite_sql(sql: str, ctx: AclContext | None, dialect: str | None = None) ->
                     if (col.name.lower() in ctx.column_denies.get(t, set())
                             or col.name.lower() in ctx.column_masks.get(t, {})):
                         return _AMBIGUOUS_OWNER
-            # 2026-10-03 修复（P0·fail-close）：cands 为空有两种完全不同��含义 ——
-            # 「该列确实不属于任何受管表」（安全，放行正确）与「查不到列结构所以判断不了」
-            # （不安全）。原实现把两者折叠成同一个 None，而调用方 862 行把 None 当放行
-            # → 一次 information_schema 超时（DB 压力大时高发，而那正是权限校验最不该
-            # 失效的时刻）就让所有配了 mask 的列以明文进入结果集。
-            # 受管表存在 + 归属不明 → 按 _AMBIGUOUS_OWNER 处理，由调用方拒绝。
-            if managed & bare_tables:
+            # 2026-10-04 修复（真 bug，实测复现）：cands 为空时**不能一律判fail-close**。
+            # cands 的搜索范围是 `managed & bare_tables`（只含配了 deny/mask 的表），
+            # 所以「cands 为空」有两种含义截然不同的情况：
+            #   (a) 该列在**任何受管表里都不存在** → 无任何 deny/mask 规则命中它
+            #       → 放行是正确且安全的；
+            #   (b) 该列存在于某张受管表，但我们**查不到它的列结构**
+            #       （information_schema 超时/连接池忙）→ 判断不了，必须拒绝。
+            # 原实现把两者都折叠成 _AMBIGUOUS_OWNER，导致 (a) 也被误拒 ——
+            # 实测症状：`SELECT o.customer_name, f.city FROM test_orders o
+            #   JOIN test_factories f …`（region_manager 角色，mask 只配了
+            #   test_orders.customer_name）被拒，提示「字段 city 归属不明」，
+            #   而报错字段甚至不在 SELECT 投影里 —— 它来自**行过滤注入的子查询**
+            #   `factory_id IN (SELECT factory_id FROM test_factories WHERE city='华东')`
+            #   中那个裸列 city。test_factories 并未配任何列级策略，本应放行。
+            # 后果：任何「多表 + 行过滤子查询」的场景都会 fail-close 误拒，
+            # 表现为「明明有权限却提示字段无权限」，且提示指向的字段与实际SQL 无关，
+            # 排障方向被带偏（本次即花了几轮才定位到）。
+            # 修法：cands 为空时不能一律拒绝，要看该列**归属谁**。
+            # ⚠️ 第一版修法引入过 fail-open（已修正，记此以免重犯）：
+            #    最初写成「列存在于任一 bare_table → 返回 None 放行」，
+            #    结果 `SELECT o.city FROM test_orders o JOIN test_factories f…`
+            #    （o=test_orders 不含 city，city 只在 f 上且配了 mask）被放行且
+            #    **city 明文未脱敏** —— 「列存在于某张表」≠「列归属于被引用的表」。
+            # 正确判据：裸列的 owner = 本次查询里**拥有该列的所有表**，
+            # 由这个集合决定放行与否（而不是只看 managed 表）：
+            all_owners = [t for t in bare_tables
+                          if col.name.lower() in {c.lower() for c in _table_columns(t)}]
+            if not all_owners:
+                # 连列结构都查不到 → 判断不了 → fail-close（10-03 的安全语义，保留）
                 return _AMBIGUOUS_OWNER
+            # 拥有该列的表里，只要**有任何一张**配了 deny/mask → 归属不明，fail-close
+            for t in all_owners:
+                if (col.name.lower() in ctx.column_denies.get(t, set())
+                        or col.name.lower() in ctx.column_masks.get(t, {})):
+                    return _AMBIGUOUS_OWNER
+            # 所有拥有该列的表都没配列级策略 → 无任何规则会命中它 → 放行正确
             return None
 
         # ── 行级：对直接 FROM/JOIN 了目标表的每个 SELECT 层追加条件 ──
@@ -978,14 +1089,59 @@ def rewrite_sql(sql: str, ctx: AclContext | None, dialect: str | None = None) ->
                 # 此前用全 AST 的 bare_tables（含子查询/CTE 内表）判断，
                 # 导致 `SELECT * FROM A WHERE id IN (SELECT id FROM B)` 这类
                 # 合法查询被误拒（A 是受管表、B 只是子查询过滤来源）。
+                #
+                # 2026-10-04 自查（P0·CTE 星号泄露，**早于今日改动就存在**）：
+                # `WITH x AS (SELECT * FROM test_orders) SELECT * FROM x` 里，
+                # 外层 FROM 解析出的是表名 `x`（CTE 名，**不是受管表**）→
+                # star_tables 为空 → 走到我今天加的「无列级策略的表放行」分支 → 明文泄露。
+                #
+                # 一度试过「CTE 定义里出现星号就 fail-close」，但**回归立刻抓到过度拒绝**：
+                # `WITH x AS (SELECT * FROM mes_process_output) SELECT x.output_id FROM x`
+                # 是完全合法的查询（外层只显式取一列），却被误拒。
+                # 复盘发现该判断本身就站不住：**CTE 内部的列不会直接返回用户** ——
+                # 泄露只发生在「外层也用星号」时（`SELECT * FROM x` 把 CTE 里的
+                # deny/mask 列全展开出来）。所以正确做法不是禁掉 CTE 内的星号，
+                # 而是让外层的基表解析**穿透 CTE 名**（下方 `_frm.this` 分支已实现）。
                 layer_tables: list[str] = []
                 _frm = outer_select.args.get("from_") or outer_select.args.get("from")
                 if _frm and isinstance(_frm.this, exp.Table):
-                    layer_tables.append(_frm.this.name.split(".")[-1].lower())
+                    _fname = _frm.this.name.split(".")[-1].lower()
+                    if _fname in cte_names:
+                        # FROM 侧是 **CTE 名**（`WITH x AS (…) SELECT * FROM x`）：
+                        # CTE 名不是受管表，若直接入表则 star_tables 为空 → 星号被放过 →泄露。
+                        # 需穿透 CTE 定义还原真实基表。
+                        _cte_base = _resolve_star_base_tables(_frm.this, cte_names, ast)
+                        layer_tables.extend(_cte_base or [])
+                    else:
+                        layer_tables.append(_fname)
+                elif _frm is not None:
+                    # 2026-10-04 修复（P0·真实数据泄露，实测复现）：
+                    # FROM 侧是**派生表**（`FROM (SELECT …) s`）时 `_frm.this` 是
+                    # exp.Subquery 而不是 exp.Table → layer_tables 为空
+                    # → star_tables 为空 → 整段星号处理被**静默跳过**。
+                    # 后果是全 AST 列扫描找不到任何 exp.Column（`*` 是 exp.Star），
+                    # 于是 deny 列不裁剪、mask 列不脱敏，**明文直达用户**。
+                    # 实测（test_orders: deny unit_price / mask customer_name）：
+                    #   SELECT * FROM (SELECT * FROM test_orders) s          → 两者明文
+                    #   WITH x AS (SELECT * FROM test_orders) SELECT * FROM x→ 两者明文
+                    #   SELECT x.* FROM x / 双层嵌套 / 带 LIMIT → 同样泄露
+                    # 而单表 `SELECT * FROM test_orders` 正常裁剪+脱敏，
+                    # 且**显式写** `SELECT s.unit_price FROM (SELECT * FROM …) s`
+                    # 会被正确拒绝（走的是列扫描分支，不依赖 star_tables）——
+                    # 即「星号」这条唯一不设防。
+                    # 修法：解析 FROM 侧的**真实基表**（穿透 Subquery / CTE 名），
+                    # 拿不到就 fail-close 拒绝，绝不静默放行。
+                    layer_tables.extend(_resolve_star_base_tables(
+                        _frm.this, cte_names, ast))
                 for _j in outer_select.args.get("joins") or []:
                     _jt = getattr(_j, "this", None)
                     if isinstance(_jt, exp.Table):
                         layer_tables.append(_jt.name.split(".")[-1].lower())
+                    elif _jt is not None:
+                        layer_tables.extend(_resolve_star_base_tables(
+                            _jt, cte_names, ast))
+                # 去重且保持顺序
+                layer_tables = list(dict.fromkeys(t for t in layer_tables if t))
                 star_tables = [t for t in layer_tables if t in managed]
                 new_projections = []
                 changed = False
@@ -996,7 +1152,31 @@ def rewrite_sql(sql: str, ctx: AclContext | None, dialect: str | None = None) ->
                     # 配了"成本价 deny / 客户名 mask"的角色只要写成 t.* 即可拿到明文全列。
                     _is_star = isinstance(p, exp.Star) or (
                         isinstance(p, exp.Column) and isinstance(p.this, exp.Star))
-                    if _is_star and star_tables:
+                    if _is_star:
+                        # 2026-10-04（P0，原修 + 当日自查修正）：
+                        # 原修：把 `if _is_star and star_tables:` 改成 `if _is_star:`，
+                        #   `star_tables` 为空即拒绝 —— 堵住了派生表/CTE 的星号泄露。
+                        # 自查发现**过度拒绝**：`star_tables = [t for t in layer_tables if t in managed]`，
+                        #   而 `managed` = 配了列级策略的表。于是**完全没配列级策略的表**
+                        #   （合法且常见的配置）`star_tables` 也为空 → `SELECT * FROM test_factories`
+                        #   被拒，且提示写「基表无法确定（派生表/CTE 形态）」——**与真实原因完全不符**，
+                        #   会把排查的人带偏。
+                        # 更糟的是策略不一致：`managed` 为空时整个 `:1064` 段直接跳过、
+                        #   全部放行；`managed` 非空但表不在其中时却拒绝 —— 同样是「无策略的表」，
+                        #   一个放行一个被拒。
+                        # 修正为**按 layer_tables 判别**（表本身是否可确定），
+                        #   与是否有列级策略分开：
+                        #     · 基表可确定但无列级策略 → 放行（无需裁剪，本就无规则可违反）
+                        #     · 基表可确定且属受管表→ 正常裁剪 + 脱敏
+                        #     · 基表查不到（派生表/CTE 穿透失败）→ fail-close 拒绝
+                        if not layer_tables:
+                            return sql, ("列级权限：SELECT * 所在层的基表无法确定"
+                                         "（派生表/CTE 形态），无法安全裁剪敏感字段，已拒绝执行。"
+                                         "请显式列出需要的字段。"), applied
+                        if not star_tables:
+                            # 基表明确、但未对其配置任何列级策略 → 无规则会被违反，放行
+                            changed = changed or False
+                            continue
                         if len(layer_tables) != 1:
                             return sql, ("列级权限：多表查询中使用了 SELECT *，无法安全裁剪敏感字段，"
                                          "已拒绝执行。请显式列出需要的字段。"), applied

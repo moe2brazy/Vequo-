@@ -1,8 +1,16 @@
 # -*- coding: utf-8 -*-
 """指标口径 × yans 库 三路独立审查（schema实查 / SQL试执行 / 语义交叉）——审计报告生成器"""
-import io, json, re, sys
+import io, json, os, re, sys
 
-SCHEMA = json.load(open(r"D:\vue_first2 (2)\vue_first2\vue_first(2)\vue_first\backend\tests\yans_schema.json", encoding="utf-8"))
+# 2026-10-04 修复：原三处硬编码旧机器绝对路径
+#   D:\vue_first2 (2)\vue_first2\vue_first(2)\vue_first\...
+# 在当前仓库（任意机器）上全部失效 —— schema 读不到会直接 FileNotFoundError，
+# 脚本根本跑不起来。改为按 __file__ 推导 backend/ 目录。
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+_BACKEND_DIR = os.path.dirname(_TESTS_DIR)
+
+SCHEMA_PATH = os.path.join(_TESTS_DIR, "yans_schema.json")
+SCHEMA = json.load(open(SCHEMA_PATH, encoding="utf-8"))
 YANS_TABLES = set(SCHEMA.keys())
 
 # 聚合/函数/关键字/类型字面量（列名校验忽略集）
@@ -18,7 +26,7 @@ def expr_cols(expr: str) -> list:
     return [t for t in toks if t.upper() not in KW and not t.isdigit()]
 
 def main():
-    sys.path.insert(0, r"D:\vue_first2 (2)\vue_first2\vue_first(2)\vue_first\backend")
+    sys.path.insert(0, _BACKEND_DIR)
     from agent.metric_registry import get_all_metrics
     from db.executor import execute_sql
 
@@ -83,7 +91,7 @@ def main():
     buf.write("\n### NOT_YANS 清单\n")
     buf.write(", ".join(f"{r['name']}@{r['table']}" for r in groups["NOT_YANS"]) + "\n")
     out = buf.getvalue()
-    io.open(r"D:\vue_first2 (2)\vue_first2\vue_first(2)\vue_first\backend\tests\metric_audit_report.txt", "w", encoding="utf-8").write(out)
+    io.open(os.path.join(_TESTS_DIR, "metric_audit_report.txt"), "w", encoding="utf-8").write(out)
     print(out[:6000])
 
 if __name__ == "__main__":

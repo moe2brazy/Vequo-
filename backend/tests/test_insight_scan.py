@@ -55,10 +55,23 @@ check("C5 趋势探查失败返回 None", _probe_trend("t", "q", "d") is None, "
 check("C6 空值率探查失败返回 None", _probe_nulls("t", "d") is None, "")
 
 # 趋势突变：历史 100 上下，最新 300（+200%）
+# 2026-10-04 更正：打桩顺序必须是**时间倒序**（最新在前），实测得-28.57 而非 200。
+# 原因：_probe_trend 的 SQL 是 `ORDER BY t DESC LIMIT 60`（取最新 60 期），
+# 拿到结果后 `rows = list(reversed(...))` 反转回时间正序，保证 vals[-1] 是最新一期。
+# 这是 10-03 修过的 P0（原为 ASC LIMIT 60 → 取到最早 60 期，vals[-1] 其实是几十年前的期，
+# "最新"完全失真）。既然实现契约是"DESC 拿 + reversed 转正"，
+# 打桩就必须模拟 DESC 的返回顺序 —— 旧测试按正序打桩，reversed 后 last 落到2026-01，
+# 于是 (100-140)/140 = -28.57%���**错的是测试，不是实现**（倒序打桩实测得 200.0）。
 TREND_ROWS = [{"t": "2026-0%d-01" % i, "v": 100} for i in range(1, 6)] + [{"t": "2026-06-01", "v": 300}]
-isc._safe_execute = lambda sql: {"success": True, "rows": TREND_ROWS}
+TREND_ROWS_DESC = list(reversed(TREND_ROWS))   # 模拟 `ORDER BY t DESC` 的返回顺序
+isc._safe_execute = lambda sql: {"success": True, "rows": TREND_ROWS_DESC}
 tr = _probe_trend("t", "q", "d")
 check("C7 趋势偏离计算正确", tr and abs(tr["deviation_pct"] - 200.0) < 1, str(tr and tr["deviation_pct"]))
+# 锁住「DESC 拿 + reversed 转正」这个顺序契约：last 必须是最新一期（2026-06）而非最早一期
+check("C7b last 取的是最新一期(非最早)", tr and tr.get("time_value") == "2026-06-01",
+      str(tr and tr.get("time_value")))
+check("C7c base 是历史期均值", tr and abs((tr.get("base") or 0) - 100.0) < 1,
+      str(tr and tr.get("base")))
 isc._safe_execute = lambda sql: {"success": True, "rows": [{"t": "2026-01-01", "v": 10}]}
 check("C8 期数 <3 不做趋势判定", _probe_trend("t", "q", "d") is None, "")
 

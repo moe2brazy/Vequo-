@@ -2931,7 +2931,13 @@ def _fix_window_diff_coalesce(query: str, sql: str) -> str:
 # 返回原因字符串（"" = 通过），交给调用方**带原因重试**——这是本文件既有的纠错机制。
 _Q_CNTDISTINCT_RE = re.compile(r"多少种|几种|几类|多少个不同|种类数|不重复的|去重的")
 _SQL_CNTDISTINCT_RE = re.compile(r"COUNT\s*\(\s*DISTINCT", re.I)
-_SQL_SELECTSTAR_RE = re.compile(r"SELECT\s+\*", re.I)
+# 2026-10-04：`表名.*`（带限定符的整表倒出）此前**漏网**。
+# 原正则 `SELECT\s+\*` 只匹配裸 `SELECT *`，而 LLM 更常写 `SELECT dim_product.*`
+# （尤其被「列出所有 X」类提示带偏时）。实测：问「单位产品成本是多少」生成
+# `SELECT dim_product.* FROM dim_product LIMIT 20`，20 条产品主数据被当成答案端给用户，
+# 而质检门、裸明细守卫（规则 2）全部因「不是裸 SELECT *」而放行。
+# ⇒ 守卫漏判比误判更危险：误判顶多重试一次，漏判直接产出「看起来有结果的错答案」。
+_SQL_SELECTSTAR_RE = re.compile(r"SELECT\s+(?:[\w\"`\[\]\.]+\s*\.\s*)?\*", re.I)
 _SQL_IDCOL_RE = re.compile(r"\b[\w\u4e00-\u9fa5]*(?:_id|_code|_no)\b", re.I)
 _SQL_HAS_STRUCT_RE = re.compile(
     r"\b(COUNT|SUM|AVG|MAX|MIN)\s*\(|\bGROUP\s+BY\b|\bDISTINCT\b|\bWHERE\b|\bJOIN\b", re.I)
@@ -3035,7 +3041,364 @@ def _detail_intent_reason(query: str, sql: str) -> str:
         return ""
 
 
-# ── ⑨ 问句点名的业务维度在 SQL 中完全缺席（2026-09-17）──────────────────────
+# ── ⑩ 「率/占比」类问句没有真做除法（2026-10-05，实测 P0）──────────────────
+# 现象：问「报废率是多少」→ `SELECT SUM(defect_qty) AS "报废率", SUM(input_qty) AS "投入量"`
+#      实测返回 91,737。洞察层已察觉「率应为百分比、此处实为绝对数量」并提示核查，
+#      但**结果列名仍叫「报废率」、数值仍是无单位计数**——用户看表格不看洞察就会直接引用错数。
+# 为什么之前没拦住（重要教训）：
+#   · 提示词里**早已**写了硬约束「率/占比类必须真的做除法，不得返回分子的总量」，
+#     实测确认该提示词**确实注入了**——但模型没照做。
+#   · 而后端守卫只查 SQL **形态**（SELECT * / 有无 GROUP BY / 有无聚合函数），
+#     上面这条 SQL 有 SUM、有 ORDER BY，形态"完全合规" ⇒ 整条放行。
+#   ⇒ **提示词是软约束（模型可以不照做），只有确定性守卫才是硬约束。**
+#     凡「模型被要求做 X」而 X 是可判定性质，就必须有对应守卫兜住，
+#     否则这条要求等于没写。
+_RATIO_GATE_ON = os.getenv("QUALITY_GATE_RATIO_DIVISION", "1").strip() not in ("0", "false", "off")
+# 问句要「率」的信号。注意与 _AGG_METRIC_FORM（判是否需聚合）区分：
+# 那个判「要不要聚合」，这个判「结果是不是个比值」——「产量」要聚合但不是率。
+_RATIO_ASK_RE = re.compile(
+    r"(率|占比|比例|比重|份额|百分数)|"
+    r"\bOEE\b|\bTEE\b|\bFTT\b|\bPPM\b", re.I)
+# 明确不是率的问法（避免「比率达成」这类误伤）
+_RATIO_EXEMPT_RE = re.compile(r"准确率|可靠率")
+
+# ── ⑪ 「率/占比」结果越界：效率类不可能 <0 或 >100（2026-10-05 实测 P0）────
+# 现象：问「产线OEE 是多少」→ 6 条产线里5 条返回**负数**效率（-169%/-184%/-257%…）。
+#      业务事实：OEE / 稼动率 / 产能利用率 / 设备利用率 / 合格率恒在 0~100%，
+#      负效率值在物理上不可能，用户一眼就知道是错的。
+# 根因：模型把「480 分钟/天」当成单条产线**允许停机总时长**，
+#      写成 `100.0*(480 - SUM(downtime_minutes))/480`；
+#      而一条产线 45 天有 48 台设备、上百次停机，SUM(downtime_minutes) 远超 480
+#      （实测 L04 = 2015 分钟 / 46 次）⇒ 分子为负。
+# 为什么没拦住：`_ratio_without_division_reason` 只验「有没有除法」——
+#      这条 SQL **确实做了除法**，形态完全合规 ⇒ 整条放行。
+#      ⇒ 「有除法」不等于「算得对」。除法形态合规 ≠ 数值在定义域内。
+# 判据：问句要效率/率类百分比指标，且 SQL 用「(常量 - 停机/不良时长) / 常量」
+#      这类「减法式」效率公式时，减去的那部分必须 ≤ 分母，否则结果必为负。
+#      这里用**可判定**的方式拦：分子减项 >= 分母 ⇒ 结果必然 <0 ⇒ 必然错。
+_EFFICIENCY_ASK_RE = re.compile(
+    r"OEE|稼动率|开动率|利用率|效率|完好率|可用率|综合效率|达标率|合格率", re.I)
+# 形如 `(X - SUM(停机/不良/损失…)) / X` 的「减法式效率」：分子里出现减号且
+# 减号右侧是时长/数量类聚合，分母是同一常量。
+_SUBTRACTIVE_EFFICIENCY_RE = re.compile(
+    r"\(\s*[\w\.\"]*\s*-?\s*(?:COALESCE\s*\()?\s*SUM\s*\(", re.I)
+
+
+def _efficiency_out_of_range_reason(query: str, sql: str) -> str:
+    """效率类问句的 SQL 用「减法式」公式且减项 >= 分母 → 结果必为负 → 拦下。
+
+    只在能**静态判定必错**时拦（减项 >= 分母），不做语义猜测，避免误伤。
+    """
+    if not _EFFICIENCY_ASK_RE.search(query or ""):
+        return ""
+    try:
+        s = re.sub(r"\s+", " ", str(sql or ""))
+        if not s:
+            return ""
+        # 只看顶层 SELECT 投影区
+        proj = re.split(r"\bFROM\b", s, maxsplit=1, flags=re.I)[0]
+        if "-" not in proj:
+            return ""
+        # 抽出 `( A - SUM(…) ) / A` 形态（允许 *100.0 前缀、括号嵌套、CASE 包裹），
+        # 比较被减常量与分母常量是否同值 —— 同值即「(总额-损失)/总额」公式，
+        # 此时只要 SUM(...) 是**多条记录累加**，结果必然为负。
+        for m in re.finditer(
+                r"\(\s*([\d\.]+)\s*-\s*(?:COALESCE\s*\(\s*)?SUM\s*\("
+                r"[^)]*?\)\s*\)?\s*\)\s*[*]?\s*100(?:\.0)?\s*[*]?\s*/\s*[\(\s]*([\d\.]+)",
+                proj, re.I):
+            try:
+                base = float(m.group(1))
+                den = float(m.group(2))
+            except Exception:
+                continue
+            if den and base and abs(base - den) < 1e-9:
+                # 同源同值⇒ 减项 >= 分母时结果必为负 ⇒ 这类公式在多设备多天场景必错
+                return ("问题是「%s」类效率指标，其值恒在 0~100%%，不可能为负数。"
+                        "当前 SQL 写成 (%g - SUM(时长/数量)) / %g ——把「每天 %g 分钟」"
+                        "当成了整条产线/全厂的**允许损失总量**；"
+                        "实际是 48 台设备 × 多天的多次停机累加，SUM 必然远大于 %g，结果必然为负。"
+                        "请改为按「设备数 × 天数 × 单台每日可用分钟」作分母，"
+                        "或直接使用已注册的替代口径（稼动率 / 设备可用率）。"
+                        % (_EFFICIENCY_ASK_RE.search(query).group(0), base, den, base, base))
+        # ── ⑪-b 效率类「量纲错」：把**记录条数**当运行时长 ──────────────
+        # 现象（2026-10-05 实测，拦掉负数公式后立刻暴露的第二层问题）：
+        #   模型改成 `100.0 - SUM(downtime_minutes)/NULLIF(COUNT(*)*60, 0)` →
+        #   结果不再为负，但**所有产线都= 99.2~99.3**（实测 L01=99.26 L02=99.18…）。
+        # 为什么还是错的：分母 `COUNT(*)*60` = 「停机记录**条数** × 60 分钟」，
+        #   它不是「日历运行时长」。实测每条记录平均停机仅 46.43 分钟
+        #   （AVG(downtime_minutes)=46.43），故 SUM/(COUNT*60) ≈ 0.77%
+        #   → 结果必然趋近 100，**各产线之间几乎没有区分度**，拿去对比毫无意义。
+        # ⇒ 判据：效率类问句的公式里出现 `COUNT(*) * 60` / `COUNT(*)*24*60` 这类
+        #   「用记录条数当时间基准」的写法 → 时间基准不成立（记录条数≠时间）→ 拦。
+        #   注意：**不能**只看「结果是否在0~100」——全=100 也在范围内，是靠量纲识破的。
+        # 只拦「COUNT(*) 单独充当时间基准」这一种形态：分母形如 `COUNT(*) * 60`
+        #（记录**条数** × 一个时长单位）—— 条数不是时间。
+        # 必须放行的合法形态（实测确认它们真能出正确值）：
+        #   · 已注册口径的 `... * COUNT(DISTINCT e.equipment_id) * 1440`
+        #     —— 「该组设备数 × 一天」= 该组日历分钟，**成立**。
+        #   · 日历工时 `(MAX(start_time)::date - MIN(start_time)::date) * 1440`
+        #     —— 压根没有 COUNT(*)，自然不命中。
+        # 所以正则要求 COUNT( 后面**不能**跟 DISTINCT /具体列名（那都是实体计数口径）。
+        if re.search(r"COUNT\s*\(\s*(?!\s*DISTINCT)[^)]*?\*\s*\)?\s*\*\s*"
+                     r"(?:24\s*\*\s*)?60\b", proj, re.I):
+            # 为什么**不**因为「已披露」就放行（实测打脸过一次）：
+            #   首版想「带 proxy / caliber_note 就算合规放行」，
+            #   结果拦下后模型产出的替代口径是
+            #     `100.0 - SUM(downtime_minutes)/NULLIF(COUNT(*)*60,0)`
+            #   列名写着 `oee_替代口径_稼动率`、还配了「口径说明」列——
+            #   **披露得漂漂亮亮，数值却全线趋近 100（99.18~99.26）毫无区分度**。
+            #   ⇒ 披露只解决「用户知不知道」，解决不了「答案对不对」。
+            #   量纲错（条数当时间基准）无论披露与否都必须拦：分母不成立，
+            #   算出来的数在数学上就没有意义，标注得再清楚也是错的。
+            return ("问题是「%s」类效率指标，其分母必须是**时间基准**（计划工时 / 日历工时）。"
+                    "当前 SQL 用 `COUNT(*) * 60`（停机记录**条数**×60）作分母 —— "
+                    "记录条数不是时间（本库平均每条停机记录仅 46.43 分钟），"
+                    "这样算出来的效率必然趋近 100，各产线之间几乎没有区分度，不具对比价值。"
+                    "请改用时间基准作分母：日历工时口径 = SUM(downtime_minutes) ÷"
+                    "（(MAX(start_time)::date - MIN(start_time)::date) × 设备数 × 1440）；"
+                    "或直接使用已注册口径「稼动率/开动率」（= 100 − 日历停机率，"
+                    "支持产线/设备/设备类型/日期维度）。"
+                    % _EFFICIENCY_ASK_RE.search(query).group(0))
+        return ""
+    except Exception:
+        return ""
+
+
+# ── ⑫ 量词与结果形态不匹配：问「数/量/件」却返回一个「率」（2026-10-05 实测）──
+# 现象：问「报废数是多少」→ 返回列 `近似报废率(不良+返工/投入)` = 0.0374。
+#      问「报废了多少件」→ 返回 5273（件数）。
+#      **同一问题家族里，一句给率、一句给件数**，语义相同形态不同。
+# 为什么没拦住：`_ratio_without_division_reason` 里有一条放行规则
+#   （问题结尾是「数/数量/个数/次数」→ 不是率，直接放行），
+#   这条规则对「报废率是多少」是对的（那确实要率），
+#   但对「报废数是多少」它只否决了"该用率"，**没有否决"返回率"**。
+#   ⇒ 反向失守：**问数量却给了比值**，单位错位同样会被用户当答案引用。
+# 判据：问句要的是**计数/总量**（数、量、件、台、个数…），
+#      但 SQL 顶层的比值表达式（除法 / %_rate / rate / pct 列）才是唯一输出列
+#      ⇒ 形态不匹配，拦下要求改成计数。
+_COUNT_ASK_RE = re.compile(r"(多少|几)\s*(件|个|条|次|台|人|单|批|款|种)|"
+                           r"(总数|数量|件数|个数|次数|台数|单数|产出量|报废数|废品数)", re.I)
+_RATIO_VALUE_COL_RE = re.compile(r"\bAS\s+[\"`]?[\w]*"
+                                 r"(rate|ratio|pct|percent|per_?capita)[\w]*[\"`]?",
+                                 re.I)
+
+
+def _count_vs_ratio_mismatch_reason(query: str, sql: str) -> str:
+    """问「数量」却只返回一个比值列 → 单位错位 → 拦下。"""
+    try:
+        q = str(query or "")
+        s = re.sub(r"\s+", " ", str(sql or ""))
+        if not q or not s:
+            return ""
+        if not _COUNT_ASK_RE.search(q):
+            return ""
+        # 问句要的是**计数/总量**，不是比值 —— 这是本守卫唯一的适用前提。
+        # 判据看问题本身：出现「率/占比/比例」且问题主体就是那个比值 → 是率类，放行。
+        # 反之（问句里出现计数词但没有比值词，如「报废数是多少」）→ 本守卫适用。
+        # 注意：**不能**用「列名里是否含率字」来放行 —— 2026-10-05 实测
+        # 「报废数是多少」返回列名 `近似报废率(...)`，正是列名含「率」被误放行的。
+        if re.search(r"(率|占比|比例|比重)", q):
+            return ""
+        proj = re.split(r"\bFROM\b", s, maxsplit=1, flags=re.I)[0]
+        aliases = re.findall(r"\bAS\s+([\"`]?[\w\u4e00-\u9fff]+[\"`]?)", proj, re.I)
+        if not aliases:
+            return ""
+        # 先剔除**字符串常量**（说明文本里的 '/' 不是除法）。
+        # 2026-10-05 实测踩过的坑：合规样例「库存周转次数」返回
+        #   NULL::numeric AS "周转次数", '建议公式：SUM(出库量)/AVG(平均库存)' AS "口径说明"
+        # 那个 '/' 在单引号文本里，不是 SQL 除法 —— 首版用 `"/" in proj` 判除法，
+        # 结果把这条**诚实NULL 的合规答案**误伤了。
+        proj_code = re.sub(r"'(?:[^']|'')*'", "''", proj)
+        has_div = ("/" in proj_code)
+        # 数值型输出列里必须**至少有一个是真比值**（有除法且不是纯 NULL/常量）
+        if has_div:
+            real_value_cols = [
+                a for a in aliases
+                if not re.match(r"^[\"'`]*[\u4e00-\u9fff]*(指标名称|说明|口径说明|名称)[\"'`]*$", a.strip('"`'))
+            ]
+            # 所有非说明列都叫「NULL」⇒ 本来就没出数（诚实 NULL）→ 不拦
+            if not real_value_cols:
+                return ""
+        has_count_alias = any(
+            re.search(r"(count|qty|quantity|num|件数|个数|数量|总数|台数|单数)", a, re.I)
+            for a in aliases)
+        # 只要不是「纯比值输出」就不拦（宁可漏过，绝不误伤）
+        if not has_div or has_count_alias:
+            return ""
+        # 明细 TOP-N / 排名类：本就要实体+数值列，不算形态错位
+        if _is_detail_topn(q):
+            return ""
+        return ("问题是「%s」——问的是**数量/件数**，但当前 SQL 输出的全部是比值列"
+                "（%s），单位与问题不匹配。同一个「%s」问法换个说法就该给件数，"
+                "结果不能一会儿是率、一会儿是件数。请改为输出计数/总量"
+                "（COUNT/SUM 绝对数量）；若该指标确实只能以比值表达，"
+                "请先把问题理解为比值并明确说明这是折算值。"
+                % (q[:20], ", ".join(a.strip('"`') for a in aliases), q[:8]))
+    except Exception:
+        return ""
+
+
+def _ratio_without_division_reason(query: str, sql: str) -> str:
+    """问句要「率/占比」，但 SQL 里没有任何除法 → 返回可读原因；否则 ""（通过）。
+
+    判「真做了除法」的口径（有意保守，宁可漏过也不误伤）：
+      · SELECT 投影里出现 `/` 运算符，且**不是**日期/字符串拼接意义上的斜杠；
+      · 或出现 `* 100` / `/ NULLIF(` 这类明确的比值写法；
+      · 或列名带 `%` / `rate` / `ratio` / `rate_percent` 且投影里有除法。
+    例外放行（这些确实不需要除法）：
+      · 常量型问法：「占比最大的前3个」这类只需 ORDER BY + LIMIT；
+      · 明细 TOP-N：「库存最低的前5个」；
+      · 已注册口径由编译器产出（本函数只作用于 LLM 生成路径）。
+    """
+    if not _RATIO_GATE_ON:
+        return ""
+    try:
+        q = str(query or "")
+        s = str(sql or "")
+        if not q or not s:
+            return ""
+        if _RATIO_EXEMPT_RE.search(q):
+            return ""
+        if not _RATIO_ASK_RE.search(q):
+            return ""
+        # 问的是「率**数/量/个数/次数**」= 要计数，不是要比值（「报废数」≠「报废率」）。
+        # 放在判率之前：数量词直接否决「率」的语义。
+        if re.search(r"(率|率数)?\s*(数|数量|个数|次数|条数|多少个|多少条|多少次)\s*$", q) \
+                or re.search(r"(多少|几)(个|条|次|件|台|人)", q):
+            return ""
+        # 纯排名/列举型问法：不需要比值
+        if _is_detail_topn(q):
+            return ""
+        if re.search(r"(占比|比例|不良率|报废率|废品率|故障率|率).{0,6}"
+                     r"(最大|最高|最低|最少|最多|前\s*\d+|top|排名|排行)", q, re.I):
+            return ""
+        # 投影区（SELECT ... FROM 之间）里找除法
+        proj = re.split(r"\bFROM\b", s, maxsplit=1, flags=re.I)[0]
+        if "/" in proj:
+            return ""
+        # 明确的比值写法：* 100 或 / NULLIF(
+        if re.search(r"\*\s*100\b", proj) or re.search(r"/\s*NULLIF\s*\(", proj, re.I):
+            return ""
+        # 比率已在别处（CTE / 子查询里先算好，外层只 SELECT 它）
+        if re.search(r"\bAS\s+[\"`]?\w*(rate|ratio|pct|percent)", s, re.I):
+            return ""
+        return ("问题是「率/占比」类指标（%s），必须由分子÷分母算出比值；"
+                "当前 SQL 只是把某个数值（很可能是分子/计数）直接当作该指标输出，"
+                "单位不对，用户会把它当百分比引用。"
+                "请改写为显式除法：分子聚合 ÷ 分母聚合（必要时 *100 或 *1.0 防整数除法）。"
+                % _RATIO_ASK_RE.search(q).group(0))
+    except Exception:
+        return ""
+
+
+# ── ⑬ 缺源字段口径的「静默冒充」：列名冒充实指标，却无任何 proxy/说明标注 ──
+# 现象（2026-10-05 实测）：问「报废了多少件」→
+#      `SELECT SUM(qms_defect_detail.defect_qty) AS "报废件数"` → 返回 5273。
+#      列名直接叫「报废件数」，值却是**全表缺陷数之和**（实测 defect_qty 合计=5273，
+#      而该表 severity_level 枚举只有 major/minor/critical，根本没有「报废」）。
+#      用户会把5273 当报废件数直接引用 —— 这是**静默冒充**。
+# 为什么没拦住：
+#   · 提示词注入了【口径未注册·必须声明】，模型确实在 `_fix_notes` 里写了声明；
+#   · 但 `_fix_notes` 是**答案文本尾部**的【执行说明】，而**结果表格的列名**仍叫「报废件数」。
+#     洞察层声明了「这是估算」，可用户看的是表格列名 → 照样误引用。
+#   · 对比合规样例：#18 问「报废率」返回列名 `近似报废率(不良+返工/投入)` + 口径说明列
+#     ——同样缺源字段，但它把「这是替代口径」写进了**列名**并额外给了说明列 ⇒ 合规。
+# ⇒ 判据：命中缺源字段闸门（`_underivable_metric_reason` 非空，即已认定算不出真值），
+#   **且**输出列名直接等于问题里的指标词，**且**列名/SQL 里没有任何 proxy、近似、
+#   说明、note 之类标注 ⇒ 静默冒充，拦下要求改名或补说明列。
+#   为什么放在静态 SQL 层判：「列名冒充实指标」仅凭 SQL 文本即可判定，
+#   不需要执行结果 —— 与 `_output_quality_reason` 拿到 query+sql 的接口一致。
+_UNREG_HONEST_MARK_RE = re.compile(
+    r"proxy|近似|替代|估算|说明|声明|无法计算|缺失|建议|非严格|口径|note|comment|remark|"
+    r"不可得|待定|n/a", re.I)
+
+
+# 闸门规则里每个类别「真正需要的源字段」特征（与 _UNDERIVABLE_METRIC_RULES 对应）。
+# 判据改成**本质性**的：不看列名叫什么，而看 SQL 有没有用上「该指标真正需要、
+# 而库里没有」的那个字段。若没有 ⇒ 它必然是拿别的列冒充。
+# 为什么不用列名匹配（2026-10-05 实测踩过的坑）：
+#   首版守卫靠「列名含中文指标词」判冒充，结果 6 条真 bug 只拦住 1 条——
+#   模型给的列名是 `inventory_turnover_rate` / `avg_output_per_line` /
+#   `utilization` 这类**英文名**，中文「周转/人均/效率」压根不出现，字面匹配全落空。
+#   ⇒ **列名是模型自由发挥的表面文字，源字段才是事实。**判据必须落在事实层。
+_UNREG_NEED_SOURCE = {
+    #类别: (需要但库里没有的源字段特征, 冒充时一定会用的「替代列」特征)
+    "人均": (r"headcount|employee|staff|worker|person|manpower|人数|员工数|工人数",
+             r"line_id|stat_date|shift_code|process_id"),
+    "周转": (r"issue_qty|out_qty|shipment|consumption|usage|sale|sold|出库|消耗|领用|发货",
+            r"available_qty|frozen_qty|safety_stock_qty|snapshot_date"),
+    "成本": (r"cost|amount|price|成本|金额|单价", r"input_qty|good_qty|plan_qty|output_id"),
+    # 「OEE」类同理收紧：runtime/uptime 这类词可能出现在**别名**里
+    # （如 oee_runtime_proxy），不能当「已用上运行时长源字段」的证据。
+    "OEE": (r"run_hours|operating_hours|run_minutes|planned_minutes|design_capacity|"
+            r"theoretical_takt|运行时长|开机时长|运行分钟|设计产能|理论节拍",
+            r"downtime_minutes|downtime_reason|good_qty|input_qty|start_time|end_time"),
+    "报废": (r"scrap|waste|reject|报废数|报废量|废品数|废品量",
+             r"defect_qty|rework_qty|severity_level|defect_type"),
+    # 「交付」类：need_re 只认**真正的交付事实列**，不能收delivery/fulfill/on_time
+    # 这类宽泛词 —— 2026-10-05 实测踩过的坑：模型给的**别名** `order_fulfillment_rate`
+    # 里含 "fulfill"，被当成了「已用上交付源字段」的证据 → 冒充守卫直接放行。
+    # ⇒ 别名不是事实，只有 delivery_date / customer_order 这类实字段才算证据。
+    "交付": (r"delivered_at|delivery_date|ship_date|shipped_at|customer_order|"
+             r"客户订单|发货时间|交付时间|签收|delivery_status",
+             r"order_status|end_date|start_date|plan_qty"),
+    "齐套": (r"bom|kitting|齐套|配套|物料清单", r"available_qty|safety_stock_qty|input_qty|frozen_qty"),
+}
+# 类别顺序 **必须与 _UNDERIVABLE_METRIC_RULES 的规则顺序一一对应**
+# （顺序错位会让「命中第N条规则」映射到错误的类别，守卫就会拿错源字段特征去比对）。
+# 依据 llm_service.py 10872-10929 逐条核对：人均→周转→OEE→成本→报废→交付→齐套→停机率。
+_UNREG_CAT_ORDER = ("人均", "周转", "OEE", "成本", "报废", "交付", "齐套", "OEE")
+
+
+def _silent_impersonation_reason(query: str, sql: str) -> str:
+    """缺源字段口径 + SQL 未使用该指标真正需要的源字段 + 无任何诚实标注 → 拦下。
+
+    这条拦的是**静默冒充**：系统已认定该指标算不出来，SQL 却用无关列拼出一个值，
+    且列名/SQL 里没有任何 proxy、近似、说明之类披露 —— 用户会把替代值当本指标引用。
+    对比合规样例（实测 #18 问报废率 → 列名 `近似报废率(...)` + `口径说明` 列）⇒ 放行。
+    """
+    try:
+        q = str(query or "")
+        s = str(sql or "")
+        if not q or not s:
+            return ""
+        reason = _underivable_metric_reason(q)
+        if not reason:
+            return ""            # 未命中缺源字段闸门 → 不归本守卫管
+        # SQL 里已有诚实标注（proxy / 说明列 / 口径文本常量）→ 放行
+        if _UNREG_HONEST_MARK_RE.search(s):
+            return ""
+        # 定位类别：用闸门**自己那条命中的规则**来定（同一事实源，不靠关键词猜）。
+        # 为什么必须这样：首版按 `c in q` 猜类别，「订单满足率是多少」里没有字面
+        # 「交付」二字 → 猜不到 → KeyError。闸门能返回 reason 就说明某条规则命中，
+        # 而规则的顺序与 _UNREG_NEED_SOURCE 的类别顺序一致，按命中序号对应即可。
+        cat = None
+        for idx, (pat, col_pat, _r) in enumerate(_UNDERIVABLE_METRIC_RULES):
+            if pat.search(q):
+                if idx < len(_UNREG_CAT_ORDER):
+                    cat = _UNREG_CAT_ORDER[idx]
+                break
+        if not cat:
+            for c in _UNREG_CAT_ORDER:
+                if c in reason:
+                    cat = c
+                    break
+        if not cat:
+            return ""
+        need_re, sub_re = _UNREG_NEED_SOURCE[cat]
+        if re.search(need_re, s, re.I):
+            return ""            # 竟然用上了真正需要的源字段（可能是新库）→ 放行
+        if not re.search(sub_re, s, re.I):
+            return ""            # 连替代列都没用到 → 不构成「冒充」，交给别的守卫
+        return ("问题是「%s」，但当前库缺少计算该指标所需的源字段（系统已判定为口径未注册）。"
+                "当前 SQL 用无关列（%s）拼出了这个指标的值，且列名/说明里没有任何"
+                "「这是替代口径」的披露——用户会把替代值当本指标直接引用，属于静默冒充。"
+                "请二选一：(1) 把输出列改名为明确体现替代口径的名称（如加后缀「_替代口径」），"
+                "或额外加一列文字说明写明「本库无该源字段，此处为替代值」；"
+                "(2) 若确实无法计算，把该列输出为 NULL 并说明原因。"
+                % (q[:24], re.findall(sub_re, s, re.I)[0]))
+    except Exception:
+        return ""
 # 现象：问「各部门的工资总和」却 `FROM employee GROUP BY employee.name`（123#10）；
 #      问「每种物料类别的物料数量」却去数 `product` 表（123#5）；问「各产品类别的
 #      不良类型分布」却只 `GROUP BY defect_type`、从没关联产品表（postgres#22）。
@@ -3183,7 +3546,27 @@ def _output_quality_reason(query: str, sql: str) -> str:
         return ""
     try:
         if _SQL_SELECTSTAR_RE.search(s):
-            return "SELECT * 返回原始明细，必须只选问题要的聚合结果与维度列"
+            # 2026-10-04：豁免**明细意图**问句。「最近5条设备维护记录」「列出所有产品」
+            # 本来就要 `SELECT *`（用户要的就是原始记录），拦它会逼模型硬凑列名，反而更差。
+            # 此前只拦裸 `SELECT *` 时问题不显眼，把正则放宽到 `表名.*` 后才暴露 ——
+            # **放宽守卫必须同步检查反向：哪些原本合法的会被误伤**。
+            # 判据：问句本身要的就是**记录行**（明细 TOP-N / 全量列举 / 明细词），
+            # 而非某个聚合值。与 _detail_intent_reason 判据刻意不同：
+            # 后者的 _RULE_COUNT_WORD 含「条/数/量」，会把「最近5条设备维护记录」判成聚合计数
+            # （实测确实如此），所以不能复用它的前置条件。
+            _want_detail = False
+            try:
+                _q0 = str(query or "")
+                _want_detail = (
+                    _is_detail_topn(_q0)                       # 「库存最低的前5个产品」
+                    or bool(re.search(r"最近\s*\d+\s*(?:条|笔|单|个|名|台|次|位|份)", _q0))
+                    or bool(_RULE_DETAIL_WANT.search(_q0))      # 「情况/明细/详情/清单」
+                    or any(w in _q0 for w in _FULL_RESULT_WORDS)  # 「所有/全部/全量/逐条」
+                ) and not _needs_aggregation(_q0)
+            except Exception:
+                _want_detail = False
+            if not _want_detail:
+                return "SELECT * 返回原始明细，必须只选问题要的聚合结果与维度列"
         # ① 去重计数被写成普通聚合
         if _Q_CNTDISTINCT_RE.search(query or "") and not _SQL_CNTDISTINCT_RE.search(s):
             return ("问题是「有多少种 / 几种不同的 X」= 去重计数，必须写成 COUNT(DISTINCT 列)，"
@@ -3193,6 +3576,33 @@ def _output_quality_reason(query: str, sql: str) -> str:
         if len(_SQL_IDCOL_RE.findall(_proj)) >= 3 and not _SQL_HAS_STRUCT_RE.search(s):
             return ("SQL 直接倒出了多条主键/外键/编码列且没有任何聚合、筛选或关联，"
                     "这不是对问题的回答；请按问题语义做聚合、集合判断或关联维表后再输出需要的维度列")
+        # ②.5 「率/占比」类问句**没有真做除法**（2026-10-05，实测 P0）
+        # 现象：问「报废率是多少」→ `SUM(defect_qty) AS "报废率", SUM(input_qty) AS "投入量"`
+        #       返回 91,737 —— 那是缺陷**计数**，不是率。用户若只看结果表格不看洞察，
+        #       就会把 91737 当成「报废率 91737%」直接引用。
+        # 为什么之前没拦住：
+        #   · 提示词里**已经**写了硬约束（「率/占比类必须真的做除法」）——实测确认已注入；
+        #   · 但**后端没有任何守卫检查 LLM 是否照做**。守卫只查 SQL 形态
+        #     （SELECT * / 有没有 GROUP BY / 有没有聚合函数），而上面这条 SQL
+        #     有 SUM、有 ORDER BY，形态完全「合规」⇒ 整条放行。
+        #   ⇒ **提示词是软约束，只有确定性守卫才是硬约束。**
+        # 判据：问句要「率/占比/比例」，但 SQL 顶层 SELECT 里没有任何除法运算
+        #      （分子分母同表相除、或除以另一个聚合表达式都算做了）。
+        _why_ratio = _ratio_without_division_reason(query or "", s)
+        if _why_ratio:
+            return _why_ratio
+        # ②.6 效率类结果越界 / 量词形态错位（2026-10-05 实测 P0/P1）
+        # 放在 ②.5 之后：②.5 只管「有没有除法」，这里管「除了之后对不对」。
+        _why_eff = _efficiency_out_of_range_reason(query or "", s)
+        if _why_eff:
+            return _why_eff
+        _why_cnt = _count_vs_ratio_mismatch_reason(query or "", s)
+        if _why_cnt:
+            return _why_cnt
+        # ②.7 缺源字段口径的静默冒充（列名冒充实指标且无任何诚实标注）
+        _why_imp = _silent_impersonation_reason(query or "", s)
+        if _why_imp:
+            return _why_imp
         # ③ 「值放错列」不在这里拦截 —— 实测（2026-09-15）**拒绝型闸门在这一类上是负收益**：
         #    拦下之后只剩直生兜底，而思考型模型在剩余预算内常常出不来 → 2 题直接从
         #    WRONG 掉成 GEN_FAIL（3/6 vs 4/6），比给出一个"0 行的错误答案"更糟。
@@ -3665,6 +4075,21 @@ _AGG_WORDS = ["各", "每个", "每条", "每种", "每类", "分别", "按", "�
               "占比", "分布", "汇总", "统计", "总计", "合计", "平均", "趋势", "同比", "环比",
               "良率", "合格率", "达成率", "TOP", "top", "最高", "最低", "最多", "最少",
               "产量", "总量", "总额", "总数", "金额"]
+# 2026-10-04 补：「率 / 比 / 单位量纲 / 均价」类问法**本质上必然要聚合**。
+# 实测漏网：用户问「单位产品成本是多少」，这些词一个都不命中 → needs_agg=False
+# → 规则 2（聚合意图却没聚合）整条被跳过 → LLM 生成 `SELECT dim_product.* LIMIT 20`
+# 返回 20 条产品主数据当答案。这是**「出结果」的假象**：出了数，但与问题无关，
+# 比拒绝更糟（用户会以为这就是成本表）。
+# 判定用正则而非追加词表，是因为这类问法后缀极杂（率/比/均价/单耗/周转/人均/单位X…），
+# 逐个加词永远补不完；用「指标必须由分子分母算」的语义特征一次性覆盖。
+_AGG_METRIC_FORM = re.compile(
+    r"(率|比|均价|单耗|人均|单位\s*[^\s]{0,6}|"
+    r"周转|成本|产值|毛利|溢价|差额|差异|"
+    # 纯英文缩写指标（OEE = Overall Equipment Effectiveness，设备综合效率）：
+    # 无「率/比」字样，但同样是「由分子分母算出」的复合指标。
+    # 实测漏网：问「OEE 是多少」→ needs_agg=False → 裸明细守卫跳过。
+    r"\bOEE\b|\bOLE\b|\bTEE\b|\bFTT\b|\bPPM\b|"
+    r"损失|损耗|效率)")
 # 需要聚合计数的信号词（命中则 TOP-N 问题仍是聚合问题，如「订单数量最多的前5名客户」）
 _AGG_COUNT_WORDS = ("数量", "次数", "个数", "总额", "总量", "总数", "金额", "产量", "良率",
                     "不良率", "合格率", "达成率", "占比", "平均", "时长")
@@ -3709,10 +4134,20 @@ def _wants_full_result(query: str) -> bool:
 
 
 def _needs_aggregation(query: str) -> bool:
-    """问题是否需要聚合（GROUP BY / 聚合函数）"""
+    """问题是否需要聚合（GROUP BY / 聚合函数）
+
+    2026-10-04：新增「指标形态」判据（率/比/单位量纲/人均/周转/成本…）。
+    这类问法要回答「是多少」，就必须由分子分母算出来，不可能靠倒明细表回答。
+    此前只看 _AGG_WORDS，「单位产品成本是多少」一个词都不命中 → 判为非聚合 →
+    裸明细守卫（规则 2）整条跳过 → 实测 LLM 返回 `SELECT dim_product.* LIMIT 20`，
+    20 条产品主数据被当成「单位成本」的答案端给用户。
+    守卫漏判比守卫误判更危险：误判顶多重试一次，漏判直接产出「看起来有结果的错答案」。
+    """
     if _is_detail_topn(query):
         return False
-    return any(w in query for w in _AGG_WORDS)
+    if any(w in query for w in _AGG_WORDS):
+        return True
+    return bool(_AGG_METRIC_FORM.search(query or ""))
 
 
 def _build_agg_hint(query: str) -> str:
@@ -3857,6 +4292,23 @@ def _build_agg_hint(query: str) -> str:
             hints.append(time_hint)
     except Exception:
         pass
+    # ── 未注册口径：不再源头拒绝，改为「放行 + 硬约束 + 强制声明」（2026-10-04）──
+    # 产品决策：**AI 兜底路径的第一硬标准是「出结果」**，拒绝等于什么都没给。
+    # 原设计（2026-09-13）为防 LLM 拿语义无关的列冒充指标而源头拒绝；实测代价是
+    # 用户拿到「请求失败 / 不能生成」。现改为：照常生成，但在提示词里下三条硬约束，
+    # 并在答案里落【执行说明】声明口径（见 ask_stream 的调用点），把「骗」变成「标注着估」。
+    try:
+        _ud_reason = _underivable_metric_reason(query)
+    except Exception:
+        _ud_reason = None
+    if _ud_reason:
+        hints.append(
+            "【口径未注册·必须声明】本问涉及的指标未在系统注册（计算所需的源字段在当前库中"
+            "不存在或不完整）。硬性要求：① 优先用已注册的相近口径字段计算并给出**具体结果**，"
+            "不要因为口径不全就不作答；② 严禁用语义无关的列冒充该指标——"
+            "特别注意「率/占比/比例」类问题必须真的做除法得到百分比，不得返回分子的总量或明细；"
+            "③ 结论中必须用一句话显式写出你实际使用的口径与公式，并说明它与业务标准定义的差异。"
+            "口径背景：" + _ud_reason)
     return "\n".join(f"- {h}" for h in hints)
 
 
@@ -3944,6 +4396,11 @@ def _validate_chart_type(chart_type: str, columns: list[str], rows: list[dict], 
     # 1) 时间趋势 → 折线（结果含时间列且语义带趋势/周期）
     if date_cols and any(w in q for w in _TREND_WORDS):
         return "area" if any(w in q for w in ("累计", "累计值", "面积")) else "line"
+    # 1b) 时间序列 + 两个**不同量纲**指标 → 双轴组合（2026-10-04 新增）
+    #     折线只画得出同量纲多系列；「每日产量和良率」这类"率 + 计数"混搭单轴必有一方贴地。
+    #     放在趋势规则之后：明确问「趋势」时仍走折线，不抢用户语义。
+    if date_cols and len(num_cols) >= 2 and _mixed_ratio_and_count(num_cols):
+        return "dual"
     # 2) 双维度交叉密度 → 热力图（2 个类别列 + 1 数值列 + ≥6 行 + 无时间列）
     if len(cat_cols) >= 2 and len(num_cols) == 1 and n >= 6 and not date_cols:
         return "heatmap"
@@ -3955,7 +4412,12 @@ def _validate_chart_type(chart_type: str, columns: list[str], rows: list[dict], 
     if len(cat_cols) == 1 and 2 <= len(num_cols) <= 4 and 3 <= n <= 12:
         return "radar"
     # 3b) 1 类别 + 2~3 数值 + 行数多 → 堆叠柱（雷达图只适合 ≤12 行，行多时堆叠对比更可读）
+    #     ⚠️ 2026-10-04 修复：堆叠要求各数值列**同量纲、可加总**。混有「率 + 计数」
+    #     （如 产量(件) + 良率(%)）时堆叠无业务含义——两个量纲相加，总高无解释、
+    #     良率那一段在大柱子里肉眼不可见 → 改走**双轴组合**（左轴柱 + 右轴折线）。
     if len(cat_cols) == 1 and 2 <= len(num_cols) <= 3 and n > 12:
+        if _mixed_ratio_and_count(num_cols):
+            return "dual"
         return "stacked"
     # 4) 纯数值相关性 → 散点（≥2 数值列、无类别列、**且无时间列**——时间序列是
     #    双线/堆叠的形态，散点会丢掉时间顺序，误导读图）
@@ -5066,20 +5528,44 @@ class LLMService:
         # 再次提问应直接命中复用，而不是重复弹窗。
         _cached = self._semantic_cache_hit()
         if _cached:
-            self.sql = _cached["sql"]
-            self.matched_tables = _cached["matched_tables"] or []
-            self.schema_context = _cached["schema_context"] or ""
-            if _cached.get("chart_type"):
-                self.chart_type = _cached["chart_type"]
-            self.title = self.title or self.query  # 命中路径未经过报告生成，标题用问题兜底
-            self._semantic_hit = True
-            # 恢复口径溯源信息：缓存条目记录了这条 SQL 当初是否由编译器生成。
-            # 若当初是编译命中，这里恢复 compiled_mql，让前端照常展示「口径编译保证」
-            # 而不是误报成 LLM 生成（并据此跳过 LLM 复查，省 2.8~5.3s）。
-            if _cached.get("compiled"):
-                self.compiled_mql = _cached.get("mql")
-            yield _step("语义缓存", f"命中相似历史查询（相似度 {_cached['similarity']:.2f}），复用 SQL 直接执行")
-        else:
+            # ── 缓存命中不等于免检（2026-10-05 实测 P0）────────────────────
+            # 实测现象：先问「报废数是多少」→ 沉淀了 `SUM(defect_qty) AS "报废数"`；
+            #      再问「报废率是多少」→ 语义缓存命中（相似度足够高），
+            #      **直接复用这条 SQL 并跳过全部下游校验** ——
+            #      没走选表、没走 SQL 生成、没走 `_output_quality_reason`、
+            #      也没走 5377 行的口径未注册检查 ⇒
+            #      结果：一个**率**的问题返回了**缺陷计数**，且**一条声明都没有**
+            #      （实测 fix_notes=0，答案文本里也无「口径未注册」字样）。
+            #      这是本次审计发现的最隐蔽的一类洞：**缓存把上游的所有纠错成果一起缓存掉了**。
+            # ⇒ 判据：命中缓存的 SQL 若通不过输出质量守卫，**不得直接复用**，
+            #    应当降级为「不走缓存，走正常生成链」（守卫会给出可读原因让 LLM 定向改写）。
+            #    缓存的价值是「跳过慢步骤」，不是「跳过正确性检查」——
+            #    一条被守卫判为退化/冒充的 SQL，说明它当初就不该被沉淀或已被后续修复淘汰。
+            _cached_bad = ""
+            try:
+                _cached_bad = _output_quality_reason(self.query, _cached["sql"] or "")
+            except Exception:
+                _cached_bad = ""
+            if _cached_bad:
+                yield _step("语义缓存",
+                            "命中历史查询但其 SQL 未通过当前质量校验（已降级为重新生成）："
+                            + _cached_bad[:52])
+                self._semantic_hit = False
+            else:
+                self.sql = _cached["sql"]
+                self.matched_tables = _cached["matched_tables"] or []
+                self.schema_context = _cached["schema_context"] or ""
+                if _cached.get("chart_type"):
+                    self.chart_type = _cached["chart_type"]
+                self.title = self.title or self.query  # 命中路径未经过报告生成，标题用问题兜底
+                self._semantic_hit = True
+                # 恢复口径溯源信息：缓存条目记录了这条 SQL 当初是否由编译器生成。
+                # 若当初是编译命中，这里恢复 compiled_mql，让前端照常展示「口径编译保证」
+                # 而不是误报成 LLM 生成（并据此跳过 LLM 复查，省 2.8~5.3s）。
+                if _cached.get("compiled"):
+                    self.compiled_mql = _cached.get("mql")
+                yield _step("语义缓存", f"命中相似历史查询（相似度 {_cached['similarity']:.2f}），复用 SQL 直接执行")
+        if not self._semantic_hit:
             # ── 确定性编译尝试（架构强约定：未注册口径 → LLM 推断 + 弹窗确认，
             #    LLM 不得直接产出可执行 SQL）──
             # 提前到二次确认之前计算：判断「能否走确定性编译」需要它，
@@ -5211,10 +5697,25 @@ class LLMService:
                 # 上移到选表之前：命中即毫秒级拒绝，不再白跑一次选表 LLM（省 ~7.6s）。
                 _ud_reason = _underivable_metric_reason(self.query)
                 if _ud_reason:
-                    self.error = _ud_reason
-                    yield _step("口径检查", "该指标所需源数据在当前库不存在，拒绝生成（防冒充）")
-                    yield {"type": "error", "message": self.error}
-                    return
+                    # 2026-10-04（产品决策，用户明确）：**AI 兜底路径的第一硬标准是「出结果」**。
+                    # 这里历史上出过两版实现，都不合格：
+                    #   v1（2026-09-13）推 {"type":"error"} + return → 前端渲染成「请求失败」；
+                    #   v2（同日）改推 type=done 的口径说明 → 不再是报错，但**仍然不出数**。
+                    # 两版的共同病灶都是「拒绝」：用户问了一个指标，系统一个结果都不给。
+                    # 现决策：**不再在生成前拒绝**，改为「放行 + 声明」——
+                    #   · 提示词侧：_build_agg_hint 注入「口径未注册·必须声明」硬约束
+                    #     （优先用相近已注册字段算出结果／禁止用无关列冒充／必须声明口径）；
+                    #   · 答案侧：落一条【执行说明】，显式告知「本次口径未注册、结果为估算」，
+                    #     并给出登记口径的入口 —— 把「静默骗」变成「标注着估」，但绝不再「不给结果」。
+                    # 注：分母可确定性推导的口径（停机率/稼动率）已在注册表登记、走 exec_sql 出准确值，
+                    # 根本不会走到这里；能走到这里的才是真正缺源数据的（人均/OEE/周转/成本…）。
+                    self._unregistered_metric_note = _ud_reason
+                    self._fix_notes.append(
+                        "本次问句涉及的口径未在系统中注册（计算所需的源字段在当前库中不存在或不完整），"
+                        "已由 AI 按库里现有数据尽力估算，结果仅供参照；"
+                        "如需可复现的准确口径，请在左侧「业务知识」页登记该口径后重问。")
+                    yield _step("口径检查",
+                                "该口径未注册（源字段缺失）→ 不再拒绝，交 AI 按现有数据估算并在答案中声明口径")
                 # 口径溯源 hint：回退 LLM 时，只要命中注册指标也展示关联口径（白盒可解释）
                 self.metric_hint = self._build_metric_hint()
                 self.matched_tables = self._tables_from_metric_hits() or self._match_tables()
@@ -5433,6 +5934,28 @@ class LLMService:
                         yield _step("SQL校验", "兜底重生成未产出 SQL，回退使用被质量闸门标记的那条"
                                                "（口径推断可能不全，请重点核对结果）")
                     self.sql = _sql
+                    # 2026-10-05：字符串字面量大小写归一（主链启用，此前仅 BIRD 档位）。
+                    # 实测根因（用户测「产能利用率是多少」）：LLM 写
+                    #   WHERE order_status IN ('COMPLETED','IN_PROGRESS')
+                    # 而 yans 库里的值是小写 completed / in_progress →
+                    # PostgreSQL 的 = 大小写敏感 → 0 行 → 洞察只能说「数据缺失」。
+                    # 这不是「拒绝」，是**静默算不出数**，用户完全看不出原因。
+                    # `_bird_case_insensitive` 本来就写好了（= 'xxx' → ILIKE 'xxx'），
+                    # 只是当年为了「主链零影响」没接——但 yans 库同样是小写状态值，
+                    # 同一个坑在主链真实存在。改写保持「精确匹配、仅大小写不敏感」语义，
+                    # 且只在有字符串等值比较时才动 SQL，零语义变化。
+                    try:
+                        _ci = _bird_case_insensitive(self.sql)
+                        if _ci and _ci != self.sql:
+                            self.sql = _ci
+                            self._fix_notes.append(
+                                "查询条件里的枚举值大小写与库中实际存储不一致，"
+                                "已改为大小写不敏感匹配后重查。")
+                            yield _step("SQL校验",
+                                        "检测到枚举值大小写与库中不符（如库中为小写而条件写了大写），"
+                                        "已改为大小写不敏感匹配")
+                    except Exception:
+                        pass
                     # 确定性改写链（**唯一入口**，见 apply_output_fixes）：
                     # LIMIT 归一 → 窗口差值兜底 → TOP-N 稳定次序 → 值放错列 → 补列。
                     # 步骤日志由 fired 回放，消息表见 _FIX_STEP_MSG。
@@ -5469,12 +5992,21 @@ class LLMService:
                         # 自己拆解系统为什么没答上来。新版保留"能自己动手的"（切模型
                         # 确实是用户可选项），但把主建议换成系统会自己做的事：
                         # 问题已落台账 → 管理员在「业务知识」补口径后同一句话直接能答。
-                        self.error = (self.error or "AI 未能根据问题生成查询 SQL。")
+                        # 2026-10-04 改：原文案"AI 未能根据问题生成查询 SQL"把两类
+                        # 完全不同的情况混成一句话，且默认把责任推给模型。实测有一类
+                        # 恰恰是**模型已经生成了正确 SQL、被我们自己的校验规则误杀**
+                        # （_unknown_identifiers 曾把 `AS total_defect` 这类输出别名判成
+                        # 幻觉字段）。对用户宣称"AI 没能生成"是失实的，也会把排查方向
+                        # 带偏到"换个模型试试"。现在如实说明两类可能原因。
+                        self.error = (self.error or "未能产出可用的查询 SQL。")
                         self.error += (
+                            "\n可能原因有两类：① 模型这一轮没有产出语句；"
+                            "② 产出的语句未通过安全或口径校验（例如引用了数据底座里不存在的"
+                            "字段、或用了隐式逗号连表）。两类都会记录在待补口径台账里。"
                             "\n这个问题已自动记入待补口径台账，管理员在「业务知识」页"
                             "补上对应口径后，同样的问题就能答了，不需要你重复描述。"
-                            f"如果你认为这是模型能力问题，可以在输入框上方「切换模型」"
-                            f"换一个 AI（当前模型：{LLM_CONFIG.get('model', '')}）。")
+                            f"你也可以在输入框上方「切换模型」换一个 AI 再试"
+                            f"（当前模型：{LLM_CONFIG.get('model', '')}）。")
                         try:
                             _record_unmatched_query(self.query)
                         except Exception:
@@ -5809,6 +6341,16 @@ class LLMService:
         #    要么来自人工验证口径、要么来自历史成功查询，「0 行」更可能是真实无数据
         #    （如「超产工单数=0」），拿去让 LLM 重写反而会破坏可解释的确定性结果。
         _zero_retry = False
+        # 2026-10-04：进入修复链**之前**无条件快照一次「最初能执行的结果」。
+        # 用途：退化输出守卫（_output_quality_reason）判失败后，若重试链耗尽预算仍改不出来，
+        # 退回这份快照并强制加声明（见下方「有声明地恢复」）——
+        # 守卫不能反过来制造「请求失败」，那与产品决策（兜底必须出结果）相反。
+        # 注意必须**无条件**初始化：退化输出走的是「执行成功但答非所问」分支，
+        # 与下面的 0 行分支不同，若只在 0 行分支赋值，此处会 NameError。
+        _first_sql = self.sql
+        _first_exec = self.executed_sql
+        _first_result = dict(self.sql_result or {})
+        _first_acl = {k: list(v) for k, v in (self.acl_applied or {}).items()}
         if (ok and self.sql_result.get("success")
                 and not (self.sql_result.get("rows") or [])
                 and (self.sql or "").strip()
@@ -6056,7 +6598,41 @@ class LLMService:
                         return
 
             if not ok:
-                # ── 重试仍失败：用 fallback ──
+                # 2026-10-04（产品决策：AI 兜底的第一硬标准是「出结果」）：
+                # 退化输出守卫（_output_quality_reason）会把裸明细判失败并让重试链去改写，
+                # 但思考型模型在剩余预算内常常改不出来（实测「单位产品成本是多少」：
+                # 守卫已明确判定「返回的是明细列表」，重试耗尽后仍交回 `SELECT dim_product.* LIMIT 20`）。
+                # 若放任此处落到 `yield {"type":"error"}`，就成了**守卫反而制造了拒绝**——
+                # 与产品决策正好相反。
+                # 正确取舍：退化明细**不是正确答案，但比「请求失败」强**。
+                # ⇒ 恢复最初那次可执行的结果（哪怕是明细），并强制加一条声明，
+                # 明确告诉用户「这是相关表的原始记录，不是你要的指标值，口径缺失」，
+                # 把「静默骗」降级为「标注着给」。真正的修复入口由声明指向「去登记口径」。
+                try:
+                    _deg_ok = bool((_first_result or {}).get("success")
+                                   and (_first_result or {}).get("rows"))
+                except Exception:
+                    _deg_ok = False
+                if _deg_ok and (_first_sql or "").strip():
+                    self.sql = _first_sql
+                    self.sql_result = dict(_first_result)
+                    self.executed_sql = _first_exec
+                    self.acl_applied = _first_acl
+                    ok = True
+                    self._fix_notes.append(
+                        "本次未能按你的问题算出指标值：库里缺少该指标计算所需的源数据，"
+                        "AI 改用最相关的表返回了原始记录（下方结果），"
+                        "**它不是该指标的答案**，请勿直接取数；"
+                        "如需准确口径，请在「业务知识」页登记该指标后重问。")
+                    yield _step("口径说明",
+                                "缺少计算所需源数据 → 改为返回最相关表的原始记录并标注（非指标答案）")
+                    if self.sql_result.get("rows"):
+                        yield {"type": "sql_result",
+                               "columns": self.sql_result["columns"],
+                               "rows": self.sql_result["rows"],
+                               "row_count": self.sql_result["row_count"]}
+
+            if not ok:
                 fallback_sql = _fallback_sql(self.query, self.matched_tables)
                 if fallback_sql and fallback_sql != self.sql:
                     self.sql = fallback_sql
@@ -6391,7 +6967,11 @@ class LLMService:
                    "response": self._build_response(analysis_deferred=True)}
             _anl = self._take_analysis()
             if _anl:
-                yield {"type": "analysis", "text": _anl}
+                # 2026-10-04：同样要过 _append_fix_notes。前端会用这个后到的 analysis
+                # 文本**整体替换** done 里的 analysis（洞察更丰富），若这里不带声明，
+                # 就会出现「done 里有口径声明、洞察一来就被冲掉」——
+                # 而洞察是用户最后看到、也是最常被截图转发的那一份。
+                yield {"type": "analysis", "text": self._append_fix_notes(_anl)}
 
     # ── SQL 生成（流式）──────────────────────────────────
 
@@ -7076,7 +7656,6 @@ class LLMService:
             except Exception:
                 return True  # 表提取失败 → 保守按复杂处理
         # ── 聚合类：默认不单独触发（见上方说明）──
-        # ── 聚合类：默认不单独触发（见上方说明）──
         try:
             from config import RESULT_CHECK_AGG_COUNTS_COMPLEX as _agg_complex
         except Exception:
@@ -7447,10 +8026,13 @@ class LLMService:
             "result": self.sql_result,
             "chart": {"type": chart_type_final, "svg": self.chart.get("svg", "")},  # SVG 一并带回，前端据此优先渲染图表
             "chart_config": {"type": chart_type_final, "title": self.title},
-            # 洞察可能已在 run() 中并行启动，这里取结果（无并行任务时自动回退同步生成）
-            # 2026-10-01 洞察后置：done 事件不再阻塞等 LLM 洞察，先用规则摘要占位，
-            # LLM 洞察由 run() 在 done 之后以独立 analysis 事件补发（见 run() 结尾）。
-            "analysis": (self._quick_analysis() if analysis_deferred else self._take_analysis()),
+            # 2026-10-04：【执行说明】/【口径说明】在**出口统一施加**（见 _append_fix_notes），
+            # 而不是只在 _quick_analysis 内拼。主链洞察走 _llm_analysis()（异步 future），
+            # 不经过 _quick_analysis，note 会整段丢失——实测命中未注册口径闸门后，
+            # 回答里看不到任何口径声明，等于「出了个数却没说清是怎么算的」。
+            # 出口施加 = 无论洞察来自 LLM 还是规则摘要、无论 deferred 与否，都必定可见。
+            "analysis": self._append_fix_notes(
+                self._quick_analysis() if analysis_deferred else self._take_analysis()),
             "recommended": self._quick_recommended(),
             "prediction": [],
             # 规则化归因（Phase 6.1）：环比下跌检测 + 维度贡献（纯计算，无信号为空串）
@@ -7739,22 +8321,39 @@ class LLMService:
         # 确定性改写链的说明（2026-09-29）：如「时间锚点已按最新有数据的月份重定」、
         # 「改写会造成 0 行已回滚」。必须落到答案里——重定锚点等于替用户换了一个时间段，
         # 不标注就从「答得准」变成「偷偷换题」。这里是无条件的（不看行数）。
+        # 2026-10-04：拼接已抽到 _append_fix_notes()，由 _build_response 出口统一施加。
+        # 原因：主链走 _llm_analysis()（异步 future），不经过本函数，note 会整个丢失
+        # ——用户看到的是一个「算出来了但没说清用了什么口径」的裸数字。
+        return _bilingualize(self._append_fix_notes(text))
+
+    def _append_fix_notes(self, text: str) -> str:
+        """把 _fix_notes 渲染成答案末尾的【执行说明】。
+
+        ⚠️ 必须由 _build_response 出口统一调用，**不能**只在 _quick_analysis 里拼：
+        主链（RESULT_EVAL/洞察）走的是 _llm_analysis() 返回的文本，
+        它不经过 _quick_analysis（除 fallback），note 会整段丢失
+        （实测：命中未注册口径闸门后，回答里看不到任何口径声明）。
+        幂等：已带【执行说明】则不重复追加。
+        """
         _fixn = getattr(self, "_fix_notes", None)
-        if _fixn:
+        if not _fixn:
+            return text
+        base = (text or "").rstrip()
+        if "【执行说明】" not in base:
             # 各条 note 自身已以「。」结尾，拼接处再补一个就成了「。。」——先各自去尾。
             _nn = [str(x).strip().rstrip("。") for x in _fixn if str(x).strip()]
             if _nn:
-                text = (text or "").rstrip() + "\n\n【执行说明】" + "；".join(_nn) + "。"
+                base = base + "\n\n【执行说明】" + "；".join(_nn) + "。"
         # 口径多候选时，本次实际采用的主口径 + 备选（2026-09-29）：不阻塞出数，
         # 但要让用户知道「你问的词我按哪个口径算的、还有哪几个近似口径」。
+        # 与【执行说明】同源——同样是「我按哪个口径答的」的用户可见声明，故一并在此施加。
         _alt = getattr(self, "_metric_alt_hint", None)
-        if _alt and _alt.get("others"):
-            text = (text or "").rstrip() + (
+        if _alt and _alt.get("others") and "【口径说明】" not in base:
+            base = base + (
                 "\n\n【口径说明】本问按「%s」口径计算；近似口径还有：%s。"
                 "如需改用其中某个，请在追问里点名。"
                 % (_alt.get("chosen"), "、".join(_alt["others"])))
-        # 2026-10-02：出口兜底双语化（幂等，规则摘要已在源头用双语标签）
-        return _bilingualize(text)
+        return base
 
     def _retrieve_docs(self, k: int = 3) -> list[str]:
         """混合问答第一步：检索知识库业务文档（口径说明/SOP/制度）。
@@ -7902,9 +8501,17 @@ class LLMService:
                     "最后给 1-2 条业务建议。不要只罗列数据。若现有数据不足以判断，请如实说明"
                     "缺什么数据、建议如何进一步分析。"
                 )
-                corr = _corr_evidence(cols, rows)
+                corr = _corr_evidence(cols, rows) if _is_corr_intent(self.query) else ""
                 if corr:
                     prompt += f"\n\n{corr}"
+                elif _is_compare_intent(self.query):
+                    # 「对比」≠「相关」（2026-10-04）：不得把并排比量级答成相关系数
+                    prompt += (
+                        "\n\n## 注意：本题是**指标对比**，不是相关性分析\n"
+                        "用户要的是各指标在同一维度下**各自的量级、极值与差距**"
+                        "（谁高谁低、相差多少），请逐指标给出高低与差距；"
+                        "**不要**计算或讨论相关系数。"
+                    )
             prompt += "\n\n注意：只依据上面给出的真实数据下结论，不要编造数据中不存在的数字。"
             # 2026-10-01 提速（不降准）：补短超时 + 禁重试（原默认 120s×2 最坏 360s）。
             # 洞察失败走 _quick_analysis 规则摘要兜底（本函数 except 分支），收紧无正确性损失。
@@ -8649,6 +9256,27 @@ def _is_analysis_intent(query: str) -> bool:
     return any(w in q for w in _ANALYSIS_INTENT_WORDS)
 
 
+# 「相关」与「对比」是两种**不同**的分析，语义必须分开（2026-10-04 修复）：
+#   · 相关/关联/关系 → 问两个指标**是否同向共变**，答案是 Pearson r；
+#   · 对比/比较/差异 → 问同维度下**各指标各自的量级、极值与差距**，与 r 无关。
+# 此前 _build_deterministic_insight 对任何分析意图都算 Pearson，导致用户问
+# 「产量和良率的对比」却被答成「皮尔逊相关系数 r=-0.11」——答非所问。
+_CORR_INTENT_WORDS = ("相关", "关联", "关系")
+_COMPARE_INTENT_WORDS = ("对比", "比较", "相比", "差异", "差距", "对照")
+
+
+def _is_corr_intent(query: str) -> bool:
+    """是否为**相关性**问法（同向共变，适用 Pearson）。"""
+    q = (query or "").lower()
+    return any(w in q for w in _CORR_INTENT_WORDS)
+
+
+def _is_compare_intent(query: str) -> bool:
+    """是否为**指标对比**问法（并排比量级/极值/差距，不是相关性）。"""
+    q = (query or "").lower()
+    return any(w in q for w in _COMPARE_INTENT_WORDS)
+
+
 # ── 查询明确性判断（2026-09-07 新增）：区分「口径未登记」与「问题本身模糊」──
 # 原红线是「口径未登记 → 一律弹窗」，实测会把已经说清楚的问题也拦下来反复追问：
 # 用户问「质量抽检不合格最多的工序」——要统计什么、按什么维度都很明确，只是该口径
@@ -8857,12 +9485,20 @@ def _corr_evidence(columns: list[str], rows: list[dict]) -> str:
 
 
 def _build_deterministic_insight(query: str, columns: list[str], rows: list[dict]) -> str | None:
-    """相关性/对比类分析问法的确定性结论（零 LLM，秒出）。
+    """分析类问法的确定性结论（零 LLM，秒出）。
 
     deepseek 对「15 行数据 + SQL + 分析任务」的洞察要 45s，是最慢一环。相关性结论
     本质是确定性计算（r 值已算出），直接由规则生成分析文本——符合"能确定性就不 LLM"。
-    仅当存在可算相关对时产出；否则返回 None（调用方回退 LLM）。
+
+    2026-10-04 修复（语义分岔）：**只有相关性问法**才产出 Pearson 结论；
+    「对比/比较/差异」改走 _build_comparison_insight（并排比量级）；
+    其余分析意图（趋势等）返回 None 交 LLM。此前不加区分地一律算 r，
+    导致用户问「产量和良率的对比」被答成「皮尔逊相关系数 r=-0.11」。
     """
+    if not _is_corr_intent(query):
+        if _is_compare_intent(query):
+            return _build_comparison_insight(query, columns, rows)
+        return None
     best = _corr_pair(columns, rows)
     if not best:
         return None
@@ -8904,6 +9540,61 @@ def _build_deterministic_insight(query: str, columns: list[str], rows: list[dict
     return "".join(lines)
 
 
+def _build_comparison_insight(query: str, columns: list[str], rows: list[dict]) -> str | None:
+    """多指标**对比**问法的确定性结论（零 LLM，秒出）。
+
+    与 _build_deterministic_insight（相关性）的语义分界：
+      · 相关 → 两个指标**是否同向共变**（Pearson r）；
+      · 对比 → 同维度下**各指标各自的量级、极值与差距**（谁高谁低、差多少）。
+    二者不可互相冒充：用户说「对比」时给 r 值属答非所问（2026-10-04 修复的缺陷）。
+
+    仅当存在 ≥2 个数值列时产出；否则返回 None（调用方回退 LLM）。
+    比率类（良率/占比…）只报均值与区间——合计无业务含义。
+    """
+    try:
+        stats = _num_cols_series(rows, columns)
+    except Exception:
+        return None
+    num_cols = [c for c in columns if c in stats]
+    if len(num_cols) < 2:
+        return None
+    # 维度列：用于「最高值出现在哪一项」的业务定位（数值列之外的第一列）
+    dim = next((c for c in columns if c not in stats), None)
+
+    def _fmt(v: float) -> str:
+        return f"{v:,.2f}" if abs(v - round(v)) > 1e-9 else f"{int(round(v)):,}"
+
+    parts: list[str] = []
+    for c in num_cols:
+        vals = stats.get(c) or []
+        if not vals:
+            continue
+        disp = _col_display(c)
+        avg = sum(vals) / len(vals)
+        rng = f"区间 {_fmt(min(vals))} ~ {_fmt(max(vals))}"
+        if _is_ratio_like(c):
+            parts.append(f"{disp} 均值 {_fmt(avg)}（{rng}）")
+        else:
+            best_v, best_dim = None, None
+            for r in rows:
+                try:
+                    v = float(r.get(c))
+                except (TypeError, ValueError):
+                    continue
+                if best_v is None or v > best_v:
+                    best_v, best_dim = v, (r.get(dim) if dim else None)
+            loc = f"，最高为「{best_dim}」" if best_dim is not None else ""
+            parts.append(f"{disp} 合计 {_fmt(sum(vals))}、均值 {_fmt(avg)}（{rng}{loc}）")
+    if len(parts) < 2:
+        return None
+    head = f"各指标对比（共 {len(rows)} 个{'维度' if dim else '样本'}，单位不同者不作加总）："
+    tail = ("说明：以上为各指标在同一维度下的并排对比，用于看量级与差距；"
+            "若需判断二者是否同向变化，请改问「XX 和 YY 是否相关」。"
+            if _mixed_ratio_and_count(num_cols) else
+            "说明：以上为各指标在同一维度下的并排对比。")
+    return head + "".join(f"\n· {p}" for p in parts) + "\n" + tail
+
+
 def _fmt_num_cn(v) -> str:
     """数字中文可读化：整数加千分位，小数保留 2 位（业务用户读 597,072 比读 597072.0 快）"""
     try:
@@ -8920,6 +9611,31 @@ def _is_measure_col(col: str) -> bool:
     c = str(col or "").lower()
     bad = ("id", "编号", "序号", "编码", "代码", "年份", "year", "月份", "month", "code", "no")
     return not any(b in c for b in bad)
+
+
+def _metric_value_scale_is_percent(col: str) -> bool:
+    """该结果列对应的注册指标，是否**已经以百分数计量**（如 0.50 就表示 0.50%）。
+
+    2026-10-04 修复（实测缺陷）：`_rule_insight` 原先只看**值域**——
+    `pct_mode = ratio_like and 0 <= mn and mx <= 1`，把「值都很小」当成
+    「这是 0~1 的原始比率」，于是 ×100 展示。对**本身数值就很小、但已经是百分数**的
+    指标（停机率 0.50%、稼动率 99.5 临界情形）会二次放大：
+    实测「综合设备停机率」真实 **0.50%** 被摘要写成 **「停机率为 50.0%」**，差 100 倍。
+
+    口径的唯一权威是注册表，故以显式声明 `value_scale == "percent"` 为准；
+    **查不到该指标时返回 False，保持旧行为 → 零回归。**
+    """
+    try:
+        from agent.metric_registry import get_all_metrics
+        _name = str(col or "").strip()
+        if not _name:
+            return False
+        for m in get_all_metrics() or []:
+            if str(m.get("name") or "").strip() == _name:
+                return str(m.get("value_scale") or "").strip().lower() == "percent"
+    except Exception:
+        pass
+    return False
 
 
 _RATIO_EN_TOKENS = {"rate", "ratio", "pct", "percent", "percentage", "share",
@@ -8940,6 +9656,17 @@ def _is_ratio_like(col: str) -> bool:
         return True
     toks = [t.lower() for t in re.split(r"[^0-9A-Za-z]+", c) if t]
     return any(t in _RATIO_EN_TOKENS for t in toks)
+
+
+def _mixed_ratio_and_count(num_cols: list[str]) -> bool:
+    """数值列是否**同时混有比率类与计数类**（量纲不可加总 → 不能堆叠/相加）。
+
+    2026-10-04 新增：实测「产量和良率的对比」被 _validate_chart_type 判成 stacked，
+    但产量（件，~1e5）与良率（%，~97）量纲完全不同——堆叠后总高度无业务含义，
+    且良率那一段在大柱子里肉眼不可见。凡是「率 + 计数」并存，一律不走堆叠。
+    """
+    flags = [_is_ratio_like(c) for c in (num_cols or [])]
+    return any(flags) and not all(flags)
 
 
 def _shrink_dict_strings(d: dict, limit: int) -> str:
@@ -9518,10 +10245,25 @@ def _rule_insight(rows: list[dict], cols: list[str]) -> str:
     med = srt[n // 2] if n % 2 else (srt[n // 2 - 1] + srt[n // 2]) / 2
 
     # 比率类且值域落在 0~1（如合格率 0.972）→ 按百分比展示，业务用户读 97.2% 才懂，0.97 读不懂
-    pct_mode = ratio_like and 0 <= mn and mx <= 1
+    # 2026-10-04 修复：新增 `already_pct` 分支——注册表显式声明 value_scale=percent 的指标
+    # （停机率/稼动率）返回的就是百分数，**不再 ×100**（实测 0.50% 曾被写成 50.0%，差 100 倍）。
+    already_pct = ratio_like and _metric_value_scale_is_percent(mc)
+    pct_mode = ratio_like and 0 <= mn and mx <= 1 and not already_pct
 
     def _fmt(v) -> str:
-        return f"{v * 100:.1f}%" if pct_mode else _fmt_num_cn(v)
+        if pct_mode:
+            return f"{v * 100:.1f}%"
+        if already_pct:
+            return f"{float(v):.2f}%"
+        return _fmt_num_cn(v)
+
+    def _spread_txt(d) -> str:
+        """比率列的极差文本（百分点），分母口径随 pct_mode / already_pct 走。"""
+        if pct_mode:
+            return f"{float(d) * 100:.1f} 个百分点"
+        if already_pct:
+            return f"{float(d):.2f} 个百分点"
+        return _fmt_num_cn(d)
 
     lines += ["", "【整体情况】"]
     # 记录数与统计口径不一致必须挑明：实测「共 6 条记录」但「平均 52.38」是按 5 条算的
@@ -9538,8 +10280,7 @@ def _rule_insight(rows: list[dict], cols: list[str]) -> str:
         lines.append(f"· {_obj + '的' if _obj else ''}{disp[mc]}为 {_fmt(vals[0])}。")
     elif ratio_like:
         # 比率类合并成一行，避免"最高…最低…"在下一行重复一遍
-        _gap_txt = (f"，相差 {(mx - mn) * 100:.1f} 个百分点" if pct_mode
-                    else f"，相差 {_fmt_num_cn(mx - mn)}")
+        _gap_txt = f"，相差 {_spread_txt(mx - mn)}"
         lines.append(f"· {disp[mc]}平均 {_fmt(avg)}，最高 {_fmt(mx)}，最低 {_fmt(mn)}{_gap_txt}。")
     else:
         lines.append(f"· {disp[mc]}合计 {_fmt_num_cn(s)}，平均 {_fmt_num_cn(avg)}，中位数 {_fmt_num_cn(med)}。")
@@ -9618,8 +10359,7 @@ def _rule_insight(rows: list[dict], cols: list[str]) -> str:
         if ratio_like:
             # 比率类只讲区间与极差（百分点）：谈"最高是最低的几倍"或"集中在 0.96 附近"
             # 对比率都读不懂（0.96 是比率不是结果值，倍数对比率也无业务含义）
-            _spread = (f"{(mx - mn) * 100:.1f} 个百分点" if pct_mode
-                       else f"{_fmt_num_cn(mx - mn)}")
+            _spread = _spread_txt(mx - mn)
             _above = sum(1 for v in vals if v > avg)
             lines.append(f"· {disp[mc]}分布在 {_fmt(mn)} ~ {_fmt(mx)} 之间，相差 {_spread}；"
                          f"{n} 条中 {_above} 条高于平均（{_fmt(avg)}）。")
@@ -10432,12 +11172,23 @@ def _has_group_or_window(sql: str) -> bool:
     return bool(re.search(r"\bGROUP\s+BY\b|\bPARTITION\s+BY\b", s, re.IGNORECASE))
 
 
-# ── 未注册复合指标「缺源数据」硬拒绝（2026-09-13 用户实测驱动）────────────
+# ── 未注册复合指标「缺源数据」判定（2026-09-13 用户实测驱动）────────────
 # 用户问「库存周转天数 / 人均产出 / 设备稼动率」等未注册复合指标时，若计算所需的
 # 源数据（出库流量 / 人数 / 运行时长）在全库都不存在，LLM 只能用无关列近似冒充
 # （实测：周转天数→MAX(可用库存)、人均产出→AVG(产量) 不除人数），产出"一本正经
-# 的错误答案"，且数值越大越像真的（4795 天）。此类问题在生成前源头拒绝，
-# 引导登记口径/接入数据，而不是让 LLM 编一个能跑的 SQL。
+# 的错误答案"，且数值越大越像真的（4795 天）。
+#
+# ⚠️ 2026-10-04 语义变更（用户产品决策，重要）：本规则**不再用于拒绝**。
+# 此前命中即在生成前 return（源头拒绝），实测代价是用户拿到「请求失败/不能生成」。
+# 现产品硬标准是「**AI 兜底路径的第一硬标准是出结果**」，故命中后改为三件事：
+#   ① 提示词侧注入「口径未注册·必须声明」硬约束（见 _build_agg_hint）；
+#   ② 答案侧落一条【执行说明】（见 ask_stream 调用点）；
+#   ③ 继续走 LLM 生成，**必定出结果**。
+# 本表退化为「口径背景说明库」：reason 文本会被拼进提示词与执行说明，
+# 告诉模型「标准定义需要什么、库里缺什么」，从而让它算出**标注着口径**的估算值，
+# 而不是拿无关列静默冒充。即「把骗降级为标注着估」，而不是「不给结果」。
+# 保留本表的价值：正因为要出结果，才更需要在提示词里点明「缺哪个源字段」，
+# 模型才能自觉声明差异，而不是照旧一本正经地编。
 
 _UNDERIVABLE_METRIC_RULES: list[tuple[re.Pattern, re.Pattern, str]] = [
     (re.compile(r"人均|每人|按人头|人天产出"),
@@ -10456,10 +11207,14 @@ _UNDERIVABLE_METRIC_RULES: list[tuple[re.Pattern, re.Pattern, str]] = [
     (re.compile(r"稼动率|开动率|产能利用率|设备利用率|设备综合效率|OEE"),
      re.compile(r"运行时长|开机时长|运转|稼动|run_time|uptime|run_hours|operating_hours|"
                 r"runtime", re.I),
-     "稼动率/利用率类指标需要「运行/开机时长」字段（稼动率=运行时间/计划时间）。"
-     "当前数据库只有停机记录（downtime），缺少计划/日历工时，无法计算稼动率。"
-     "请接入设备运行时长数据，或在结果卡片「去登记口径」明确稼动率的计算公式。"),
-    (re.compile(r"单位生产成本|单件成本|生产成本|单位成本"),
+     "稼动率/利用率类指标需要「运行/开机时长」或「设计产能/理论节拍」做分母"
+     "（稼动率=运行时间÷计划时间；产能利用率=实际产出÷设计产能）。"
+     "当前数据库只有停机记录（downtime）与产出/投入数量，缺少这两类基准字段。"
+     "已注册的可算替代口径：**稼动率/开动率**（100−停机率，日历工时口径）、"
+     "**产能利用率**（合格产出÷投入产出，近似口径）。"
+     "请优先改用其中之一；如需严格定义，请在结果卡片「去登记口径」明确计算公式，"
+     "或接入设备运行时长/设计产能数据。"),
+    (re.compile(r"单位生产成本|单件成本|生产成本|单位成本|产品成本|单件产品成本|产品单位成本"),
      re.compile(r"成本|cost|amount|金额|price|花费|单价", re.I),
      "单位生产成本需要「成本金额」字段（单位成本=总成本/产量）。"
      "当前数据库没有成本类字段，无法计算单位生产成本。"
@@ -11179,7 +11934,22 @@ def _bird_case_insensitive(sql: str) -> str:
     if _bird_backend() == "sqlite":
         # SQLite：`= 'xxx'` → `= 'xxx' COLLATE NOCASE`（精确、大小写不敏感、无通配符风险）。
         # 不用 LIKE：SQLite 的 _ % 是通配符且默认无转义字符，不如 COLLATE NOCASE 干净。
-        return re.sub(r"(?<![<>=!])\s*=\s*" + _STR, r" = '\1' COLLATE NOCASE", sql)
+        sql = re.sub(r"(?<![<>=!])\s*=\s*" + _STR, r" = '\1' COLLATE NOCASE", sql)
+        # IN 列表同样处理（与 PG 分支保持一致，见下方注释）
+        m_in = re.search(r"\bIN\s*\(((?:\s*'[^']*'\s*(?:,\s*'[^']*'\s*)*))\)", sql, re.I)
+        if m_in:
+            items = re.findall(r"'[^']*'", m_in.group(1))
+            lowered = ",".join("'%s'" % it.strip("'").lower() for it in items)
+            col = _last_equality_column(sql, m_in.start())
+            if col:
+                # 同 PG 分支：**替换**列名而非插入（插入会产出 `col lower(col) IN`）
+                pat = re.compile(re.escape(col) + r"(\s*)IN\s*\("
+                                 r"(?:\s*'[^']*'\s*(?:,\s*'[^']*'\s*)*)\)",
+                                 re.I)
+                sql2, n = pat.subn("lower(%s)\\1IN (%s)" % (col, lowered), sql)
+                if n:
+                    sql = sql2
+        return sql
 
     def _repl(m):
         raw = m.group(1)                # 字面量内容（含 '' 转义）
@@ -11188,7 +11958,68 @@ def _bird_case_insensitive(sql: str) -> str:
         lit = esc.replace("'", "''")    # 重新转义回 SQL 字面量
         return " ILIKE '%s'" % lit
 
+    # 2026-10-05 补：`IN ('A','B')` 列表也要处理。
+    # 原正则只认 `= 'xxx'`，**完全不认 IN 列表**——而枚举过滤最常见的写法恰恰是 IN。
+    # 实测（用户测「产能利用率是多少」）：LLM 生成
+    #   WHERE w.order_status IN ('COMPLETED','IN_PROGRESS')
+    # 库里是小写 completed / in_progress → 0 行 → 洞察只能说「数据缺失」，
+    # 而这既不是拒绝、也不是正确结果，是**静默算不出数**（最难查的一类）。
+    # 改法：逐个把 IN 列表内的字面量替换为小写形式 + 把 IN 改成 IN 列表内的 OR-ILIKE。
+    # 用 `lower(col) = lower('x')` 语义等价、可读性差一些，但避免 ILIKE 的通配符语义，
+    # 代价是**丢失索引**（枚举过滤通常走不了索引，本就是全表扫，可接受）。
+    # 实现方式：把 `IN (a,b)` 改写为 `lower(col) IN (lower(a), lower(b))`——
+    # 只需把 IN 后的每个字面量小写化，再在 IN 前加 lower(<列>)。
+    m_in = re.search(r"\bIN\s*\(((?:\s*'[^']*'\s*(?:,\s*'[^']*'\s*)*))\)", sql, re.I)
+    if m_in:
+        items = re.findall(r"'[^']*'", m_in.group(1))
+        # 字面量直接小写化即可（不必写 lower('X')，等价但可读性差）
+        lowered = ",".join("'%s'" % it.strip("'").lower() for it in items)
+        col = _last_equality_column(sql, m_in.start())
+        if col:
+            # ⚠️ 必须**替换掉**原列名，不能只在 IN 之前插入。
+            # 踩过的坑：插入式改写产出 `order_status lower(order_status) IN (...)`
+            # ——`lower()` 落在了列名**之后**，语法错误。
+            # 正确形态：`... WHERE lower(order_status) IN ('a','b')`。
+            # 做法：把 `col IN (...)` 整体匹配后替换（`(` `)` 必须转义，
+            # 否则拼进 pattern 会抛 unbalanced parenthesis）。
+            pat = re.compile(re.escape(col) + r"(\s*)IN\s*\("
+                             r"(?:\s*'[^']*'\s*(?:,\s*'[^']*'\s*)*)\)",
+                             re.I)
+            sql2, n = pat.subn("lower(%s)\\1IN (%s)" % (col, lowered), sql)
+            if n:
+                sql = sql2
     return re.sub(r"(?<![<>=!])\s*=\s*" + _STR, _repl, sql)
+
+
+def _last_equality_column(sql: str, before: int) -> str:
+    """推断 IN 列表对应的列名。返回空串表示推断不出（调用方应放弃改写）。
+
+    做法：**只看 IN 之前紧邻的那个标识符**——`... WHERE <col> IN (...)`。
+    这是 SQL 里 IN 列表的标准形态，比「猜等号列 / 猜表别名」可靠得多。
+
+    ⚠️ 这里连续踩过四个坑，全是"猜列名"的教训：
+      ① 早期从 `FROM t WHERE` 里把第二个词当别名 → `lower(WHERE)`，语法错误；
+      ② 修①时加了关键字黑名单，但黑名单存**小写**、候选是**大写**，
+         用 `.upper()` 比小写集合永远命不中 ⇒ 检查形同虚设；
+      ③ 退到「猜表名」⇒ `lower(mes_work_order)` —— 表名同样不是列名，一样是语法错误；
+      ④ 改用紧邻标识符后，`NOT IN` 里紧邻的是 NOT ⇒ `a lower(NOT) IN (...)`，
+         再次语法错误。
+    ⇒ 结论：**宁可返回空串放弃改写，也绝不能猜列名**。
+      猜错会产出语法错误的 SQL，比不改坏得多（不改只是维持现状的 0 行，
+      改了出错会让整个查询失败）。紧邻标识符是唯一可靠来源，取不到就放弃。
+    """
+    head = sql[:before]
+    # ④ NOT IN 一律不改写：紧邻的是 NOT（关键字），且它的语义是**取反**——
+    #    IN 漏匹配只是"少查行"，NOT IN 漏匹配会变成"多排除行"，后果更重。
+    if re.search(r"\bNOT\s*$", head, re.I):
+        return ""
+    m = re.search(r"([\w\"`\[\]\.]+)\s*$", head)
+    if not m:
+        return ""
+    col = m.group(1)
+    if col.strip('"`[]').lower() in _S_RESERVED:
+        return ""
+    return col
 
 
 def _bird_model() -> str:
@@ -11339,7 +12170,25 @@ def _bird_gen_sql(query: str, schema_context: str, budget_s: float | None = None
 
 
 def _unknown_identifiers(sql_text: str) -> set:
-    """SQL 里引用的表/列名中，当前库里不存在的那些（用于定向纠错提示）。"""
+    """SQL 里引用的表/列名中，当前库里不存在的那些（用于定向纠错提示）。
+
+    2026-10-04 修复（P0 误杀）：原实现只比对 schema，**没有排除 SQL 自己定义的别名**，
+    于是 `SELECT SUM(m.defect_qty) AS total_defect ... ORDER BY total_defect`
+    里的 `total_defect` 被当成「编造的不存在的字段」→ _reject() 判不通过 →
+    定向重试再产一版别名 → 再被拒 → 最终报「AI 未能根据问题生成查询 SQL」，
+    而模型其实**已经正确生成了 SQL**。
+
+    复现证据（yans 库实测）：两条复杂问句的 LLM 产物
+    「找出最近一个月不良数量最高的产品」→ 误报 total_defect；
+    「各车间的产量占比」→ 误报 total_output。二者都是代码自己写的输出别名。
+
+    现在把「查询内自定义的标识符」一并纳入白名单：
+      · SELECT 输出别名（exp.Alias）      —— 含 ORDER BY / GROUP BY 里对别名的引用
+      · 表别名（exp.Table.alias）          —— 如 `FROM mes_process_output AS m`
+      · 子查询/派生表别名（exp.Subquery）
+      · CTE 名（exp.CTE）
+    真正编造的列名（不在 schema、也非自定义别名）仍会被拦下，检测能力不受影响。
+    """
     try:
         cmap = _all_table_columns() or {}
     except Exception:
@@ -11361,15 +12210,46 @@ def _unknown_identifiers(sql_text: str) -> set:
     try:
         import sqlglot
         from sqlglot import exp as _exp
+
+        def _alias_of(node, attr="alias"):
+            try:
+                v = getattr(node, attr, None)
+                return str(v).lower() if v else ""
+            except Exception:
+                return ""
+
         for node in sqlglot.parse(sql_text, read="postgres"):
             if node is None:
                 continue
+            # 收集本查询自定义的标识符，避免把别名误判成幻觉
+            defined: set[str] = set()
+            for a in node.find_all(_exp.Alias):
+                n = _alias_of(a)
+                if n:
+                    defined.add(n)
+            for t in node.find_all(_exp.Table):
+                n = _alias_of(t)
+                if n:
+                    defined.add(n)
+            for s in node.find_all(_exp.Subquery):
+                n = _alias_of(s)
+                if n:
+                    defined.add(n)
+            try:
+                for c in node.find_all(_exp.CTE):
+                    n = str(getattr(c, "alias", "") or "").lower()
+                    if n:
+                        defined.add(n)
+            except Exception:
+                pass
             for col in node.find_all(_exp.Column):
                 name = (col.name or "")
                 if not name or name == "*":
                     continue
-                if name.lower() not in cols:
-                    unknown.add(name)
+                low = name.lower()
+                if low in cols or low in defined:
+                    continue
+                unknown.add(name)
     except Exception:
         pass
     return unknown
@@ -11812,6 +12692,42 @@ def _run_escape_sql(query: str, tables_desc: str, slim_schema: str,
         return None
 
 
+def _snapshot_grain_where(table: str, alias: str = "") -> str:
+    """周期快照表 → 返回「只看最新快照日」的**纯条件片段**（不含 WHERE / AND）；其他表返回空串。
+
+    2026-10-04 新增。本项目已在 `inv_inventory_snapshot` 上连续 4 次犯同一个错：
+    该表每个 snapshot_date 对每个产品存一份**全量状态**（不是一次事件），
+    库存/余额是**时点值**不是流量，不带限定就把 N 个快照日累加
+    （实测总库存 46.2×、冻结库存 49.0×、安全库存 54.6×、库存健康度图 27.8~114.7×）。
+    这里的规则式（`_try_warning_rule` / `_try_expr_rules`）原先也全是裸 SQL，
+    于是同样的错在规则侧又犯了一次。
+
+    判据复用 metric_compiler._FACT_META 的 `snapshot_grain` 标记（唯一事实来源，
+    避免两处各写一份再次漂移）。查不到 → 视为非快照表，不加限定（保守：
+    给非快照表加 MAX(...) 会把数据全过滤掉，那是更坏的事故）。
+    `alias` 供 JOIN 场景限定列前缀。
+
+    ⚠️ 2026-10-04 自查修正：首版返回**自带前导 ` AND `** 的片段，依赖「调用方一定
+    已经有 WHERE」这个隐含前提。若某条 SQL 恰好没有 WHERE，拼出来就是
+    `... FROM t AND "snapshot_date" = ...` → PG 语法错误 42601。
+    现在统一返回**纯条件**（与 data_charts._snapshot_grain_clause 风格一致），
+    由调用方决定拼WHERE 还是 AND —— 两个模块的约定必须一样，不能一个带前缀一个不带。
+    """
+    bare = str(table).split(".")[-1].strip().lower()
+    try:
+        from agent.metric_compiler import _FACT_META
+        meta = _FACT_META.get(bare) or {}
+    except Exception:
+        return ""
+    if not meta.get("snapshot_grain"):
+        return ""
+    tcol = meta.get("time_col") or ""
+    if not tcol:
+        return ""
+    p = (alias + "." if alias else "") + f'"{tcol}"'
+    return f'{p} = (SELECT MAX("{tcol}") FROM "{bare}")'
+
+
 def _try_warning_rule(query: str, matched_tables: list, cmap: dict) -> dict | None:
     """确定性「阈值预警」快速通道（2026-09-06）。
 
@@ -11868,14 +12784,24 @@ def _try_warning_rule(query: str, matched_tables: list, cmap: dict) -> dict | No
             break
         if not dim_tn:
             # 无 dim 表可 join：退化为单表明细（仓库+量+安全）
+            # 2026-10-04：周期快照表（如 inv_inventory_snapshot）必须限定到最新快照日，
+            # 否则「当前量<安全库存」的预警会列出**全部历史快照日**的每一行缺货记录
+            # （同一产品每次缺货各一行），而用户问的是「现在缺什么」。
+            # 当前演示库无低于安全线行，故修前修后都返回空 —— 属潜伏问题。
+            # 2026-10-04 自查修正：_snapshot_grain_where 现返回**纯条件**（无前导 AND），
+            # 由这里自己拼 ` AND ` —— 与 data_charts._where_with_snapshot 的约定保持一致。
+            _snapw = _snapshot_grain_where(stn)
+            _snapw = f" AND {_snapw}" if _snapw else ""
             sel = (f'SELECT {stn}."{qcol}" AS "当前量", {stn}."{scol}" AS "安全库存" '
-                   f'FROM {stn} WHERE {stn}."{qcol}" < {stn}."{scol}" '
+                   f'FROM {stn} WHERE {stn}."{qcol}" < {stn}."{scol}"{_snapw} '
                    f'ORDER BY ({stn}."{scol}" - {stn}."{qcol}") DESC LIMIT 100')
         else:
+            _snapw2 = _snapshot_grain_where(stn, alias="s")
+            _snapw2 = f" AND {_snapw2}" if _snapw2 else ""
             sel = (f'SELECT d."{dim_col}" AS "对象", s."{qcol}" AS "当前量", '
                    f's."{scol}" AS "安全库存" FROM {stn} s '
                    f'JOIN {dim_tn} d ON s."{join_col}" = d."{join_col}" '
-                   f'WHERE s."{qcol}" < s."{scol}" '
+                   f'WHERE s."{qcol}" < s."{scol}"{_snapw2} '
                    f'ORDER BY (s."{scol}" - s."{qcol}") DESC LIMIT 100')
         # 只读/列名校验兜底（与逃生同哲学：校验不过不产出）
         from agent.sql_validator import validate_sql_safety
@@ -11950,11 +12876,20 @@ def _try_expr_rules(query: str, matched_tables: list, cmap: dict) -> dict | None
         if "平均" in q and ("高于" in q or "超过" in q or "大于" in q):
             if ("库存" in q or "available" in q.lower()) and _has("inv_inventory_snapshot"):
                 # 库存快照是逐行明细 → 明细筛选（每行 available_qty 与全局平均比）
+                # 2026-10-04 修复：inv_inventory_snapshot 是**每日快照表**（每期对每产品
+                # 存一份全量状态），不带snapshot_date 限定会返回**全部 45 个快照日**的明细
+                # （实测 506 行 vs 正确 13 行），同一产品重复出现数十次；
+                # 且比较基准 AVG(available_qty) 本身也混了44 个历史快照日
+                # （全表 3353.3 vs 最新快照 3648.1）—— 两处都要收敛。
+                # 注意与本文件:3740 自己的注释「库存快照表中每个产品恰好一行」保持一致：
+                # 那句注释描述的正是「每产品一行」的正确形态，而原 SQL 并未做到。
                 sql = ('SELECT product_id, available_qty FROM inv_inventory_snapshot '
-                       'WHERE available_qty > (SELECT AVG(available_qty) FROM inv_inventory_snapshot) '
+                       'WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) '
+                       'AND available_qty > (SELECT AVG(available_qty) FROM inv_inventory_snapshot '
+                       '                       WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot)) '
                        'ORDER BY available_qty DESC')
-                return _build(sql, "命中「高于平均」规则：列出可用库存高于全局平均值的快照明细",
-                              ["库存按逐行 available_qty 与全表平均比较，请核对"])
+                return _build(sql, "命中「高于平均」规则：列出可用库存高于平均值的快照明细（最新快照日）",
+                              ["库存按逐行 available_qty 与**最新快照日**平均比较，请核对"])
             elif ("产量" in q or "合格" in q or "产出" in q) and _has("mes_process_output"):
                 # 产量按实体汇总后再比平均 → 分组 HAVING
                 if "工序" in q or "process" in q.lower():
@@ -11981,12 +12916,24 @@ def _try_expr_rules(query: str, matched_tables: list, cmap: dict) -> dict | None
         # ── ④ 库存充足程度分类（CASE WHEN）──
         if ("充足" in q and ("分类" in q or "分档" in q or "程度" in q)) \
                 and _has("inv_inventory_snapshot"):
+            # 2026-10-04 修复两处：
+            # ① 缺快照限定 → 返回**全部 45 个快照日**的 1004 行（同一产品按快照日重复分档），
+            #    正确应为最新快照日的 20 行。
+            # ② 阈值与注册表冲突：此处硬编码 `* 2`，而指标注册表 `库存分档统计`
+            #    明确规定「r=available/safety；r<1 缺货；1≤r<**1.5** 正常；r≥1.5 过剩」
+            #    （1.5 为默认业务阈值，见 metrics_registry.json:148）。
+            #    同一件事出现两套阈值 + 两套档位名（告急/偏低/充足 vs 缺货/正常/过剩），
+            #    用户对照两处结果会对不上。现在统一采用注册表口径。
+            #    （当前演示库各产品比值 2.25~9.03，两套阈值下都落「过剩/充足」，
+            #      所以这次修复在现有数据下不产生可见差异，属预防性对齐。）
             sql = ("SELECT product_id, "
-                   "CASE WHEN available_qty < safety_stock_qty THEN '告急' "
-                   "WHEN available_qty < safety_stock_qty * 2 THEN '偏低' ELSE '充足' END AS \"充足程度\" "
-                   "FROM inv_inventory_snapshot ORDER BY product_id")
-            return _build(sql, "命中「库存充足分类」规则：按可用量相对安全库存分档（告急/偏低/充足）",
-                          ["分档阈值按 1×/2× 安全库存推断，请核对业务口径"])
+                   "CASE WHEN available_qty < safety_stock_qty THEN '缺货' "
+                   "WHEN available_qty < safety_stock_qty * 1.5 THEN '正常' ELSE '过剩' END AS \"充足程度\" "
+                   "FROM inv_inventory_snapshot "
+                   "WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) "
+                   "ORDER BY product_id")
+            return _build(sql, "命中「库存分档」规则：按可用量/安全库存比值分档（缺货/正常/过剩，最新快照日）",
+                          ["分档阈值 1×/1.5× 安全库存，与指标注册表「库存分档统计」同口径，请核对"])
 
         # ── ⑤ 工期天数 = 结束日期 - 开始日期（列间日期差）──
         if ("工期" in q or "周期" in q or "耗时" in q) and "工单" in q and _has("mes_work_order"):

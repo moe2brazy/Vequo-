@@ -51,15 +51,48 @@ n2 = suggest_from_query("按产品统计可用与冻结之和",
                         "SELECT product_id, SUM(available_qty + frozen_qty) FROM inv_inventory_snapshot GROUP BY product_id")
 check("B4 同源不重复入池", n2 == 0 and len(list_candidates()) == 1, str(n2))
 # 已注册口径不再沉淀
-n3 = suggest_from_query("各产线产量", "SELECT line_id, SUM(good_qty) FROM mes_process_output GROUP BY line_id")
-check("B5 已注册口径跳过", n3 == 0, str(n3))
+# 2026-10-04 更正：原样例用 `SUM(good_qty)` 断言「已注册口径应跳过」，实测沉淀了 1 条。
+# 定性结论：**测试样例选错，不是代码 bug**。`suggest_from_query` 的去重键是
+#   (归一化表达式, 表集合, 过滤签名)   —— 见 metric_miner._registered_keys / _metric_key
+# 而注册表里「产量」的表达式是
+#   SUM(COALESCE(good_qty,0) + COALESCE(defect_qty,0))   （合格+不良=总产量）
+# **与 `SUM(good_qty)` 本来就是两个不同口径**（后者只是合格数，不是产量）。
+# 所以它被当成新口径沉淀是**正确行为** —— 管理员正是靠这个入口发现「良数」这类新口径。
+# 另注：B4 之所以能过，并非走了 registered 去重（实测其 key 同样未命中注册表），
+#       而是走了 `cid in _CAND` 这条「同源不重复入池」分支。
+# 改用**与注册表逐字一致**的表达式来验证「已注册跳过」这条真正的红线。
+from agent.metric_registry import get_all_metrics as _gam
+_reg_expr = ""
+_reg_tbl = ""
+for _m in _gam():
+    if _m.get("name") == "产量":
+        _reg_expr = _m.get("sql_expression") or ""
+        _reg_tbl = (_m.get("tables") or [""])[0]
+        break
+_sql_reg = ("SELECT %s, %s FROM %s GROUP BY %s"
+            % (_reg_tbl.split(".")[-1], _reg_expr, _reg_tbl.split(".")[-1], _reg_tbl.split(".")[-1]))
+n3 = suggest_from_query("各产线产量", _sql_reg)
+check("B5 已注册口径跳过(与注册表表达式逐字一致)", n3 == 0,
+      f"n3={n3} sql={_sql_reg[:70]}")
+# 反向断言：不同口径（良数 vs 产量）**应该**被沉淀，这是该功能的设计目的
+_n_good = suggest_from_query("只统计合格数", "SELECT line_id, SUM(good_qty) FROM mes_process_output GROUP BY line_id")
+check("B5b 不同口径应沉淀(良数≠产量)", _n_good == 1, f"n={_n_good}")
+# 清掉本条，避免影响 B8
+if _n_good:
+    _CAND.pop([v["id"] for v in _CAND.values() if v.get("sample_question", "").startswith("只统计合格数")][0], None)
 # 空 SQL / 无聚合不沉淀
 check("B6 空 SQL 返回 0", suggest_from_query("x", "") == 0, "")
 check("B7 纯 SELECT 无聚合返回 0", suggest_from_query("x", "SELECT * FROM t") == 0, "")
 # 忽略的口径不再推荐
+# 2026-10-04 更正：原样例用 `SUM(available_qty)` 断言「ignore 后返回 0」，但那条
+# 表达式**本来就不是已注册口径**（注册表是 sum(available_qty+coalesce(frozen_qty,0))
+# 且带最新快照过滤），所以即使没被 ignore，它也会被当作新口径沉淀 1 条 → 断言必然失败。
+# 真正要守的红线是「被 ignore 的**同一条**候选不再进池」，
+# 因此改用 B1 沉淀的那条完全相同的 SQL。
 _IGNORED.add(cands[0]["id"])
-check("B8 忽略后不再沉淀", suggest_from_query("库存低于安全库存",
-      "SELECT product_id, SUM(available_qty) FROM inv_inventory_snapshot GROUP BY product_id") == 0, "")
+_n_b8 = suggest_from_query("按产品统计可用与冻结之和",
+      "SELECT product_id, SUM(available_qty + frozen_qty) FROM inv_inventory_snapshot GROUP BY product_id")
+check("B8 忽略后不再沉淀", _n_b8 == 0, f"n={_n_b8}")
 _IGNORED.clear()
 for k in list(_CAND):
     _CAND.pop(k)

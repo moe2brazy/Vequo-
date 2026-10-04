@@ -150,6 +150,16 @@ _FACT_META = {
     # 库存域
     "inv_inventory_snapshot": {
         "time_col": "snapshot_date",
+        # 2026-10-04 标记为「周期快照表」（snapshot_grain）：
+        # 该表每个 snapshot_date 对每个产品存一份**全量状态**（不是一次事件），
+        # 所以 Σ/COUNT 不带 snapshot_date 过滤就会把 N 个快照日累加 —— 库存是**时点值**不是流量。
+        # 本项目已因此连续出4 次数值错误（库存量/库存预警数 2026-10-03~04、
+        #   总库存/冻结库存/安全库存 2026-10-04），实测 46~55 倍，
+        #   且全部是「确定性编译 0.1s 出数、格式完全正常、无任何提示」的静默错误。
+        # 有了这个标记，编译期可自动注入最新快照约束，把「漏一个错 46 倍」
+        # 变成「漏一个编译失败」—— 失败是安全的，静默错值不是。
+        # 事件表（如 eqp_downtime_record，每行一次停机事件）**不要**打这个标记。
+        "snapshot_grain": True,
         "dims": {
             "产品": {"fact_col": "product_id", "join": ("dim_product", "product_id", "product_name")},
             "仓库": {"fact_col": "warehouse_code", "join": None},
@@ -377,6 +387,55 @@ def _dim_join_clause(dim_def: dict, alias: str) -> tuple[str, str]:
 # 派生视图（向后兼容旧调用方）
 _COMPILABLE_TABLES = set(_FACT_META)  # 所有可编译事实表
 _FACT_TIME_COL = {t: m["time_col"] for t, m in _FACT_META.items() if m.get("time_col")}  # 有时间列的表（同比环比用）
+# 周期快照表：每期存全量状态，聚合必须限定到某期（2026-10-04，见 _FACT_META 内说明）
+_SNAPSHOT_GRAIN_TABLES = {t: m["time_col"] for t, m in _FACT_META.items() if m.get("snapshot_grain")}
+
+
+def audit_snapshot_grain_metrics() -> list[dict]:
+    """体检：以周期快照表为事实表、却没做周期限定的指标。
+
+    2026-10-04 新增。背景：`inv_inventory_snapshot` 这类**周期快照表**（每个时间粒度
+    对每个实体存一份全量状态）上做无过滤的 SUM/COUNT，等于把 N 个周期的值累加，
+    而库存/余额这类是**时点值**不是流量。本项目已连续出4 次静默错值
+    （库存量、库存预警数、总库存、冻结库存、安全库存），实测偏差 46~55 倍。
+
+    与其指望每个加指标的人记得手写 `snapshot_date = (SELECT MAX(...))`，
+    不如在**注册期就把漏网的揪出来** —— 让「漏一个错 46 倍」变成
+    「加载时一条告警」。
+
+    返回 [{name, table, expr, has_exec_sql}]，仅返回有问题的项。
+    判据：以快照表为唯一事实表 + sql_expression 里既没有 MAX(snapshot_date)
+    也没有该表时间列的字面引用（即没有任何时间限定）。
+    指标带 exec_sql 的会另有人工验证路径，但也一并列出供人工确认。
+    """
+    problems: list[dict] = []
+    try:
+        from agent.metric_registry import get_effective_metrics
+        metrics = get_effective_metrics()
+    except Exception:
+        return problems
+    for m in metrics:
+        tables = [str(t).split(".")[-1] for t in (m.get("tables") or [])]
+        snap = [t for t in tables if t in _SNAPSHOT_GRAIN_TABLES]
+        if not snap:
+            continue
+        expr = (m.get("sql_expression") or "").strip()
+        if not expr:
+            continue  # 无表达式（走 exec_sql）不属此类问题
+        tcol = _SNAPSHOT_GRAIN_TABLES[snap[0]]
+        # 已有任何时间限定即视为已处理
+        if re.search(r"MAX\s*\(\s*" + re.escape(tcol) + r"\s*\)", expr, re.I):
+            continue
+        if re.search(r"\b" + re.escape(tcol) + r"\b", expr, re.I):
+            continue
+        problems.append({
+            "name": m.get("name"),
+            "table": snap[0],
+            "time_col": tcol,
+            "expr": expr,
+            "has_exec_sql": bool(m.get("exec_sql")),
+        })
+    return problems
 
 
 def _pg_numeric(expr: str) -> str:
@@ -538,6 +597,45 @@ _EXPR_SCALAR_SUBQUERY_RE = re.compile(
     r"\(\s*SELECT\s+(?:MAX|MIN|COUNT|SUM|AVG)\s*\(\s*[A-Za-z_][A-Za-z0-9_]*\s*\)"
     r"\s+FROM\s+[A-Za-z_][A-Za-z0-9_]*\s*\)", re.IGNORECASE)
 
+# PG 聚合子句 `FILTER (WHERE <cond>)` 的包装关键字。
+# 2026-10-04 修复：注册表里「只取最新快照日」类口径写成
+#     SUM(available_qty + frozen_qty) FILTER (WHERE snapshot_date = (SELECT MAX(...)))
+# 其中 FILTER(WHERE …) 是 PG 合法的**聚合子句**，但 _EXPR_FORBIDDEN_RE 把裸 `WHERE`
+# 当成语句关键字 → 该口径被判「不安全」→ 编译直接回退 LLM。
+# 实测后果：「各仓库的库存量」「近30天各仓库的库存量排名」等问法确定性编译零命中。
+_EXPR_FILTER_RE = re.compile(r"FILTER\s*\(\s*WHERE\s+", re.IGNORECASE)
+
+
+def _strip_filter_wrapper(expr: str) -> str:
+    """剥掉 `FILTER (WHERE <cond>)` 的包装词，**保留条件本体**继续参与校验。
+
+    只删 FILTER / WHERE 两个包装关键字，条件表达式原样留在串里，后续仍走
+    _EXPR_FORBIDDEN_RE 与 _EXPR_SAFE_RE 双重校验 —— 不放松任何注入面
+    （含子查询/语句关键字的恶意条件照常被拦）。
+    """
+    out = expr
+    while True:
+        m = _EXPR_FILTER_RE.search(out)
+        if not m:
+            return out
+        oi = out.find("(", m.start())
+        if oi < 0:
+            return out
+        depth = 0
+        j = oi
+        while j < len(out):
+            if out[j] == "(":
+                depth += 1
+            elif out[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if j >= len(out):
+            return out  # 括号不配平 → 原样返回，交给上层拒绝
+        inner = out[m.end():j]
+        out = out[:m.start()] + "( " + inner + " )" + out[j + 1:]
+
 
 def _safe_metric_expr(expr: str) -> bool:
     """判断指标表达式是否可安全编译（防注入）。
@@ -545,10 +643,12 @@ def _safe_metric_expr(expr: str) -> bool:
     2026-10-03：先剥掉受限形态的聚合标量子查询 `(SELECT MAX(col) FROM tbl)`
     （内置「库存量」口径用它表达「只取最新快照日」，无注入面），
     剩余部分不允许出现任何 SELECT / DML / DDL / 子句关键字。
+    2026-10-04：再剥掉 `FILTER (WHERE <cond>)` 的包装词（条件本体保留校验）。
     """
     if not expr:
         return False
     probe = _EXPR_SCALAR_SUBQUERY_RE.sub(" ", expr)
+    probe = _strip_filter_wrapper(probe)
     if _EXPR_FORBIDDEN_RE.search(probe):
         return False
     return bool(_EXPR_SAFE_RE.fullmatch(probe))
@@ -2229,7 +2329,12 @@ _MULTI_ANALYSIS_INTENT_RE = re.compile(
 
 
 def _suppress_multi_metric_compile(query: str) -> bool:
-    """问句是否「多指标 + 关系/对比意图」→ 是则禁止编译。"""
+    """问句是否「多指标 + 关系/对比意图」→ 是则禁止编译。
+
+    2026-10-04 收窄：仅当这些指标**无法在同一条 SQL 里确定性产出多列**时才禁止
+    （跨表 / 非白名单事实表 / 指标表数不为 1）。同表多指标现由普通编译路径接管，
+    判据处的长注释说明了收窄依据与实测后果。
+    """
     if not query or not _MULTI_ANALYSIS_INTENT_RE.search(query):
         return False
     try:
@@ -2262,7 +2367,31 @@ def _suppress_multi_metric_compile(query: str) -> bool:
                 continue
             _selected[_mn] = _w
         named = set(_selected.keys())
-        return len(named) >= 2
+        if len(named) < 2:
+            return False
+        # 2026-10-04 收窄（重要，附取证）：原实现「≥2 个指标 + 关系/对比词 → 一律禁止编译」
+        # 是 2026-09-03 的产物，当时本文件还**没有**下面两条能力：
+        #   ① `find_metrics` 按最长匹配只留 1 个指标 → 多指标问法会被压成单指标静默编译；
+        #   ② 「关系/对比类自动补维度」（见 try_compile_metric 内「关系/对比类语义补全」段）
+        #      尚未落地 —— 它专门为「停机时长和停机次数的关系」这类**无维度双指标**问法
+        #      自动补一个维度分组，产出多行多列，使散点/关系图有数据可画。
+        # 这两条现在都成立了：2611 行已改用 `find_metrics(query, limit=None)` 全量取词，
+        # 2777 行附近会自动补维度。继续一律禁止的代价是实测可见的 ——
+        # 「停机时长和停机次数的关系」被白白推给 LLM（同类问法实测 72~131s，
+        # 且 LLM 解读易把相关系数当普通数值列去排名）。
+        # 收窄判据：只有当指标**无法在同一条 SQL 里确定性产出多列**时才禁止编译 ——
+        # 即 跨表（需桥接，桥接失败自然回退 LLM）/ 非白名单事实表 / 表数不为 1。
+        _tabs: set[str] = set()
+        for _m in get_effective_metrics():
+            if str(_m.get("name") or "") not in named:
+                continue
+            _ts = _m.get("tables") or []
+            if len(_ts) != 1:
+                return True
+            _tabs.add(str(_ts[0]))
+        if len(_tabs) == 1 and next(iter(_tabs)) in _COMPILABLE_TABLES:
+            return False
+        return True
     except Exception:
         return False
 

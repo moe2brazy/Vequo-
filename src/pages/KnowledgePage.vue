@@ -201,7 +201,7 @@
                     <span v-for="c in refFieldsOfMetric(selectedDetail)" :key="c.name" class="kb-rel-chip mono" :title="c.translation || c.comment || c.name">{{ c.name }}</span>
                   </div>
                 </div>
-                <div v-if="refFieldsOfMetric(selectedDetail).length" class="kb-rel-group">
+                <div v-if="selectedDetail.formula" class="kb-rel-group">
                   <div class="kb-rel-title"><AppIcon name="function-square" :size="12" /> 口径公式</div>
                   <div class="kb-rel-formula mono">{{ selectedDetail.formula }}</div>
                 </div>
@@ -491,7 +491,7 @@
                 <option value="">全部类型</option>
                 <option v-for="kt in knowledgeTypes" :key="kt" :value="kt">{{ kt }}</option>
               </select>
-              <button class="kb-primary-btn" @click="termFormModal = true"><AppIcon name="plus" :size="11" /> 新增术语</button>
+              <button class="kb-primary-btn" @click="openTermForm"><AppIcon name="plus" :size="11" /> 新增术语</button>
             </div>
           </div>
           <div class="kb-terms-body">
@@ -501,7 +501,11 @@
                 <span><AppIcon :name="typeIcons[group.type] || 'list'" :size="13" /> {{ group.type }}</span>
                 <span class="kb-card-count">{{ group.items.length }} 个术语</span>
               </div>
-              <div v-for="term in group.items" :key="term.term" class="kb-term" @click="openTermDetail(term)">
+              <!-- key 用「表.字段」而非 term：后端去重键是「术语+前30字释义」，
+                   同名不同释义会同时保留（status/type/created_at 这类跨表重复率很高），
+                   term 重复会让 Vue 复用错 DOM，术语卡显示错乱。
+                   自定义术语无 mapped_field，退回 term 即可。 -->
+              <div v-for="term in group.items" :key="`${term.mapped_table || 'custom'}.${term.mapped_field || term.term}.${term.definition?.slice(0, 8) || ''}`" class="kb-term" @click="openTermDetail(term)">
                 <div class="kb-term-main">
                   <div class="kb-term-top">
                     <span class="kb-term-name">{{ term.term_cn || term.term }}</span>
@@ -699,6 +703,7 @@
         <div class="kb-modal-body">
           <div class="kb-form-row"><label>字段</label><input :value="fieldEdit.column" disabled class="kb-input" /></div>
           <div class="kb-form-row"><label>业务含义</label><textarea v-model="fieldEdit.value" rows="3" class="kb-input"></textarea></div>
+          <p v-if="fieldEditMsg" class="kb-form-msg">{{ fieldEditMsg }}</p>
         </div>
         <div class="kb-modal-foot">
           <button class="kb-ghost-btn" @click="fieldEdit = null">取消</button>
@@ -825,10 +830,28 @@
       </div>
     </div>
   </Teleport>
+
+  <!-- 术语详情弹窗：与上面的反馈弹窗同样 Teleport 到 body。
+       openTermDetail 一直往 detailModal 写内容，但此前模板里从未渲染它 →
+       点任意术语卡片「零反应」，escHtml 也因此成了死代码。 -->
+  <Teleport to="body">
+    <div v-if="detailModal" class="kb-modal-mask" @click.self="detailModal = null">
+      <div class="kb-modal" @click.stop>
+        <div class="kb-modal-head">
+          <span><AppIcon name="book-open" :size="14" /> {{ detailModal.title }}</span>
+          <button class="kb-detail-close" @click="detailModal = null"><AppIcon name="x" :size="14" /></button>
+        </div>
+        <div class="kb-modal-body" v-html="detailModal.content"></div>
+        <div class="kb-modal-foot">
+          <button class="kb-primary-btn" @click="detailModal = null">关闭</button>
+        </div>
+      </div>
+    </div>
+  </Teleport>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, watch, nextTick } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import KnowledgeGraph from '../components/KnowledgeGraph.vue'
 import LightRagGraph from '../components/LightRagGraph.vue'
 import GraphNodeDetail from '../components/GraphNodeDetail.vue'
@@ -1090,9 +1113,14 @@ const saveOverride = async (key: string, kind: string, patch: any) => {
     body: JSON.stringify({ key, kind, patch }),
   })
   const data = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error(data.detail || `保存失败（HTTP ${res.status}）`)
   if (!data.success) throw new Error(data.detail || '保存失败')
-  // 覆盖后会改变 scenes/terms 结果，需重新加载
+  // 覆盖后会改变 scenes/terms 结果，需重新加载。
+  // 图谱节点 label 与快照缓存同样来自这些数据：原来只刷 scenes/terms，导致
+  // 「场景知识」里已显示新名、「知识图谱」里仍是旧名，同一实体两个名字。
+  snapshots.value = {}
   await Promise.all([loadKnowledge(), loadUserData()])
+  await loadRelations()
 }
 
 // ========== API 基础地址 ==========
@@ -1444,7 +1472,9 @@ const findObjRef = (table: string): { obj: any; sceneKey: string; sceneName: str
   }
   return null
 }
-// 表 → 全库关联指标（跨场景去重，附带归属场景名）
+// 表 → 全库关联指标（跨场景去重，附带归属场景 key/名）
+// 注意 sceneKey 必须一起返回：模板 @click 传 openMetricDetail(it.m, it.sceneKey)，
+// 缺失会让弹窗头部的场景名渲染成字面量 undefined（scenesMap[undefined] → undefined）。
 const metricsOfTableAll = (table: string) => {
   const seen = new Set<string>()
   const out: any[] = []
@@ -1452,7 +1482,7 @@ const metricsOfTableAll = (table: string) => {
     for (const m of s?.metrics || []) {
       if ((m.tables || []).includes(table) && m.name && !seen.has(m.name)) {
         seen.add(m.name)
-        out.push({ m, sceneName: s?.name || '' })
+        out.push({ m, sceneKey: s?.key || '', sceneName: s?.name || '' })
       }
     }
   }
@@ -1467,7 +1497,9 @@ const rulesOfObjAll = (obj: any) => {
   for (const s of Object.values(scenesMap.value) as any[]) {
     for (const r of s?.rules || []) {
       const text = `${r.name || ''} ${r.condition || ''} ${r.formula || ''} ${r.source || ''}`
-      if (text.includes(t) || (lb && lb.length >= 2 && text.includes(lb))) out.push({ r, sceneName: s?.name || '' })
+      if (text.includes(t) || (lb && lb.length >= 2 && text.includes(lb))) {
+        out.push({ r, sceneKey: s?.key || '', sceneName: s?.name || '' })
+      }
     }
   }
   return out
@@ -2363,11 +2395,14 @@ const runTemplate = async (template: any) => {
   runningTplId.value = template.id
   const win = window.open('', '_blank')
   if (win) {
+    // 模板名来自后端，但这里是字符串拼 HTML —— 名字里出现 < 或 " 就会破坏页面结构。
+    // 同一个文件里已有 escHtml（原先只被死代码 openTermDetail 用着），这里复用。
+    const safeName = escHtml(template.name || '分析报告')
     win.document.write(
-      '<html><head><meta charset="UTF-8"><title>' + (template.name || '分析报告') + '</title></head>' +
+      '<html><head><meta charset="UTF-8"><title>' + safeName + '</title></head>' +
       '<body style="font-family:sans-serif;display:flex;align-items:center;justify-content:center;' +
       'height:100vh;color:#6b7280;font-size:15px;flex-direction:column;gap:10px">' +
-      '<div style="font-size:20px;color:#1d2129">正在生成「' + (template.name || '分析报告') + '」…</div>' +
+      '<div style="font-size:20px;color:#1d2129">正在生成「' + safeName + '」…</div>' +
       '<div style="font-size:13px;color:#9ca3af">按模板步骤确定性编译执行（约 1-3 秒）</div></body></html>'
     )
   }
@@ -2416,7 +2451,11 @@ const loadTemplates = async () => {
     const res = await fetch(`${API_BASE}/knowledge/templates`)
     if (!res.ok) return
     const json = await res.json()
-    if (json.templates?.length) {
+    // 用 Array.isArray 而非 `.length`：后端对**受限用户**会裁掉无权模板并返回
+    // 空数组，此时原写法整段跳过 → knowledgeTemplates 仍是初始的 6 个内置模板
+    //（还带伪造的 metrics_count/tables_count）→ 用户看到并执行自己无权访问的
+    // 模板，点「一键生成报告」后才被后端 404 拦下。
+    if (Array.isArray(json.templates)) {
       knowledgeTemplates.value = json.templates
       templateSummary.value = json.summary || null
     }
@@ -2501,8 +2540,9 @@ const selectDomainNode = (node: DomainNode) => {
 
 // 详情面板打开时同步迷你关系图焦点
 watch(() => selectedDetail.value?.table, (table) => {
-  if (table) miniTarget.value = table
-  else if (!miniTarget.value) miniTarget.value = ''
+  // 原为 `else if (!miniTarget.value)` —— 只在本就为空时赋值，等于永不生效，
+  // 从对象详情切到指标/规则详情后 miniTarget 仍留着上一个对象。
+  miniTarget.value = table || ''
 })
 
 // ========== 全局搜索 ==========
@@ -2510,6 +2550,7 @@ const globalSearchQ = ref('')
 const globalSearchResults = ref<any[]>([])
 const globalSearchFocus = ref(false)
 const globalSearchTimer = ref<any>(null)
+const globalBlurTimer = ref<any>(null)
 const runGlobalSearch = () => {
   const q = globalSearchQ.value.trim().toLowerCase()
   globalSearchResults.value = []
@@ -2518,7 +2559,9 @@ const runGlobalSearch = () => {
   for (const [sk, s] of Object.entries(scenesMap.value) as any[]) {
     const sceneName = s?.name || sk
     for (const o of (s?.objects || [])) {
-      const blob = `${o.label || ''} ${o.table || ''} ${o.description || ''}`.toLowerCase()
+      // 后端 _build_scene_object 返回的是 desc，不是 description（后者是 metrics 的字段），
+      // 原写法读到 undefined → 对象描述文本恒为空，搜描述里的词永远搜不到
+      const blob = `${o.label || ''} ${o.table || ''} ${o.desc || ''}`.toLowerCase()
       if (blob.includes(q)) out.push({ key: `object:${o.table || o.label}`, type: '业务对象', title: o.label || o.table, subtitle: `数据表 · ${sceneName}`, scene: sk, icon: 'table' })
     }
     for (const m of (s?.metrics || [])) {
@@ -2533,12 +2576,20 @@ const runGlobalSearch = () => {
   for (const t of termDictionary.value) {
     const name = t.term_cn || t.term || t.name || ''
     const blob = `${name} ${t.term || ''} ${t.definition || ''}`.toLowerCase()
-    if (blob.includes(q)) out.push({ key: `term:${name}`, type: '术语', title: name, subtitle: t.category ? `术语 · ${t.category}` : '术语', icon: 'book-open' })
+    // key 用 term（英文稳定主键）而非 term_cn：中文名可能重复，且后端 find 按 term 匹配
+    if (blob.includes(q)) out.push({ key: `term:${t.term || name}`, type: '术语', title: name, subtitle: t.category ? `术语 · ${t.category}` : '术语', icon: 'book-open' })
   }
-  for (const tp of topicList.value) {
-    const name = tp.name || ''
-    const blob = `${name} ${tp.description || ''}`.toLowerCase()
-    if (blob.includes(q)) out.push({ key: `topic:${tp.id ?? name}`, type: '分析主题', title: name, subtitle: '分析主题', icon: 'target' })
+  // 分析主题取自 scenesMap（与 openTopicDetail 同源，点击才能真的打开详情）。
+  // 原实现只扫 topicList，而它是 /api/tables/topics 返回的**场景级**主题
+  // （production→"生产分析"），与 scenesMap[].topics 里的**场景内**主题
+  // （"产量趋势"/"良率与质量表现"…）是两套不同的集合、名字也对不上
+  // → 搜出「生产分析」后按名字去 scenesMap 里 find 必然 miss，点不动。
+  for (const [sk, s] of Object.entries(scenesMap.value) as any[]) {
+    for (const tp of (s?.topics || [])) {
+      const name = tp.name || ''
+      const blob = `${name} ${tp.description || ''}`.toLowerCase()
+      if (blob.includes(q)) out.push({ key: `topic:${name}`, type: '分析主题', title: name, subtitle: s?.name || sk, scene: sk, icon: 'target' })
+    }
   }
   globalSearchResults.value = out.slice(0, 12)
 }
@@ -2547,7 +2598,12 @@ const onGlobalSearchInput = () => {
   globalSearchTimer.value = setTimeout(runGlobalSearch, 250)
 }
 const blurSearch = () => {
-  globalSearchTimer.value = setTimeout(() => { globalSearchFocus.value = false }, 200)
+  // 必须用独立定时器：原实现与搜索防抖共用一个 ref 且直接覆盖，
+  // 于是「失焦」会把搜索定时器的句柄丢掉（再也取消不掉），
+  // 紧接着重新聚焦打字时 clearTimeout 清掉的是「失焦隐藏」→
+  // 下拉框关不掉，且搜索结果在失焦之后才被算出来。
+  if (globalBlurTimer.value) clearTimeout(globalBlurTimer.value)
+  globalBlurTimer.value = setTimeout(() => { globalSearchFocus.value = false }, 200)
 }
 const jumpToSearchResult = (r: any) => {
   globalSearchQ.value = ''
@@ -2555,22 +2611,33 @@ const jumpToSearchResult = (r: any) => {
   const parts = r.key.split(':')
   const kind = parts[0]
   const id = parts.slice(1).join(':')
-  // 定位到对应场景并打开详情
-  for (const [sk, s] of Object.entries(scenesMap.value) as any[]) {
-    const obj = (s?.objects || []).find((o: any) => o.table === id)
-    if (obj) { activeScene.value = sk; openObjectDetail(obj, sk); return }
-    const met = (s?.metrics || []).find((m: any) => m.name === id)
-    if (met) { activeScene.value = sk; openMetricDetail(met, sk); return }
-    const rule = (s?.rules || []).find((m: any) => m.name === id)
-    if (rule) { activeScene.value = sk; openRuleDetail(rule, sk); return }
-    const topic = (s?.topics || []).find((m: any) => m.name === id)
-    if (topic) { activeScene.value = sk; openTopicDetail(topic, sk); return }
+  // 只在 kind 对应的集合里找。原实现不分支、四类依次无条件匹配且只比 name，
+  // 导致「良率」这类术语被场景里的同名指标劫持，kind 形同虚设。
+  const pick = (s: any, k: string): any[] => {
+    if (k === 'object') return s?.objects || []
+    if (k === 'metric') return s?.metrics || []
+    if (k === 'rule') return s?.rules || []
+    if (k === 'topic') return s?.topics || []
+    return []
   }
   if (kind === 'term') {
-    const t = termDictionary.value.find((x: any) => x.term === id)
-    if (t) { activeView.value = 'terms'; openTermDetail(t) }
-  } else if (kind === 'topic') {
-    activeView.value = 'topics'
+    const t = termDictionary.value.find((x: any) => x.term === id || x.term_cn === id)
+    activeView.value = 'terms'
+    // 找不到时不塞搜索词：塞了会让列表被过滤成空，用户以为「这页没数据」
+    if (t) openTermDetail(t)
+    return
+  }
+  for (const [sk, s] of Object.entries(scenesMap.value) as any[]) {
+    const hit = pick(s, kind).find((x: any) =>
+      kind === 'object' ? x.table === id : x.name === id)
+    if (!hit) continue
+    activeScene.value = sk
+    activeView.value = 'scene'
+    if (kind === 'object') openObjectDetail(hit, sk)
+    else if (kind === 'metric') openMetricDetail(hit, sk)
+    else if (kind === 'rule') openRuleDetail(hit, sk)
+    else openTopicDetail(hit, sk)
+    return
   }
 }
 
@@ -2696,18 +2763,26 @@ const cancelEdit = () => { editModal.value = null }
 
 // ========== 字段业务含义编辑（对象详情字段表） ==========
 const fieldEdit = ref<any>(null)
+const fieldEditMsg = ref('')
 const openFieldEdit = (col: any) => {
   if (!selectedDetail.value?.table) return
+  fieldEditMsg.value = ''
   fieldEdit.value = { table: selectedDetail.value.table, column: col.name, value: col.translation || '' }
 }
 const saveFieldEdit = async () => {
   const f = fieldEdit.value
   if (!f) return
+  fieldEditMsg.value = ''
   try {
     await saveOverride(`field:${f.table}.${f.column}`, 'field', { translation: f.value })
     fieldEdit.value = null
-    await loadKnowledge()
-  } catch { /* ignore */ }
+    // 不再重复 loadKnowledge：saveOverride 内部已 await loadKnowledge+loadUserData，
+    // 这里再来一次会让全页闪一次「正在从数据库加载…」。
+  } catch (e: any) {
+    // 原为 catch{} 空吞 —— 保存失败时弹窗不关、页面无任何变化、也没有提示，
+    // 用户只能反复点，以为按钮坏了。
+    fieldEditMsg.value = e?.message || '保存失败，请重试'
+  }
 }
 
 // ========== 自定义术语增加 ==========
@@ -2717,6 +2792,18 @@ const termForm = ref({
 })
 const termFormMsg = ref('')
 const termFormMsgOk = ref(true)
+const EMPTY_TERM_FORM = () => ({
+  term: '', en: '', definition: '', category: '',
+  knowledge_type: '业务对象', abbreviation: '', data_type: '',
+})
+// 打开时必须整体重置：原实现只弹窗不清内容，上一次失败留下的红字提示
+// 会继续显示；更严重的是保存成功后只清了 4 个字段，category / data_type /
+// knowledge_type 被静默沿用到下一个术语，提交出错的数据。
+const openTermForm = () => {
+  termFormMsg.value = ''
+  termForm.value = EMPTY_TERM_FORM()
+  termFormModal.value = true
+}
 const saveCustomTerm = async () => {
   termFormMsg.value = ''
   if (!termForm.value.term.trim()) { termFormMsg.value = '术语名称不能为空'; termFormMsgOk.value = false; return }
@@ -2726,12 +2813,12 @@ const saveCustomTerm = async () => {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(termForm.value),
     })
+    if (!res.ok) throw new Error(`保存失败（HTTP ${res.status}）`)
     const data = await res.json()
     if (!data.success) throw new Error(data.detail || '保存失败')
-    termFormMsg.value = '术语已保存'
-    termFormMsgOk.value = true
-    Object.assign(termForm.value, { term: '', en: '', definition: '', abbreviation: '' })
+    termForm.value = EMPTY_TERM_FORM()
     termFormModal.value = false
+    toast('术语已保存')
     await loadKnowledge()
     await loadUserData()
   } catch (e: any) {
@@ -2742,10 +2829,20 @@ const saveCustomTerm = async () => {
 const deleteCustomTerm = async (term: string) => {
   if (!window.confirm(`确认删除自定义术语「${term}」？`)) return
   try {
-    await fetch(`/api/knowledge/terms/${encodeURIComponent(term)}`, { method: 'DELETE' })
+    // 原实现只 await fetch 不看 res.ok，且 catch 空吞 → 后端 500 时列表纹丝不动，
+    // 用户以为删掉了（刷新后又出现），完全无从判断
+    const res = await fetch(`/api/knowledge/terms/${encodeURIComponent(term)}`, { method: 'DELETE' })
+    if (!res.ok) {
+      let msg = `删除失败（HTTP ${res.status}）`
+      try { msg = (await res.json())?.detail || msg } catch { /* 响应非 JSON，用默认文案 */ }
+      throw new Error(msg)
+    }
+    toast('已删除')
     await loadKnowledge()
     await loadUserData()
-  } catch { /* ignore */ }
+  } catch (e: any) {
+    toast(e?.message || '删除失败，请重试', false)
+  }
 }
 
 // ========== 初始化 ==========
@@ -2769,6 +2866,13 @@ watch(() => props.initialScene, (scene) => {
     activeView.value = 'scene'
     activeScene.value = scene
   }
+})
+
+onUnmounted(() => {
+  // 页面级定时器此前完全不清理：离开本页后搜索防抖仍会 fire 并写已废弃的 ref，
+  // toast 的 setTimeout 还会去操作已卸载的 DOM。
+  if (globalSearchTimer.value) clearTimeout(globalSearchTimer.value)
+  if (globalBlurTimer.value) clearTimeout(globalBlurTimer.value)
 })
 </script>
 
