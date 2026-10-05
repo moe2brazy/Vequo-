@@ -84,3 +84,30 @@ backend/field_cn_ai.json
 backend/report_assets.json
 backend/report_scheduler.json
 backend/knowledge_user_data.json
+
+# ── 运行时业务配置（每台机器各生成一份，默认空壳，不进仓库）──
+# 理由：monitor_rules/notifier/skill_store 都是 admin 在界面上配置后落盘的，
+#属个人配置而非项目资产；仓库里放一份空壳反而会让人以为「配好了」。
+backend/monitor_rules.json
+backend/notifier.json
+backend/skill_store.json
+# 未匹配问题台账（键是中文原句，逐机不同，且会无限增长）
+backend/.unmatched_queries.json
+
+# ── 评测产物 / 备份文件（可由脚本重新生成，不需要进仓库）──
+backend/tests/bank_detail.json
+backend/tests/*.bak
+backend/tests/*.bak-*
+backend/tests/metric_audit_report.txt
+
+# ── 本地工具产物（不进仓库）──
+# 注意：.gitignore **不支持行尾注释**，故以下规则的说明一律另起一行。
+# .run/ 是 PyCharm 运行配置（每台机器路径不同）
+.run/
+# .workbuddy/ 是本地临时排查脚本
+.workbuddy/
+# _bak_*/ 是手工备份目录
+_bak_*/
+# 合并/归档产物目录（若有）
+_obsolete/
+_archive_*/
