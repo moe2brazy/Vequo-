@@ -164,8 +164,59 @@
       "inventory"
     ]
   },
-  "updated_at": "2026-10-04T15:41:16.524346+00:00",
-  "updated_by": "unit-fixture",
-  "user_grants": {},
+  "updated_at": "2026-10-06T04:41:13.656853+00:00",
+  "updated_by": "admin",
+  "user_grants": {
+    "viewer": {
+      "mes_process_output": [
+        "output_id",
+        "work_order_id",
+        "product_id",
+        "process_id",
+        "line_id",
+        "stat_date",
+        "input_qty",
+        "good_qty",
+        "defect_qty",
+        "rework_qty",
+        "shift_code"
+      ],
+      "mes_work_order": [
+        "work_order_id",
+        "work_order_no",
+        "product_id",
+        "line_id",
+        "plan_qty",
+        "start_date",
+        "end_date",
+        "order_status"
+      ],
+      "dim_product": [
+        "product_id",
+        "product_code",
+        "product_name",
+        "product_model",
+        "product_category",
+        "unit",
+        "is_active"
+      ],
+      "dim_process": [
+        "process_id",
+        "process_code",
+        "process_name",
+        "process_seq",
+        "standard_yield_rate",
+        "is_key_process"
+      ],
+      "dim_production_line": [
+        "line_id",
+        "line_code",
+        "line_name",
+        "workshop_name",
+        "line_manager",
+        "line_status"
+      ]
+    }
+  },
   "strict_mode": false
 }
