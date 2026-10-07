@@ -122,7 +122,7 @@
       "inventory"
     ]
   },
-  "updated_at": "2026-10-07T08:42:14.768305+00:00",
+  "updated_at": "2026-10-07T08:42:46.897572+00:00",
   "updated_by": "admin",
   "user_grants": {
     "viewer": {
@@ -309,6 +309,23 @@
         "process_seq",
         "standard_yield_rate",
         "is_key_process"
+      ],
+      "dim_product": [
+        "product_id",
+        "product_code",
+        "product_name",
+        "product_model",
+        "product_category",
+        "unit",
+        "is_active"
+      ],
+      "dim_production_line": [
+        "line_id",
+        "line_code",
+        "line_name",
+        "workshop_name",
+        "line_manager",
+        "line_status"
       ]
     }
   },
