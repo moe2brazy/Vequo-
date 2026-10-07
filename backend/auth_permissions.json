@@ -107,7 +107,11 @@
         }
       },
       "metrics": {},
-      "actions": {}
+      "actions": {
+        "export": true,
+        "share": true,
+        "download": true
+      }
     },
     "region_manager": {
       "datasets": [
@@ -164,7 +168,7 @@
       "inventory"
     ]
   },
-  "updated_at": "2026-10-06T04:41:13.656853+00:00",
+  "updated_at": "2026-10-07T06:19:05.685981+00:00",
   "updated_by": "admin",
   "user_grants": {
     "viewer": {
