@@ -220,7 +220,7 @@ const pageComponents: Record<string, any> = {
 const currentPageComponent = computed(() => pageComponents[currentPage.value] || OverviewPage)
 // 仅核心页进 KeepAlive 缓存（后台任务不中断）；其余页直接渲染，避免 8 页常驻内存卡死
 const isCachedPage = computed(() => ['overview', 'ask', 'data'].includes(currentPage.value))
-import { logout as apiLogout, getUser, getToken, isAdmin, isEditor, updateLocalUser, type AuthUser } from './auth'
+import { logout as apiLogout, getUser, getToken, isAdmin, isEditor, isTokenFresh, updateLocalUser, type AuthUser } from './auth'
 // 修复（P0）：未读轮询必须在 token 失效/登出时停止，否则 5s 一次的 401 会反复跳登录页
 import { stopSupportPolling, resetSupportPolling } from './supportService'
 import { recordLogin } from './stores/loginLog'
@@ -235,9 +235,21 @@ const loginEmail = ref('')
 function enterWorkspace() {
   if (view.value === 'workspace') return
   // 已登录账号 → 直接进入工作台
-  if (authUser.value) {
+  // 2026-10-06 修复（P0·先进工作台再跳登录）：
+  // 原判断只有 `if (authUser.value)`，而 authUser 来自 getUser() —— 它原先
+  // 只读 localStorage 的用户记录。于是「有用户记录、token 已失效或缺失」这种
+  // 残留态会**直接切到工作台**：工作台首个请求带无效凭证 → 后端 401 →
+  // patchFetch 广播 auth:unauthorized → onUnauthorized 把 view 置回 login。
+  // 用户观感就是「先进工作台，1~2 秒后被弹回登录页」。
+  // 现在进工作台前先本地预检 token（exp 未到期且结构合法），不通过就当未登录。
+  if (authUser.value && isTokenFresh()) {
     view.value = 'workspace'
     return
+  }
+  // token 不可用但用户记录还在 → 清掉残留，避免后续界面误判「已登录」
+  if (authUser.value) {
+    authUser.value = null
+    apiLogout(true) // 静默清理凭证（不派发 auth:logout，避免把 view 置回 intro）
   }
   // 未登录 → 进登录页（登录优先）；没有账号再从登录页底部去注册
   goLogin()
@@ -282,7 +294,16 @@ function backHome() {
 }
 
 // ====== 认证状态（原项目 Phase 4.1） ======
-const authUser = ref(getUser())
+// 2026-10-06 修复（P0·先进工作台再跳登录）：初始登录态除了「有用户记录」
+// 还要过 token 预检。getUser() 现在已要求 token 存在，但**过期 token 仍是本地
+// 合法存在的** —— 不预检的话，页面一刷新就直接进工作台，随后第一个 API 401
+// 又把用户弹回登录页（同样 1~2 秒）。这里在启动时就清理掉过期凭证，
+// 让刷新后落在登录页而不是「闪一下工作台」。
+const authUser = ref(isTokenFresh() ? getUser() : null)
+if (!isTokenFresh()) {
+  // 过期/无效 token：静默清掉，避免 getToken() 继续把它附到请求头里
+  apiLogout(true)
+}
 // 供各页面（如 KnowledgePage 的 canDo）建立登录态响应式依赖；登录/登出后按钮显隐自动刷新
 provide('authUser', authUser)
 const showUserMenu = ref(false)

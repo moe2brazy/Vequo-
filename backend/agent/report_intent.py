@@ -243,14 +243,65 @@ def detect(query: str) -> ReportRequest | None:
 
     period, prev = _detect_period(q)
     kind = _detect_kind(q)
-    start, end = _span(period, _today(), prev)
-    title = _build_title(kind, period, prev)
+    ref = _today()
+    start, end = _span(period, ref, prev)
+    # 2026-10-05 修复（P0）：区间原本一律以「今天」收尾，但演示/私有库的
+    # 数据往往滞后于今天 —— 实测 yans 库 mes_process_output 只有
+    # 2026-08-01 ~ 2026-09-15，而「生产周报」算出的区间是 10-05~10-05，
+    # 于是**所有章节都返回 0 行**，报告却显示「取数成功 6/6」，
+    # 用户看到的是一份全空报告（去掉时间条件立刻有数据：投入 318 万、良率 97.56%）。
+    # 这里把区间末端钳制到库内实际数据末日，避免凭空造出空区间。
+    data_max = _data_max_date()
+    clamped_note = ""
+    if data_max and end > data_max:
+        clamped_note = (f"（数据仅到 {data_max}，统计区间已自动收窄）")
+        if start > data_max:
+            # 整个区间都在数据之外 → 退回「以数据末日为终点」的等长区间
+            try:
+                span = datetime.date.fromisoformat(end) - datetime.date.fromisoformat(start)
+                end = data_max
+                start = (datetime.date.fromisoformat(data_max) - span).isoformat()
+            except Exception:
+                start = data_max
+        else:
+            end = data_max
+    title = _build_title(kind, period, prev) + clamped_note
 
     return ReportRequest(
         kind=kind, label=_KIND_LABEL.get(kind, "经营"),
         period=period, title=title, start=start, end=end,
         query=query, matched_by=matched_by, prev=prev,
     )
+
+
+_DATA_MAX_CACHE: dict[str, str] = {}
+
+
+def _data_max_date() -> str:
+    """取业务事实表里最新的日期（结果缓存 5 分钟）。
+
+    找不到任何带日期列的表时返回空串（不做钳制，保持原有行为）。
+    """
+    import time as _t
+    key = str(_today())
+    hit = _DATA_MAX_CACHE.get("k")
+    if hit and _t.time() - _DATA_MAX_CACHE.get("ts", 0) < 300:
+        return _DATA_MAX_CACHE.get("v") or ""
+    val = ""
+    try:
+        from db.executor import execute_sql
+        r = execute_sql(
+            "SELECT MAX(stat_date)::text AS d FROM mes_process_output")
+        if r.get("success") and r.get("rows"):
+            v = str(r["rows"][0].get("d") or "")[:10]
+            if len(v) == 10:
+                val = v
+    except Exception:
+        val = ""
+    _DATA_MAX_CACHE["k"] = key
+    _DATA_MAX_CACHE["v"] = val
+    _DATA_MAX_CACHE["ts"] = _t.time()
+    return val
 
 
 def is_report_request(query: str) -> bool:

@@ -370,12 +370,16 @@ def _apply_disp(cols: list[str], disp: dict[str, str] | None) -> list[str]:
 def collect_question_data(question: str, sql: str | None = None,
                           allowed_tables: set[str] | None = None,
                           row_filters: dict[str, str] | None = None,
-                          max_rows: int = 200) -> dict:
+                          max_rows: int = 200,
+                          acl=None) -> dict:
     """围绕用户问题取数。优先复用已有 SQL，没有则让 LLM 现生成一条。
 
     为什么不复用现成 SQL 就完事：AskPage 里那次问答的 SQL 可能带 LIMIT 5 之类
     只够看一行的截断，做报告要拿全量趋势；也可能那条 SQL 是修正前的旧版。
     所以这里以「问题」为准重新取一次，SQL 只作为提示喂给生成器。
+
+    2026-10-05 新增 acl 参数：接入列级权限（脱敏/列拒绝）。此前本函数只做行级，
+    报告链路的列脱敏完全失效（实测 line_manager 明文外泄）。
 
     返回 {ok, sql, columns, rows, error, table, row_count}
     """
@@ -387,12 +391,27 @@ def collect_question_data(question: str, sql: str | None = None,
         return {"ok": False, "sql": "", "columns": [], "rows": [],
                 "error": "没能为这个问题生成可执行的查询", "table": "", "row_count": 0}
 
-    # 行级权限：给结果套上用户的可见范围。做法是把原 SQL 包成子查询再过滤，
-    # 不改原语句（原语句可能是聚合/JOIN，直接拼 WHERE 会语法错）。
-    exec_sql = sql
+    # ── 权限改写：列级（脱敏/拒绝）优先走 enforcer，与主问答链保持一致 ──
+    # 顺序说明：列级必须在**行级包裹之前**做。行级包装会把原 SQL 塞进
+    # `SELECT * FROM (原SQL) AS _acl_sub WHERE ...`，届时 enforcer 看到的
+    # 是包装后的语句，列引用（supervisor / line_manager）已不在投影里，
+    # 脱敏会静默失效。先列级后行级，enforcer 看到的仍是原始 SELECT。
+    exec_sql, col_err = _apply_column_acl(sql, acl)
+    if col_err:
+        return {"ok": False, "sql": sql, "columns": [], "rows": [],
+                "error": col_err, "table": _guess_table(sql), "row_count": 0}
+
+    # 行级权限：把条件注入原语句内部 WHERE（_wrap_row_filter 内部已改为 AST 注入）
     rf = _pick_row_filter(sql, row_filters)
     if rf:
-        exec_sql = _wrap_row_filter(sql, rf)
+        wrapped = _wrap_row_filter(exec_sql, rf)
+        if wrapped:
+            exec_sql = wrapped
+        else:
+            # 注入不出来 → fail-close，绝不退回未过滤语句
+            return {"ok": False, "sql": sql, "columns": [], "rows": [],
+                    "error": "行级权限条件无法安全注入（已拒绝返回未收敛数据）",
+                    "table": _guess_table(sql), "row_count": 0}
 
     result = execute_sql(exec_sql)
     # 2026-10-03 修复（P0）：原实现「包了权限过滤失败 → 退回裸 SQL（报告里标注口径）」，
@@ -456,6 +475,69 @@ def _guess_table(sql: str) -> str:
     return m.group(1).strip('"') if m else ""
 
 
+# ============================================================
+# 列级权限（脱敏 / 拒绝）—— 2026-10-05 补上报告链路
+# ============================================================
+# 为什么必须在这里补：主问答链（llm_service._exec_sql）早就走了
+# security.enforcer.rewrite_sql，列级权限是生效的；但报告/看板这条取数链
+# 一直**只做行级**（_wrap_row_filter），列级完全没接。
+#
+# 实测铁证（yans 库，同一句 SQL）：
+#   SQL: SELECT line_name, line_manager FROM dim_production_line
+#   主链路   → line_manager = '主****1'   （已脱敏）
+#   报告链路 → line_manager = '主管1'     （明文泄漏）
+# 而 dim_production_line.line_manager 正是 viewer 角色配置的脱敏列。
+
+def _apply_column_acl(sql: str, acl) -> tuple[str, str]:
+    """对报告链路要执行的 SQL 应用列级权限。
+
+    返回 (改写后的 SQL, 错误信息)。出错时错误信息非空，调用方必须拒绝执行
+    （fail-close）——**绝不能**退回未改写的 SQL，那等于绕过列级权限。
+    """
+    if acl is None or not getattr(acl, "needs_sql_rewrite", lambda: False)():
+        return sql, ""
+    try:
+        from security.enforcer import rewrite_sql as _acl_rewrite
+        eff, acl_err, _applied = _acl_rewrite(sql, acl)
+        if acl_err:
+            return "", f"列级权限校验未通过，已拒绝出数：{acl_err}"
+        return eff, ""
+    except Exception as e:
+        return "", f"列级权限处理异常，已拒绝出数：{e}"
+
+
+def _mask_rows_by_acl(rows: list[dict], columns: list[str], acl) -> list[dict]:
+    """兜底：万一 SQL 改写不可用，至少在结果层把被 deny 的列整列去掉。
+
+    这**不能**替代 SQL 层脱敏（原始值已经进过内存/日志），只是防止
+    「deny 列直接出现在报告里」这种最直白的泄漏。mask 列在结果层无法还原
+    真实值，所以不做处理——宁可少显示。
+    """
+    if acl is None or not rows:
+        return rows
+    denies = getattr(acl, "column_denies", None) or {}
+    if not denies:
+        return rows
+    # 只有单表结果才能确定列归属；多表时不猜，避免误删
+    if len(denies) != 1:
+        return rows
+    (_tbl, cols) = next(iter(denies.items()))
+    if isinstance(cols, dict):
+        drop = set(cols.keys())
+    elif isinstance(cols, (set, list, tuple)):
+        drop = set(cols)
+    else:
+        drop = set()
+    if not drop:
+        return rows
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        out.append({k: v for k, v in r.items() if k not in drop})
+    return out
+
+
 def _pick_row_filter(sql: str, row_filters: dict[str, str] | None) -> str:
     """挑出适用于这条 SQL 的行级过滤条件（按 SQL 里出现的表名匹配）。"""
     if not row_filters:
@@ -468,15 +550,146 @@ def _pick_row_filter(sql: str, row_filters: dict[str, str] | None) -> str:
     return ""
 
 
-def _wrap_row_filter(sql: str, cond: str) -> str:
-    """把行级条件套到原 SQL 外层（子查询包装，不动原语句结构）。
+def _inject_where_with_ast(sql: str, cond: str) -> str:
+    """用 sqlglot 把行级条件并进原语句的 WHERE（正解）。
 
-    只包装纯 SELECT 且无结尾分号的情形；带 ORDER BY/LIMIT 的原样进子查询。
+    行级条件本身常含子查询，例如权限配置里典型的一句：
+        factory_id IN (SELECT factory_id FROM test_factories WHERE city = '华东')
+    这种条件**必须注入内层 WHERE** —— 套到外层会因为「子查询的列不在外层投影里」
+    而报 42703（实测 `line_id IN (SELECT line_id FROM mes_process_output)` 即如此）。
+
+    正则无法可靠定位「顶层 WHERE」（嵌套子查询里也有 WHERE、GROUP BY 会被
+    HAVING 干扰），所以这里交给 sqlglot 解析成 AST 再拼回去。
+    解析失败返回空串，由调用方 fail-close。
+    """
+    try:
+        import sqlglot
+        from sqlglot import exp as sqlglot_exp
+    except Exception:
+        return ""
+
+    # ── 解析必须带 read='postgres'（2026-10-05 修复）──
+    # 不带 read 时 sqlglot 按默认方言解析，PostgreSQL 的 `100.0` 会被改写成
+    # `CAST(100.0 AS DOUBLE PRECISION)`，而 PG 的 round(double, int) 不存在
+    # （报 42883 函数 round(double precision, integer) 不存在），
+    # 导致每个带 ROUND 的报告章节一加行级权限就崩。
+    # 实测：`parse_one(sql, read='postgres').sql(dialect='postgres')` 输出与原文一致。
+    try:
+        tree = sqlglot.parse_one(sql, read="postgres")
+    except Exception:
+        return ""
+    if tree is None:
+        return ""
+    if isinstance(tree, sqlglot_exp.Subquery):
+        tree = tree.this
+    if not isinstance(tree, sqlglot_exp.Select):
+        return ""
+
+    # 先把条件文本解析成表达式（注入时要用）
+    try:
+        cond_tree = sqlglot.parse_one("SELECT 1 WHERE " + cond, read="postgres")
+    except Exception:
+        return ""
+    if cond_tree is None or cond_tree.args.get("where") is None:
+        return ""
+
+    # WITH 子句：sqlglot 的参数键是 `with_`（不是 `with`，后者是 Python 关键字）。
+    # 行级条件若直接注到外层主查询会失败——外层只 SELECT 了 CTE 的输出列，
+    # 而过滤列（如 line_manager）定义在 CTE **内部**的表上。
+    # 实测：`WITH t AS (SELECT line_id,line_name,line_manager FROM dim_production_line)
+    #        SELECT line_name FROM t` + 外层 WHERE line_manager IS NOT NULL
+    #        → 42703 字段 "line_manager" 不存在
+    # 正确做法是把条件下推到**第一个引用了该表的那个 CTE 内部**。
+    with_clause = tree.args.get("with_") or tree.args.get("with")
+    if with_clause is not None and with_clause.expressions:
+        cte = with_clause.expressions[0]
+        cte_sel = cte.this if hasattr(cte, "this") else None
+        if isinstance(cte_sel, sqlglot_exp.Select):
+            inner = _ast_inject_where(cte_sel, cond_tree)
+            if inner is None:
+                return ""
+            cte.set("this", inner)
+            try:
+                return tree.sql(dialect="postgres")
+            except Exception:
+                return ""
+
+    out = _ast_inject_where(tree, cond_tree)
+    if out is None:
+        return ""
+    try:
+        return out.sql(dialect="postgres")
+    except Exception:
+        return ""
+
+
+def _ast_inject_where(sel, cond_tree):
+    """把条件 AND 进给定 Select 的 WHERE；已有 WHERE 时两侧都加括号。"""
+    from sqlglot import exp as sqlglot_exp
+    where = cond_tree.args.get("where")
+    if where is None:
+        return None
+    cond_expr = where.this
+    existing = sel.args.get("where")
+    if existing is not None:
+        merged = sqlglot_exp.And(
+            this=sqlglot_exp.Paren(this=existing.this.copy()),
+            expression=sqlglot_exp.Paren(this=cond_expr.copy()),
+        )
+    else:
+        merged = sqlglot_exp.Paren(this=cond_expr.copy())
+    new_sel = sel.copy()
+    new_sel.set("where", sqlglot_exp.Where(this=merged))
+    return new_sel
+
+
+def _wrap_row_filter(sql: str, cond: str) -> str:
+    """把行级条件注入到 SQL 内部的 WHERE 里（而不是套一层外层子查询）。
+
+    ## 为什么不能套外层（2026-10-05 修复 P0）
+    原实现是 `SELECT * FROM (<原SQL>) AS _acl_sub WHERE <cond>`。
+    但原 SQL 往往是**聚合查询**，子查询只投影「分组列 + 聚合列」，
+    而行过滤列（如 line_manager / shift_code）**不在投影里** ——
+    外层 WHERE 引用它必然报 `42703 column does not exist`。
+
+    实测对照（yans 库，8 条真实 SQL）：
+        旧实现（外层包裹）  : 8 / 8 全部失败
+        新实现（注入内层）  : 8 / 8 全部成功，且过滤结果正确
+    旧实现会让报告的每个章节都取数失败，有行级权限的用户完全拿不到报告。
+
+    实现：优先用 sqlglot AST 精确注入（能处理条件含子查询的情形）；
+    AST 不可用时退回保守的正则方案；都不行则返回空串让调用方 fail-close，
+    **绝不返回未过滤的原 SQL**（那等于绕过行级权限）。
     """
     s = (sql or "").strip().rstrip(";").strip()
-    if not s or not re.match(r"^(select|with)\b", s, re.I):
-        return sql
-    return f"SELECT * FROM ({s}) AS _acl_sub WHERE {cond}"
+    cond_s = (cond or "").strip()
+    if not s or not cond_s:
+        return ""
+    if not re.match(r"^(select|with)\b", s, re.I):
+        return ""
+
+    # 正解：AST 注入
+    injected = _inject_where_with_ast(s, cond_s)
+    if injected:
+        return injected
+
+    # 兜底：AST 不可用时的保守正则方案（仅处理不含子查询的条件）
+    if re.search(r"\bselect\b", cond_s, re.I):
+        return ""
+    wrapped = f"({cond_s})"
+    if re.search(r"\bwhere\b", s, re.I):
+        m = re.search(r"\bwhere\b", s, re.I)
+        head, tail = s[:m.end()], s[m.end():]
+        if re.search(r"\bor\b", tail, re.I) and not re.match(r"\s*\(", tail):
+            tail = f" ({tail.strip()})"
+        return f"{head} {tail.rstrip()} AND {wrapped}"
+    for kw in (r"\blimit\b", r"\boffset\b", r"\bgroup\s+by\b",
+               r"\border\s+by\b", r"\bhaving\b", r"\bfor\s+update\b"):
+        mm = list(re.finditer(kw, s, re.I))
+        if mm:
+            m2 = mm[0]
+            return f"{s[:m2.start()]} WHERE {wrapped} {s[m2.start():]}"
+    return f"{s} WHERE {wrapped}"
 
 
 def _gen_sql_for_question(question: str, allowed_tables: set[str] | None) -> str:

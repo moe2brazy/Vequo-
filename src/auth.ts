@@ -35,9 +35,22 @@ export function getToken(): string | null {
 }
 
 export function getUser(): AuthUser | null {
+  // 2026-10-06 修复（P0·登录页闪烁）：原实现只读 localStorage 的 USER_KEY，
+  // **不要求 TOKEN_KEY 同时存在**。于是任何「有用户记录、没 token」的残留状态
+  // （登出被中断 / 旧版本遗留 / 手工清过其中一个 key）都会被判为「已登录」，
+  // App.vue 的 enterWorkspace() 直接切到工作台；工作台首个请求带上这个无效/缺失
+  // 凭证 → 后端 401 → patchFetch 广播 auth:unauthorized → onUnauthorized 跳登录页。
+  // 用户看到的就是「先进工作台，1~2 秒后被弹回登录」。
+  // 用户身份必须与 token 成对存在，否则一律视为未登录。
+  if (!getToken()) return null
   try {
     const raw = localStorage.getItem(USER_KEY)
-    return raw ? (JSON.parse(raw) as AuthUser) : null
+    if (!raw) return null
+    const u = JSON.parse(raw) as AuthUser
+    // 结构性校验：解析成功但字段缺失/类型不对时也当作无身份，
+    // 避免半个对象让界面进入「已登录」外观（右上角出现空用户名、菜单错乱）。
+    if (!u || typeof u !== 'object' || !u.username) return null
+    return u
   } catch {
     return null
   }
@@ -45,6 +58,34 @@ export function getUser(): AuthUser | null {
 
 export function isLoggedIn(): boolean {
   return !!getToken()
+}
+
+/**
+ * 只解析 JWT 载荷做本地有效性预检（**不验签**，签名只能由后端判定）。
+ * 用途：进工作台前先拦掉「token 结构已过期」的情况，避免白进一趟再被 401 弹回。
+ * 解析失败或不是标准 JWT（格式/段数不对、payload 不是 JSON）一律视为无效。
+ */
+export function isTokenFresh(): boolean {
+  const t = getToken()
+  if (!t) return false
+  const parts = t.split('.')
+  if (parts.length !== 3) return false
+  try {
+    // 补 padding：JWT 用的是 base64url（-_ 替�� +/）且省略末尾 =）
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+    const json = decodeURIComponent(
+      atob(b64 + '='.repeat((4 - (b64.length % 4)) % 4))
+        .split('')
+        .map((ch) => '%' + ('00' + ch.charCodeAt(0).toString(16)).slice(-2))
+        .join('')
+    )
+    const payload = JSON.parse(json)
+    if (typeof payload !== 'object' || payload === null) return false
+    if (typeof payload.exp === 'number' && payload.exp * 1000 <= Date.now()) return false
+    return true
+  } catch {
+    return false
+  }
 }
 
 export function isAdmin(): boolean {

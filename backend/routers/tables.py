@@ -1,6 +1,7 @@
 import statistics
 import os
 import re
+import logging
 import tempfile
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Request, Header
 from sqlalchemy.orm import Session
@@ -11,6 +12,8 @@ from agent.field_semantics import explain_field_detailed
 from pydantic import BaseModel
 from typing import Any, Optional, List
 from security import enforcer
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/tables", tags=["数据表"])
 
@@ -859,24 +862,34 @@ def get_overview(authorization: str = Header(None), db: Session = Depends(get_db
     data = _acl_filter_overview(data, authorization)
 
     # 关系数 / 主题数：与各自列表接口（/relationships、/topics）同源，按授权重算，
-    # 保证概览数字与用户实际能打开的内容数量一致；全量用户（guest/admin）保持原值。
-    full, _ = _acl_visible(authorization)
-    if not full:
-        try:
-            from routers.knowledge import _cached
-            rel = _cached("relationships", _build_relationships, db)
+    # 保证概览数字与用户实际能打开的内容数量一致。
+    # 【2026-10-08 修复】原写成 `if not full:` —— 只给受限用户重算，
+    # 而 admin/guest 走 else 分支沿用 _build_overview 里的原值。
+    # 但那个原值算的是「物理外键 + metadata_relationships」，在 yans 库里两者
+    # 分别为 0 条和「表不存在」，于是**管理员看到的关系数恒为 0**，
+    # 与关系图页显示的 14 条自相矛盾。
+    # 现在改为：先算出未过滤的基准值，受限用户再按 ACL 过滤 —— 两条路径口径统一。
+    try:
+        from routers.knowledge import _cached
+        rel = _cached("relationships", _build_relationships, db)
+        full, _ = _acl_visible(authorization)
+        if not full:
             data["data"]["relationship_count"] = len(
                 _acl_filter_relationships(rel, authorization)["relationships"])
-        except Exception:
-            pass
-        try:
-            from routers.knowledge import _cached, _build_scenes
-            scenes = _cached("scenes", _build_scenes, db)
-            topics = _scenes_to_topics(scenes)
+        else:
+            data["data"]["relationship_count"] = len(rel["relationships"])
+    except Exception:
+        logger.warning("关系数重算失败，沿用总览原值", exc_info=True)
+    try:
+        from routers.knowledge import _cached, _build_scenes
+        scenes = _cached("scenes", _build_scenes, db)
+        topics = _scenes_to_topics(scenes)
+        full2, _ = _acl_visible(authorization)
+        if not full2:
             data["data"]["topic_count"] = len(
                 _acl_filter_topics({"topics": topics}, authorization)["topics"])
-        except Exception:
-            pass
+    except Exception:
+        logger.warning("主题数重算失败，沿用总览原值", exc_info=True)
     return data
 
 
@@ -943,24 +956,19 @@ def _build_overview(db: Session) -> dict:
     # 3. 总数据行数（在下方 table_row_counts 估算后统一求和）
     total_rows = 0
     
-    # 4. 表间关系数量（真实外键 + 预定义业务关系；metadata_relationships 可能为空表，
-    #    不能只查它——否则永远 0，取两者之和）
+    # 4. 表间关系数量
+    #    【2026-10-08 修复】原实现三处except: pass 静默吞异常：yans 库物理外键实测 0 条、
+    #    metadata_relationships 表根本不存在，两个查询各抛 UndefinedTable 后各贡献 0，
+    #    于是总览卡片恒显示 0，而关系图页面（_build_relationships 的 inferred 推导）显示 14 条
+    #    —— 同一页面两个数字自相矛盾，根因就是这两个except 把问题藏了。
+    #    现在直接复用 _build_relationships 的同一口径（与 get_overview 里的 ACL 重算一致），
+    #    并把异常记进日志，不再静默。
     relationship_count = 0
     try:
-        fk_count = db.execute(text("""
-            SELECT COUNT(*) FROM information_schema.table_constraints tc
-            WHERE tc.constraint_type = 'FOREIGN KEY'
-              AND tc.table_schema NOT IN ('information_schema', 'performance_schema', 'mysql', 'sys', 'pg_catalog')
-              AND tc.table_schema NOT LIKE 'pg_%'
-        """)).scalar() or 0
-        relationship_count += int(fk_count)
+        rel = _build_relationships(db)
+        relationship_count = len(rel["relationships"])
     except Exception:
-        pass
-    try:
-        meta_count = db.execute(text('SELECT COUNT(*) FROM metadata_relationships')).scalar() or 0
-        relationship_count += int(meta_count)
-    except Exception:
-        pass
+        logger.warning("表间关系数统计失败（总览卡片将显示 0）", exc_info=True)
     
     # 5. 分析主题数量：轻量调用主题引擎（只数主题数，不构建对象/字段翻译层级，
     #    避免 overview 每次请求都要全库生成字段翻译导致十几秒卡顿 → 前端卡片显示 0）

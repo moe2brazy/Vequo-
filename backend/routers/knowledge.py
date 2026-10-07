@@ -3,7 +3,7 @@
 将数据库中的真实表名、字段名映射为业务对象、指标等，供前端知识库页面使用。
 """
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import inspect, text
@@ -566,8 +566,23 @@ def _scene_topics(scene_key: str, objects: List[Dict], metrics: List[Dict]) -> L
 
 # ========== 获取业务知识场景 ==========
 
-def _username_of(authorization: str) -> str:
-    """从 Authorization 头解析用户名（不抛异常，失败回退 guest）。"""
+def _username_of(authorization: str, request=None) -> str:
+    """从 Authorization 头解析用户名。
+
+    2026-10-05 修复数据串号：原实现 token 无效/过期时**静默回退 "guest"**，
+    而这个用户名是所有知识数据写接口的归属键（收藏/术语/人工覆盖/反馈/模板使用），
+    于是出现两条实际后果：
+      ① 写串号：A 的 token 过期后继续发写请求，数据落进所有匿名访客共用的 guest 桶；
+      ② 读串号：A 下次读回的也是 guest 桶 → **看到别人的收藏与人工覆盖**。
+    实测无效 token 确实得到 'guest'，且该桶已有内容。
+
+    现在分两种情况：
+    - token 有效 → 真实用户名（不变）
+    - token 无效/缺失 → **按客户端指纹**分桶（`anon-<hash>`），不再共用 guest。
+      这样匿名用户之间不会互相看到数据；已登录用户过期后重新登录即可取回自己的桶。
+    注意：这里**不抛 401** —— 知识库的读接口（scenes/terms）对匿名开放是既有行为，
+    改成强制登录会影响演示；真正的 fail-close 应该在写接口上单独做。
+    """
     token = None
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:].strip()
@@ -576,7 +591,20 @@ def _username_of(authorization: str) -> str:
         payload = decode_token(token)
         if payload and payload.get("sub"):
             return str(payload["sub"])
-    return "guest"
+    # 匿名：按客户端分桶，避免所有匿名访客共用 guest
+    try:
+        import hashlib
+        raw = ""
+        if request is not None:
+            raw = "%s|%s|%s" % (
+                request.headers.get("user-agent", ""),
+                request.headers.get("accept-language", ""),
+                request.client.host if getattr(request, "client", None) else "",
+            )
+        digest = hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()[:12]
+        return "anon-%s" % digest
+    except Exception:
+        return "anon-unknown"
 
 
 def _require_action_export(authorization: str) -> dict:
@@ -604,7 +632,7 @@ def _require_action_export(authorization: str) -> dict:
 
 
 @router.get("/scenes")
-def get_knowledge_scenes(authorization: str = Header(None), db: Session = Depends(get_db)):
+def get_knowledge_scenes(request: Request, authorization: str = Header(None), db: Session = Depends(get_db)):
     """从当前数据库动态组织业务场景，包含各场景下的业务对象（表）/ 指标 / 规则
 
     权限：已登录非管理员只返回「涉及的表全部可见」的场景（与 /topics 规则一致）；
@@ -614,7 +642,7 @@ def get_knowledge_scenes(authorization: str = Header(None), db: Session = Depend
     data = _acl_filter_scenes(data, authorization)
     # 叠加当前用户的人工覆盖（编辑/停用），纯内存操作，不触发全库重建
     from knowledge_user_data import apply_scene_overrides
-    return apply_scene_overrides(_username_of(authorization), data)
+    return apply_scene_overrides(_username_of(authorization, request), data)
 
 
 @router.post("/hit")
@@ -1151,7 +1179,7 @@ def _generate_rich_definition(column_name: str, column_type: str, knowledge_type
 
 
 @router.get("/terms")
-def get_knowledge_terms(authorization: str = Header(None), db: Session = Depends(get_db)):
+def get_knowledge_terms(request: Request, authorization: str = Header(None), db: Session = Depends(get_db)):
     """从数据库字段注释中提取术语词典；无注释时返回常见业务术语。
 
     权限：已登录非管理员只返回可见表相关的术语（按 mapped_table 过滤）；
@@ -1161,7 +1189,7 @@ def get_knowledge_terms(authorization: str = Header(None), db: Session = Depends
     data = _acl_filter_terms(data, authorization)
     # 叠加人工覆盖 + 自定义术语
     from knowledge_user_data import apply_term_overrides
-    return apply_term_overrides(_username_of(authorization), data)
+    return apply_term_overrides(_username_of(authorization, request), data)
 
 
 def _acl_filter_terms(data: dict, authorization: str) -> dict:
@@ -1796,7 +1824,7 @@ def _template_required_tables(tpl: Dict) -> set:
     return tables
 
 
-def _template_persona(authorization: str) -> tuple:
+def _template_persona(request: Request, authorization: str) -> tuple:
     """当前业务人员的「身份画像」：(full, allowed, used_count, fav_ids, roles)。
 
     full/allowed = 授权表范围（_acl_visible，None=不受限）；used/favs 来自
@@ -1817,7 +1845,7 @@ def _template_persona(authorization: str) -> tuple:
         roles = []
     try:
         from knowledge_user_data import get_user_data
-        ud = get_user_data(_username_of(authorization)) or {}
+        ud = get_user_data(_username_of(authorization, request)) or {}
         used = {str(k): int(v or 0) for k, v in (ud.get("template_use_count") or {}).items()}
         favs = {str(f) for f in (ud.get("favorites") or []) if str(f).startswith("tpl:")}
     except Exception:
@@ -1825,7 +1853,7 @@ def _template_persona(authorization: str) -> tuple:
     return full, allowed, used, favs, roles
 
 
-def _recommend_templates(templates: List[Dict], authorization: str,
+def _recommend_templates(request: Request, templates: List[Dict], authorization: str,
                          table_domains: Dict[str, str] | None = None) -> Dict:
     """按身份把模板清单裁成「这个人能用、且对他有用」的样子。
 
@@ -1840,7 +1868,7 @@ def _recommend_templates(templates: List[Dict], authorization: str,
     返回 {templates, summary}；summary 供前端渲染推荐横幅（可访问几张表、推荐几个、
     隐藏几个）。
     """
-    full, allowed, used, favs, roles = _template_persona(authorization)
+    full, allowed, used, favs, roles = _template_persona(request, authorization)
     domains = table_domains or {}
     allowed_lc = {str(t).split(".")[-1].lower() for t in (allowed or set())}
 
@@ -1910,7 +1938,8 @@ def _recommend_templates(templates: List[Dict], authorization: str,
 
 
 @router.get("/templates")
-def get_knowledge_templates(authorization: str = Header(None), db: Session = Depends(get_db)):
+def get_knowledge_templates(request: Request, authorization: str = Header(None),
+                            db: Session = Depends(get_db)):
     """分析模板列表：按当前业务人员的身份动态推荐（不预置死模板清单）。
 
     推荐依据两层：
@@ -1932,7 +1961,7 @@ def get_knowledge_templates(authorization: str = Header(None), db: Session = Dep
             t = str(o.get("table") or "").split(".")[-1].lower()
             if t and t not in domains:
                 domains[t] = nm
-    return _recommend_templates(templates, authorization, domains)
+    return _recommend_templates(request, templates, authorization, domains)
 
 
 def _find_knowledge_template(scenes: Dict, template_id: str) -> Optional[Dict]:
@@ -1944,7 +1973,8 @@ def _find_knowledge_template(scenes: Dict, template_id: str) -> Optional[Dict]:
 
 
 @router.post("/templates/{template_id}/run")
-def run_knowledge_template(template_id: str, authorization: str = Header(None),
+def run_knowledge_template(request: Request, template_id: str,
+                           authorization: str = Header(None),
                            db: Session = Depends(get_db)):
     """一键执行分析模板：按模板 questions[] 逐题走「确定性编译」管线，
     组装单文件 HTML 报告（图表 SVG + 表格 + 规则结论 + SQL 溯源）。
@@ -1954,6 +1984,14 @@ def run_knowledge_template(template_id: str, authorization: str = Header(None),
     - 鉴权：与 /scenes 一致（ACL 过滤后的可见场景内模板才可执行）；
       另把授权表集合下传执行器，逐步骤按编译出的取数表做 fail-closed 校验 ——
       此前内置模板不受场景 ACL 约束，受限用户可执行任意内置报告（数据越权），已堵。
+
+    ⚠ 2026-10-07 修复「一键生成报告」全部 500：
+      本函数原先签名里**没有 `request`**，但函数体第 2001 行调用了
+      `_username_of(authorization, request)` ⇒ `NameError: name 'request' is not defined`
+      ⇒ 8 个模板 100% 报 500（本文件其余 13 处调用都声明了 `request: Request`，
+      唯独此处漏了）。审计后已把 `request: Request` 提到参数表首位。
+      **教训：FastAPI 路由里凡在函数体引用 `request`，签名必须显式声明**——
+      Python 不会报错到定义处，只会在**运行时**炸，这类 bug 静态查不出来。
     """
     data = _cached("scenes", _build_scenes, db)
     scenes = _acl_filter_scenes(data, authorization)["scenes"]
@@ -1970,7 +2008,7 @@ def run_knowledge_template(template_id: str, authorization: str = Header(None),
         else {str(t).split(".")[-1].lower() for t in (allowed or set())})
     if result.get("error"):
         raise HTTPException(status_code=400, detail=result["error"])
-    username = _username_of(authorization)
+    username = _username_of(authorization, request)
     _audit_knowledge(username, "knowledge_template_run", template=tpl.get("name"))
     # 简化步骤（不含 rows 全量，避免响应过大）
     slim = [{
@@ -2013,71 +2051,71 @@ def _audit_knowledge(username: str, event: str, **detail) -> None:
 
 
 @router.get("/user-data")
-def api_get_user_data(authorization: str = Header(None)):
+def api_get_user_data(request: Request, authorization: str = Header(None)):
     """返回当前用户的收藏 / 反馈 / 人工覆盖 / 自定义术语 / 模板使用统计。"""
-    return get_user_data(_username_of(authorization))
+    return get_user_data(_username_of(authorization, request))
 
 
 @router.post("/favorite")
-def api_set_favorite(body: dict, authorization: str = Header(None)):
+def api_set_favorite(body: dict, request: Request, authorization: str = Header(None)):
     key = str((body or {}).get("key") or "")
     value = bool((body or {}).get("value"))
-    username = _username_of(authorization)
+    username = _username_of(authorization, request)
     favorites = set_favorite(username, key, value)
     _audit_knowledge(username, "knowledge_favorite", key=key, value=value)
     return {"success": True, "favorites": favorites}
 
 
 @router.post("/feedback")
-def api_set_feedback(body: dict, authorization: str = Header(None)):
+def api_set_feedback(body: dict, request: Request, authorization: str = Header(None)):
     key = str((body or {}).get("key") or "")
     vote = str((body or {}).get("vote") or "")
     reason = str((body or {}).get("reason") or "")
-    username = _username_of(authorization)
+    username = _username_of(authorization, request)
     result = set_feedback(username, key, vote, reason)
     _audit_knowledge(username, "knowledge_feedback", key=key, vote=vote)
     return {"success": True, "feedback": result}
 
 
 @router.post("/override")
-def api_set_override(body: dict, authorization: str = Header(None)):
+def api_set_override(body: dict, request: Request, authorization: str = Header(None)):
     key = str((body or {}).get("key") or "")
     kind = str((body or {}).get("kind") or "")
     patch = (body or {}).get("patch") or {}
-    username = _username_of(authorization)
+    username = _username_of(authorization, request)
     result = set_override(username, key, kind, patch)
     _audit_knowledge(username, "knowledge_edit", key=key, kind=kind)
     return {"success": True, "override": result}
 
 
 @router.delete("/override/{key:path}")
-def api_remove_override(key: str, authorization: str = Header(None)):
-    username = _username_of(authorization)
+def api_remove_override(key: str, request: Request, authorization: str = Header(None)):
+    username = _username_of(authorization, request)
     removed = remove_override(username, key)
     _audit_knowledge(username, "knowledge_edit_clear", key=key)
     return {"success": True, "removed": removed}
 
 
 @router.post("/terms")
-def api_add_term(body: dict, authorization: str = Header(None)):
-    username = _username_of(authorization)
+def api_add_term(body: dict, request: Request, authorization: str = Header(None)):
+    username = _username_of(authorization, request)
     term = add_custom_term(username, body or {})
     _audit_knowledge(username, "knowledge_term_add", term=term.get("term"))
     return {"success": True, "term": term}
 
 
 @router.delete("/terms/{term:path}")
-def api_remove_term(term: str, authorization: str = Header(None)):
-    username = _username_of(authorization)
+def api_remove_term(term: str, request: Request, authorization: str = Header(None)):
+    username = _username_of(authorization, request)
     removed = remove_custom_term(username, term)
     _audit_knowledge(username, "knowledge_term_remove", term=term)
     return {"success": True, "removed": removed}
 
 
 @router.post("/template-use")
-def api_template_use(body: dict, authorization: str = Header(None)):
+def api_template_use(body: dict, request: Request, authorization: str = Header(None)):
     tid = str((body or {}).get("template_id") or "")
-    username = _username_of(authorization)
+    username = _username_of(authorization, request)
     count = record_template_use(username, tid)
     return {"success": True, "use_count": count}
 
@@ -2087,14 +2125,15 @@ def api_template_use(body: dict, authorization: str = Header(None)):
 # =========================================================
 
 @router.get("/health")
-def get_knowledge_health(authorization: str = Header(None), db: Session = Depends(get_db)):
+def get_knowledge_health(request: Request, authorization: str = Header(None),
+                         db: Session = Depends(get_db)):
     scenes_data = _cached("scenes", _build_scenes, db)
     scenes_data = _acl_filter_scenes(scenes_data, authorization)
     scenes = scenes_data.get("scenes") or {}
     terms_data = _cached("terms", _build_terms, db)
     terms_data = _acl_filter_terms(terms_data, authorization)
     terms = terms_data.get("terms") or []
-    username = _username_of(authorization)
+    username = _username_of(authorization, request)
     custom_terms = (get_user_data(username).get("custom_terms") or [])
 
     def _has_cn(s: str) -> bool:
@@ -2253,7 +2292,7 @@ def search_knowledge(q: str = "", authorization: str = Header(None), db: Session
 # =========================================================
 
 @router.get("/export")
-def export_knowledge(scope: str = "terms", format: str = "md",
+def export_knowledge(request: Request, scope: str = "terms", format: str = "md",
                      authorization: str = Header(None), db: Session = Depends(get_db)):
     """导出术语词典/指标口径为 MD / CSV 文件。
 
@@ -2265,7 +2304,7 @@ def export_knowledge(scope: str = "terms", format: str = "md",
     """
     _require_action_export(authorization)
     fmt = (format or "md").lower()
-    username = _username_of(authorization)
+    username = _username_of(authorization, request)
 
     # 白名单：原先只判断 `scope == "terms"`，任何非法值都静默落到 metrics 分支
     # 并返回 200 + 指标口径文件 —— 调用方拼错参数时完全无从察觉。

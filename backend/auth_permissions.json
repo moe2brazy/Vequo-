@@ -85,7 +85,7 @@
       "rows": {},
       "columns": {
         "dim_production_line": {
-          "supervisor": {
+          "line_manager": {
             "mode": "mask",
             "note": "负责人姓名脱敏",
             "mask": "partial_1_1",
@@ -112,7 +112,7 @@
       "test_materials.unit_cost",
       "test_orders.unit_price",
       "test_orders.customer_name",
-      "dim_production_line.supervisor"
+      "dim_production_line.line_manager"
     ],
     "metrics": [
       "产量"
@@ -122,7 +122,7 @@
       "inventory"
     ]
   },
-  "updated_at": "2026-10-07T08:42:46.897572+00:00",
+  "updated_at": "2026-10-07T08:43:32.683249+00:00",
   "updated_by": "admin",
   "user_grants": {
     "viewer": {
@@ -326,6 +326,25 @@
         "workshop_name",
         "line_manager",
         "line_status"
+      ],
+      "eqp_downtime_record": [
+        "downtime_id",
+        "equipment_id",
+        "line_id",
+        "start_time",
+        "end_time",
+        "downtime_minutes",
+        "downtime_reason",
+        "is_planned"
+      ],
+      "inv_inventory_snapshot": [
+        "snapshot_id",
+        "snapshot_date",
+        "product_id",
+        "warehouse_code",
+        "available_qty",
+        "frozen_qty",
+        "safety_stock_qty"
       ]
     }
   },

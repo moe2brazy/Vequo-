@@ -103,8 +103,11 @@ def _seed_model() -> dict:
                 "tables": [],
                 "rows": {},
                 "columns": {
-                    "dim_production_line": {"supervisor": {"mode": "mask", "mask": "partial_1_1",
-                                                           "note": "负责人姓名脱敏"}},
+                    #列名必须是真实 schema 里的列：dim_production_line 的负责人列
+                    # 是 line_manager（曾误写成 supervisor，该列不存在于表中，
+                    # 导致脱敏配置静默失效、负责人姓名明文外泄）。
+                    "dim_production_line": {"line_manager": {"mode": "mask", "mask": "partial_1_1",
+                                                             "note": "负责人姓名脱敏"}},
                     "test_materials": {"unit_cost": {"mode": "deny", "note": "成本价对普通员工不可见"}},
                 },
                 "metrics": {},
@@ -135,7 +138,7 @@ def _seed_model() -> dict:
         },
         "sensitive": {
             "columns": ["test_materials.unit_cost", "test_orders.unit_price",
-                        "test_orders.customer_name", "dim_production_line.supervisor"],
+                        "test_orders.customer_name", "dim_production_line.line_manager"],
             "metrics": ["产量"],
             "datasets": ["sales", "inventory"],
         },
@@ -400,6 +403,63 @@ def _ensure_shape(model: dict) -> dict:
     policies = model.get("policies") or {}
     model["policies"] = {str(k): _normalize_policy(v) for k, v in policies.items()}
     return model
+
+
+def audit_dangling_columns(model: dict) -> list[str]:
+    """体检：列出「配置里引用了、但当前库里不存在」的表与列。
+
+    【2026-10-08 新增】背景：曾把 dim_production_line 的负责人列误配成
+    `supervisor`（真实列名是 `line_manager`），而引擎层只按配置里的列名做脱敏，
+    于是「界面显示已配置脱敏、实际零效果」，负责人姓名明文外泄——且不报错。
+    这类静默失效只能靠「配置 × 真实 schema」对账才能发现，故加此体检函数。
+
+    设计取舍：**只告警、不自动删除**。自动删会把「配错了」变成「配错了也没人知道」，
+    反而更难排查；保留悬空项 + 明确告警，才能让人去改对。
+
+    返回 human-readable 告警列表；库不可用或表不存在时静默跳过（体检不应影响主流程）。
+    """
+    warnings: list[str] = []
+    try:
+        # 复用项目自己的连接获取方式（不要自己拼 URL：多profile/切库时
+        # 真实连接由 database.get_db 持有，自造 URL 会连错库或连不上）
+        from sqlalchemy import text
+        from database import get_db
+        db = next(get_db())
+        try:
+            rows = db.execute(text(
+                "select table_name, column_name from information_schema.columns"
+                " where table_schema = 'public'"
+            )).fetchall()
+        finally:
+            db.close()
+        real: dict[str, set[str]] = {}
+        for t, c in rows:
+            real.setdefault(str(t).lower(), set()).add(str(c).lower())
+    except Exception:
+        return warnings  # 体检不可用时不得影响主流程
+
+    def _check(where: str, table: str, column: str) -> None:
+        t = str(table).lower()
+        if t not in real:
+            return  # 表本身不存在：多库/多profile 场景常见，不在此处刷屏
+        if str(column).lower() not in real[t]:
+            warnings.append(f"{where}: 列「{table}.{column}」在当前库中不存在，"
+                            f"该条{mode_hint(where)}配置不会生效")
+
+    def mode_hint(where: str) -> str:
+        return "脱敏" if "columns" in where or "sensitive" in where else "权限"
+
+    # 1) 各角色 columns 策略里的列（mask / deny）
+    for role_key, pol in (model.get("policies") or {}).items():
+        for table, cols in ((pol or {}).get("columns") or {}).items():
+            for col in (cols or {}):
+                _check(f"policies.{role_key}.columns", table, col)
+    # 2) 敏感列清单
+    for item in model.get("sensitive", {}).get("columns", []) or []:
+        parts = str(item).split(".")
+        if len(parts) == 2:
+            _check("sensitive.columns", parts[0], parts[1])
+    return warnings
 
 
 def save_model(model: dict, actor: str = "") -> dict:

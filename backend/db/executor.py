@@ -188,9 +188,23 @@ _BLOCKED_FILE_WRITE = re.compile(
     r"\bINTO\s+(OUTFILE|DUMPFILE)\b",
     re.IGNORECASE,
 )
-# PG 的 SELECT ... INTO newtable（建表，无任何写操作关键词，会被 SELECT 开头规则放行）
+# PG 的 SELECT ... INTO newtable（建表，无任何写操作关键词，会被SELECT 开头规则放行）
+#
+# 【2026-10-08 修复】原正则要求 INTO 后紧跟表名：
+#     INTO\s+[A-Za-z_][A-Za-z0-9_."]*\s*(,|FROM...)
+# 但 PG 允许在表名之前插入持久性修饰符，实测以下三种变体全部绕过只读闸门，
+# 且在 PG侧**真的建出了表**（回滚事务内验证 SELECT count(*) FROM _evil 成功）：
+#     SELECT * INTO TEMP _evil FROM t
+#     SELECT * INTO TEMPORARY TABLE _evil FROM t
+#     SELECT * INTO UNLOGGED _evil FROM t
+# 因此这里必须先把可选修饰符（TEMP / TEMPORARY / TEMP TABLE / UNLOGGED / GLOBAL /
+# LOCAL，以及它们的任意组合与重复）整体吃掉，再匹配真实表名。
+#
+# 修饰符清单依据 PG 文档 SELECT INTO 的persistence_clause：
+#   [ [ GLOBAL | LOCAL ] { TEMPORARY | TEMP } | UNLOGGED ] TABLE [ IF NOT EXISTS ] new_table
+_INTO_PERSISTENCE = r"(?:(?:GLOBAL|LOCAL)\s+)?(?:(?:TEMPORARY|TEMP)\s+)?(?:TABLE\s+)?(?:UNLOGGED\s+)?(?:TABLE\s+)?(?:IF\s+NOT\s+EXISTS\s+)?"
 _BLOCKED_SELECT_INTO = re.compile(
-    r"\bSELECT\b[\s\S]*?\bINTO\s+[A-Za-z_][A-Za-z0-9_.\"]*\s*(,|FROM\b|FROM\s)",
+    r"\bSELECT\b[\s\S]*?\bINTO\s+" + _INTO_PERSISTENCE + r"[A-Za-z_][A-Za-z0-9_.\"]*\s*(,|FROM\b|FROM\s)",
     re.IGNORECASE,
 )
 # 分号拼接多条语句：分号后还有非空白内容（允许结尾分号）

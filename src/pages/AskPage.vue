@@ -677,9 +677,8 @@
         <span class="text-xs text-gray-400">系统默认：{{ llmDefault.model }}</span>
         <button
           @click="restoreDefault"
-          :disabled="llmRestoring || !canManageLlm"
+          :disabled="llmRestoring"
           class="px-3 py-1.5 border border-gray-200 text-gray-500 rounded-lg text-xs hover:bg-gray-50 transition disabled:opacity-50"
-          :title="canManageLlm ? '' : '仅管理员可恢复默认'"
         >
           {{ llmRestoring ? '恢复中...' : '↺ 恢复默认' }}
         </button>
@@ -689,17 +688,15 @@
       <div class="flex items-center gap-2 mt-4">
         <button
           @click="testLlmConfig"
-          :disabled="llmTesting || !canManageLlm"
+          :disabled="llmTesting"
           class="flex-1 px-4 py-2 border border-gray-200 text-gray-600 rounded-lg text-sm hover:bg-gray-50 transition disabled:opacity-50"
-          :title="canManageLlm ? '' : '仅管理员可测试连接'"
         >
           {{ llmTesting ? '测试中...' : '测试连接' }}
         </button>
         <button
           @click="saveLlmConfig"
-          :disabled="llmSaving || !canManageLlm"
+          :disabled="llmSaving"
           class="flex-1 px-4 py-2 bg-gradient-to-r from-primary to-primary-dark text-white rounded-lg text-sm font-medium hover:opacity-90 transition disabled:opacity-50"
-          :title="canManageLlm ? '' : '仅管理员可保存配置'"
         >
           {{ llmSaving ? '保存中...' : '保存并启用' }}
         </button>
@@ -717,7 +714,7 @@ import ModalDialog from '../components/ModalDialog.vue'
 import MetricClarifyCard from '../components/MetricClarifyCard.vue'
 import MetricDefineCard from '../components/MetricDefineCard.vue'
 import AnalysisConfirmDialog from '../components/AnalysisConfirmDialog.vue'
-import { getUser, isAdmin } from '../auth'
+import { getUser } from '../auth'
 import { pruneLocalStorage } from '../storage'
 // ========== 模型配置 ==========
 const modelDialogVisible = ref(false)
@@ -745,9 +742,15 @@ const llmForm = reactive({
 
 // 模型服务：优先从后端 /api/llm/providers 动态加载（含 Ollama 本地模型等新供应商），
 // 加载失败时回退到内置列表（保证功能可用）。
-// 保存/测试/恢复默认等写操作仅 admin 可用（后端 require_roles("admin")），
-// 非管理员打开弹窗为只读展示，避免提交后 403 假失败。
-const canManageLlm = computed(() => isAdmin())
+// 2026-10-07：保存/测试/恢复默认已放开为「**只需登录**」（后端从
+// require_roles("admin") 改为 require_login()），任何账号都能自己换模型。
+// 前端原有的 canManageLlm（= isAdmin()）连同按钮 disabled / title 三元、
+// 「仅管理员可修改（当前只读）」提示、非管理员只读分支**已一并删除**——
+// 放开权限后它们恒为真或不可达，留着是误导性死代码。
+// ⚠ 配置是**全局单份**（后端 config.update_llm_config 写 .env，全进程共享）：
+//    任一账号保存后对**所有账号**生效。这是本次的既定取舍（赶时间，优先方便）。
+//    若日后要按账号隔离，须后端按 username 存配置、问数链路按当前用户读取，
+//    单纯在前端加回判断没用。
 interface ProviderOpt {
   name: string
   label: string
@@ -805,11 +808,9 @@ const openModelDialog = async () => {
   //（并行执行会在列表为空时误判为"自定义"）
   await loadProviders()
   await loadLlmConfig()
-  // 非管理员只读提示（写操作后端仅允许 admin，先说明避免 403 假失败）
-  if (!canManageLlm.value) {
-    llmSuccess.value = true
-    llmMessage.value = '模型配置为系统级设置，仅管理员可修改/测试（当前只读）。'
-  }
+  // 2026-10-07：模型配置已放开为「只需登录」，不再有只读态。
+  // 原逻辑：非管理员时提示「仅管理员可修改/测试（当前只读）」——
+  //   canManageLlm 现恒为 true，该分支自然不再进入，但文案会误导，故一并移除。
 }
 
 // 选择服务时帮用户写好 base_url 与示例模型，并按厂商适配温度（Kimi 需 temperature=1）

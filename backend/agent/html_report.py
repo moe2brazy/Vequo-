@@ -273,15 +273,20 @@ def _build_flow_svg(rels: list[dict], labels: dict[str, str]) -> str:
 
 
 def build_html_report(db: Session, allowed_tables: set[str] | None = None,
-                      row_filters: dict[str, str] | None = None) -> str:
+                      row_filters: dict[str, str] | None = None,
+                      acl=None) -> str:
     """生成单文件 HTML 数据总览报告（标签页 + 流程图 + 颜色高亮）。
 
     权限过滤（安全关键）：
     - allowed_tables 非 None 时，报告只统计/展示/总结用户有权访问的表（越权表不出现）；
     - row_filters 提供时，样例数据查询注入行级 WHERE 条件（仅返回用户可见行）；
-    - 关系图只保留两端都有权限的边。
+    - 关系图只保留两端都有权限的边；
+    - **acl（2026-10-05 新增）**：样例数据的列级脱敏/列拒绝。缺了它报告里
+      会出现被脱敏列的明文，且这些明文还会进 LLM prompt。
     调用方需按 ACL 指纹做缓存隔离，避免不同权限用户共享缓存越权。
     """
+    # 延迟导入避免循环依赖（question_report 不依赖本模块）
+    from agent.question_report import _apply_column_acl
     # ── 数据准备 ──
     from db.executor import get_table_row_counts, execute_sql
     from db.tools import get_real_tables
@@ -348,12 +353,27 @@ def build_html_report(db: Session, allowed_tables: set[str] | None = None,
     except Exception:
         rels = []
     # 样例数据（前 6 表）：按行级权限注入 WHERE 条件（仅返回用户可见行）
+    #
+    # 2026-10-05 修复（P0）：原实现是 `SELECT *` + 只做行级过滤，**列级脱敏完全没接**。
+    # 后果有两层，比单纯的「报告里显示明文」更严重：
+    #   ① 样例行直接进 HTML 报告 → 用户下载的 Word/PDF 里是被脱敏列的明文；
+    #   ② 样例行还会被拼进 LLM prompt 的「关键数据摘要」→ 敏感数据出境到模型侧。
+    # 现在：列级走 enforcer.rewrite_sql（与主问答链一致），且把 SELECT * 换成
+    # 显式列清单 —— 即便 ACL 没配列规则，也不会把整表所有列无条件送出去。
     samples = []
     for t in tables_info[:6]:
         try:
             name = t["name"]
             qname = quote_ident(name) if "." not in name else \
                 f'{quote_ident(name.split(".", 1)[0])}.{quote_ident(name.split(".", 1)[1])}'
+            # 显式列清单：优先用 tables_info 里已有的 columns，退化才回退 SELECT *
+            raw_cols = [c.get("name") for c in (t.get("columns") or []) if c.get("name")]
+            if not raw_cols:
+                continue
+            # 列过多时只取前 12 列，避免 prompt 爆炸
+            sel_cols = raw_cols[:12]
+            sel_list = ", ".join(quote_ident(c) for c in sel_cols)
+            base_sql = f"SELECT {sel_list} FROM {qname}"
             row_cond = ""
             if row_filters:
                 _rf = row_filters.get(name) or row_filters.get(name.split(".")[-1])
@@ -361,9 +381,15 @@ def build_html_report(db: Session, allowed_tables: set[str] | None = None,
                     valid, _err, _clean = validate_sql_safety(f"SELECT 1 WHERE {_rf}")
                     if valid:
                         row_cond = f" WHERE {_rf}"
-            r = execute_sql(f"SELECT * FROM {qname}{row_cond} LIMIT 3")
+            sample_sql = f"{base_sql}{row_cond} LIMIT 3"
+            # 列级权限：与主链共用 enforcer，失败即拒绝出数（不退回未脱敏语句）
+            sample_sql, col_err = _apply_column_acl(sample_sql, acl)
+            if col_err:
+                continue
+            r = execute_sql(sample_sql)
             if r["success"] and r["rows"]:
-                samples.append({"table": t["alias"], "name": name, "rows": r["rows"], "columns": r["columns"]})
+                samples.append({"table": t["alias"], "name": name,
+                                "rows": r["rows"], "columns": r["columns"]})
         except Exception:
             pass
 

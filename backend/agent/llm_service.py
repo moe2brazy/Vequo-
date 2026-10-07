@@ -11,6 +11,7 @@ import os
 import queue
 import re
 import time
+import datetime
 import functools
 import sys
 import threading
@@ -813,6 +814,229 @@ _S_GROUPBY_RE = re.compile(
     r"(?is)(?<![A-Za-z])GROUP\s+BY\s+(.*?)(?=\bORDER\s+BY\b|\bHAVING\b|\bLIMIT\b|$)")
 # 问句里显式点名的列名：(line_id) / （qty_produced）—— 只认纯 ASCII 标识符
 _S_COL_HINT_RE = re.compile(r"[（(]\s*([a-z_][a-z0-9_]*)\s*[）)]")
+
+
+# ── 并列指标补列（2026-10-06，q12 Q3 端到端实测驱动）──────────────────
+# 现象：问「各车间的非计划停机**次数和总时长**分别是多少」，
+#      实得投影 = ['车间', '非计划停机次数'] —— **只给了次数，漏了总时长**。
+# 为什么必须确定性修而不是让守卫拦：
+#   守卫只能退回重生成，而模型重生成仍可能只投影一个指标；
+#   用户问的是两个数、只给一个属于**答非所问**，而且表格里看不出少了东西。
+#   这与既有 `_fix_explicit_col_select`（SELECT * 补列）同族，
+#   区别是触发源是**问句里的并列指标词**而非括号里的点名列。
+#
+# 指标短语 → 可加和度量列的映射（刻意保守：只认「指标词 + 明确度量列名」，
+# 不做「分钟数→downtime_minutes」这类纯语义推断——那属于选表，不归本步骤）。
+# 指标短语 → 可加和度量列。只认「问句明确点到这个指标名」，
+# 不做「分钟数 → downtime_minutes」这类纯语义推断 —— 那是选表，不归本步骤。
+_PARALLEL_METRIC_MAP = (
+    (r"(?:总)?(?:停机)?分钟|停机时长|停机时间|时长|分钟数",
+     ("downtime_minutes",)),
+    (r"不良数|不良量|不良数量|缺陷数|缺陷数量|缺陷总数|不良品数",
+     ("defect_qty",)),
+    (r"产量|产出量|产出数量|合格数|良品数|产出数", ("good_qty",)),
+    (r"投入量|投入数量|投入数|投入总数|上机数", ("input_qty",)),
+    (r"抽样数|抽检数量|样本数|样品数", ("sample_qty",)),
+    (r"返工数|返工量|返工数量", ("rework_qty",)),
+)
+
+# 并列连接词：问句里分隔两个及以上指标的地方
+_PARALLEL_SPLIT_RE = re.compile(r"(?:和|与|以及|、|＋|\+|及)")
+
+
+def _tables_in_sql(sql: str):
+    """抽 SQL 已引用的表名（裸表名，去 schema 前缀），保持出现顺序。"""
+    out = []
+    for m in re.finditer(r"(?:FROM|JOIN)\s+([\w.]+)", sql, re.I):
+        t = m.group(1).split(".")[-1].strip('"')
+        if re.match(r"^[A-Za-z_][\w]*$", t) and t not in out:
+            out.append(t)
+    return out
+
+
+_EXISTING_NUMCOLS_CACHE: dict = {}
+
+
+def _existing_numeric_columns(tables) -> dict:
+    """查这些表里真实存在的数值列，返回 {"表": {列名小写, ...}}。
+
+    缓存 key = 表名元组。用于两件事：
+      ① 补出来的列必须真实存在（不能编列名）；
+      ② 判断度量列归属哪张表（决定补 `SUM(别名.列)` 里的别名）。
+    """
+    global _EXISTING_NUMCOLS_CACHE
+    tl = [t for t in tables if re.match(r"^[A-Za-z_][\w]*$", t)]
+    if not tl:
+        return {}
+    key = tuple(sorted(tl))
+    if key in _EXISTING_NUMCOLS_CACHE:
+        return _EXISTING_NUMCOLS_CACHE[key]
+    out = {}
+    try:
+        q = ", ".join("'%s'" % t for t in tl)
+        r = execute_sql(
+            "SELECT table_name, column_name FROM information_schema.columns "
+            "WHERE table_schema='public' AND table_name IN (%s) "
+            "AND data_type IN ('numeric','integer','bigint','real',"
+            "'double precision','smallint')" % q)
+        if isinstance(r, dict) and r.get("success"):
+            for row in (r.get("rows") or []):
+                out.setdefault(str(row.get("table_name") or "").lower(),
+                               set()).add(
+                    str(row.get("column_name") or "").lower())
+    except Exception:
+        out = {}
+    _EXISTING_NUMCOLS_CACHE[key] = out
+    return out
+
+
+def _alias_of_table(sql: str, table: str) -> str:
+    """SQL 里某张表用的别名；有别名用别名，否则用**真表名**。
+
+    ⚠ 必须排除 SQL 保留字 —— 首版没排除，于是
+    `FROM eqp_downtime_record GROUP BY equipment_id` 里的 `GROUP`
+    被当成别名，补出 `SUM(GROUP.downtime_minutes)` 这种**语法错误**的 SQL。
+    （`_S_RESERVED` 已存在且含 group/where/order/limit 等，直接复用。）
+    """
+    for m in re.finditer(
+            r"(?:FROM|JOIN)\s+([\w.]+)(?:\s+(?:AS\s+)?\"?([\w]+)\"?)?",
+            sql, re.I):
+        tbl = m.group(1).split(".")[-1].strip('"')
+        if tbl.lower() != table.lower():
+            continue
+        al = (m.group(2) or "").strip('"')
+        if not al or al.lower() in _S_RESERVED:
+            return table          # 没有别名，或那其实是 GROUP/WHERE 之类关键字
+        return al
+    return table
+
+
+_AGG_RE = re.compile(r"\b(SUM|COUNT|AVG|MIN|MAX)\s*\(", re.I)
+
+# 度量列 → 问句里对应的中文短语。用它给补出的列起中文别名，
+# 免得界面上出现「车间 | 非计划停机次数 | downtime_minutes」这种中英混排。
+_CN_METRIC_ALIAS = {
+    "downtime_minutes": ("分钟", "时长"),
+    "defect_qty": ("不良数", "缺陷数"),
+    "good_qty": ("产量", "产出量"),
+    "input_qty": ("投入量", "投入数量"),
+    "sample_qty": ("抽样数",),
+    "rework_qty": ("返工数",),
+}
+
+
+def _cn_metric_alias(query: str, col: str) -> str:
+    """给补出的度量列起中文别名：优先取问句里实际用过的那段措辞。"""
+    cands = _CN_METRIC_ALIAS.get(col)
+    if not cands:
+        return col
+    for w in cands:
+        if w in str(query or ""):
+            return w
+    return cands[0]
+
+
+def _fix_parallel_metric_columns(query: str, sql: str) -> str:
+    """问句并列要了多个指标、SQL 只投影了其中一个 → 用 SUM 补齐缺的度量列。
+
+    与 `_fix_explicit_col_select` 的分工：
+      · 那条管「问句括号里点名了列名」（`各产线(line_id)的总投入数量`）；
+      · 本条管「问句用并列连接词把指标短语并列起来」
+        （`次数和总时长`、`产量和不良数`）。
+
+    五条硬约束（任一不满足就原样返回，宁可漏过不误伤）：
+      ① 单层 `SELECT ... FROM ...`（`_simple_select_parts` 已排除
+         CTE / UNION / DISTINCT / select 列表带子查询）；
+      ② 必须有 GROUP BY —— 明细行不受影响，也避免把明细查询改成聚合；
+      ③ 必须有至少一列**不带聚合的维度列**可留，否则补完变成纯聚合；
+      ④ 补出的列必须在 SQL 已引用的表里真实存在；
+      ⑤ 该指标对应的列名已出现在 SQL 任何位置 → 幂等不动。
+    """
+    try:
+        s = str(sql or "").strip().rstrip(";")
+        q = str(query or "")
+        if not s or not q:
+            return sql
+        if not _PARALLEL_SPLIT_RE.search(q):
+            return sql
+        parts = _simple_select_parts(s)
+        if not parts:
+            return sql
+        if not _S_GROUPBY_RE.search(s):
+            return sql
+        sel, _rest = parts
+        sel_items = _split_top_commas(sel)
+        if not sel_items:
+            return sql
+        # 必须有维度列可留
+        dim_items = [x for x in sel_items if not _AGG_RE.search(x)]
+        if not dim_items:
+            return sql
+        # 问句点名了哪些可加和度量
+        want = []
+        for pat, cols in _PARALLEL_METRIC_MAP:
+            if re.search(pat, q):
+                for c in cols:
+                    if c not in want:
+                        want.append(c)
+        if not want:
+            return sql
+        # 幂等：列名已在 SQL 全文出现 → 认为已给
+        low = s.lower()
+        missing = [c for c in want if not re.search(r"\b%s\b" % re.escape(c), low)]
+        if not missing:
+            return sql
+        # 列必须真实存在于已引用的表，且能定位归属表
+        tabs = _tables_in_sql(s)
+        numcols = _existing_numeric_columns(tabs)
+        if not numcols:
+            return sql
+        adds = []
+        for c in missing:
+            owner = None
+            for t in tabs:
+                if c in numcols.get(t.lower(), ()):  # 该表有此数值列
+                    owner = t
+                    break
+            if owner is None:
+                continue
+            adds.append((c, owner))
+        if not adds:
+            return sql
+        new_items = list(sel_items)
+        # ⚠ 补出的 SUM **必须沿用已有聚合的过滤形态**，否则数值虚高。
+        #   实测（q12 Q3，2026-10-06 端到端）：原句
+        #   `SUM(CASE WHEN is_planned = FALSE THEN 1 ELSE 0 END) AS "非计划停机次数"`
+        #   补出 `SUM(f.downtime_minutes)` → 把**计划停机**也算进来，
+        #   一车间给出 6295，而真值（非计划）是 3380（虚高 1.86 倍）。
+        #   ⇒ 从已有聚合里提取 CASE 条件（形如 `CASE WHEN <cond> THEN`），
+        #     有就套到补出的 SUM 上；没有才用裸 SUM。
+        agg_cond = None
+        for it in sel_items:
+            m = re.search(r"CASE\s+WHEN\s+(.+?)\s+THEN\s+1\s+ELSE\s+0\s+END",
+                          it, re.I | re.S)
+            if m:
+                agg_cond = re.sub(r"\s+", " ", m.group(1)).strip()
+                break
+        for c, owner in adds:
+            al = _alias_of_table(s, owner)
+            if agg_cond:
+                agg = "SUM(CASE WHEN %s THEN %s.%s ELSE 0 END)" % (
+                    agg_cond, al, c)
+            else:
+                agg = "SUM(%s.%s)" % (al, c)
+            new_items.append('%s AS "%s"'
+                             % (agg, _cn_metric_alias(q, c)))
+        new_sel = ", ".join(new_items)
+        m = re.match(r"(?is)^SELECT\s+(.*?)\s+FROM\s+(.*)$", s)
+        if not m:
+            return sql
+        return "SELECT %s FROM %s" % (new_sel, m.group(2))
+    except Exception:
+        return sql
+
+
+
 _S_RESERVED = {"where", "group", "order", "limit", "join", "left", "right", "inner", "full",
                "on", "having", "union", "offset", "cross", "natural", "as", "and", "or",
                "select", "from", "by", "distinct", "all"}
@@ -1149,7 +1373,12 @@ def _fix_cte_rank_to_limit(query: str, sql: str) -> str:
 # 只在「问句含相对时间窗口」+「SQL 用 `列 >= (SELECT MAX(日期列) FROM 表)` 作阈值」时改写，
 # 区间算术原样保留（-29 days 之类不动），最小侵入。
 _REL_WINDOW_RE = re.compile(
-    r"最近|近\s*\d+\s*[天日月周]|本月|这个月|当月|上月|上个月|本周|这周|上周|今天|今日|昨天|昨日")
+    r"最近|近\s*\d+\s*[天日月周]|本月|这个月|当月|上月|上个月|本周|这周|上周|今天|今日|昨天|昨日"
+    # 2026-10-05 补：季度/年度相对词。原正则只认到「上月/本周」，于是
+    # 「本季度各产线良率」这类问句即使 0 行、且编译器刚把它的锚点从
+    # CURRENT_DATE 改成数据驱动锚点，提示门槛仍判 false → 不触发
+    # 「库里数据只到 X」的解释，用户只看到空白，无从判断是查询写错还是真没数据。
+    r"|本季\s*度?|本季度|季初至今|本季至今|上季\s*度?|上季度|今年|本年|年初至今|今年以来|去年")
 
 # 2026-10-03 新增：**绝对月份/年份**问句（「6月」「2026年8月」）同样需要数据范围提示。
 # 背景（真库实测）：编译器对这类问句产出
@@ -1289,6 +1518,55 @@ def _probe_data_range(sqlexec, tables: list[str]) -> dict | None:
 def _fmt_dt(v) -> str:
     s = str(v or "")
     return s[:10] if len(s) >= 10 else s
+
+
+def _rows_effectively_empty(rows) -> bool:
+    """结果是否「实质为空」—— 覆盖两种形态，而不只是「零行」。
+
+    ── 根因（2026-10-06，黄金题库 82 条实测）────────────────────────
+    PostgreSQL 的**裸聚合**（无 GROUP BY 的 SUM/COUNT/AVG…）在无匹配行时
+    产出**一行 NULL**，不是零行：
+        SELECT SUM(good_qty)*1.0/NULLIF(SUM(input_qty),0) AS r
+          FROM mes_process_output WHERE stat_date >= CURRENT_DATE
+        → [(None,)]        ← len(rows) == 1，值全None
+    而全仓 55+ 处判空写的是 `not rows` / `len(rows) == 0`
+    （实测 L408/1223/3006/8417/8473/8812/9024/9031/9619/9931/10104/10480/12034/13957…），
+    于是这类「一个数都没算出来」的结果被当成**正常出数**：
+      · L8417 数据范围提示不触发 → 问「今天的投入产出比」只答「建议放宽时间范围」，
+        却不告诉用户数据只到 2026-09-15（题单#52/#53 要求的行为）；
+      · L84730 行重试链不进 → 没有任何修正机会；
+      · L9031 图表按 1 行 NULL 去渲染；
+      · L9619 失败归因判成「不是空结果」→ 不给「筛选条件过严」的提示。
+    另有形态：`GROUP BY` 后的分组**全部为 NULL 值**（如各组 SUM 都 NULL）。
+
+    ── 判定规则（保守，只认「所有值皆空」，不猜语义）────────────
+      · rows 为空/None → 空
+      · 所有行的**所有值**都是 None（或空串/纯空白）→ 空
+      · 只要有任一非空值 → 不空
+    刻意**不做**的事：不判断「值是否等于 0」—— SUM 算出 0 是合法答案
+    （如「不良总数 = 0」），把它当空会制造新的假空结果。
+
+    ⚠ 调用方必须**按语义挑选**，不能全局替换：
+      `_dim_is_one_to_one` 那类探测的语义恰好相反（「无行」= 无重复 = 1:1 成立），
+      用本函数会把 1:1 判成非1:1。
+    """
+    if not rows:
+        return True
+    try:
+        it = iter(rows)
+    except TypeError:
+        return True
+    for row in it:
+        vals = row.values() if isinstance(row, dict) else (
+            row if isinstance(row, (list, tuple)) else [row])
+        for v in vals:
+            if v is None:
+                continue
+            if isinstance(v, str) and not v.strip():
+                continue
+            return False        # 有任一实质值 → 不空
+    return True                    # 迭代完仍无实质值（含空生成器）→ 空
+
 
 
 def _zero_row_data_range_hint(sqlexec, tables: list[str], query: str) -> str:
@@ -2605,6 +2883,51 @@ _SUP_HINT_RE = re.compile(r"[（(]\s*([A-Za-z_][A-Za-z0-9_]*)\s*[)）]")
 _SUP_TOPN_Q_RE = re.compile(r"前\s*(?:\d+|[一二三四五六七八九十]+)|TOP\s*\d+", re.I)
 
 
+# ── TOP-N 行数提取（共用谓词，2026-10-06 新增）────────────────────────
+_TIME_SPAN_RE = re.compile(
+    r"(?:[一二两三四五六七八九十\d]{1,3})\s*"
+    r"(?:天|日|周|个?月|月|年|季度|小时|分钟|个工作日)"
+    r"|(?:最近|近|过去)\s*[一二两三四五六七八九十\d]{1,3}\s*$")
+
+
+def _topn_count_from_query(query: str):
+    """从问句里提取「要几行」；不是 TOP-N 就返回 None。
+
+    ⚠ **必须排除时间跨度**（2026-10-06 实测 P0，q12 Q11）：
+      「最近**两周**每天的非计划停机时长」里的"两"被当成 TOP-2，
+      于是把 `LIMIT 1000` 强改成 2、重试后再改成 1，14 天日趋势只剩1 行。
+      「两周」「近30 天」「过去三个月」说的都是**时间**不是**行数**，
+      靠后接单位词区分：数词后面跟时间单位的，一律不算 TOP-N。
+      ⇒ 这类问句要返回**全序列**，交给「最近N 天」那类窗口去截，不靠 LIMIT。
+    """
+    q = str(query or "")
+    if not q:
+        return None
+    _np = r"(\d+|[一二两三四五六七八九十]{1,3})"
+    for _m in re.finditer(
+            rf"(?:前\s*{_np}"
+            rf"|(?:最高|最低|最大|最小|最多|最少|最长|最短|最好|最差"
+            rf"|最晚|最早|最新|最旧|排行|排名前)"
+            rf"[的]?\s*(?:前)?\s*{_np}|TOP\s*{_np})"
+            rf"\s*(?:个|名|条|家|项|台|道|种)?",
+            q, re.I):
+        # ★ 该数词所在片段若是时间跨度 → 跳过，继续找下一个候选
+        _frag = q[_m.start():_m.end()]
+        _around = q[max(0, _m.start() - 6):_m.end() + 6]
+        if _TIME_SPAN_RE.search(_frag) or _TIME_SPAN_RE.search(_around):
+            continue
+        _g = next((g for g in _m.groups() if g), None)
+        if _g:
+            try:
+                from agent.metric_compiler import _cn_num as _cn
+                _n = int(_g) if _g.isdigit() else (_cn(_g) or 0)
+            except Exception:
+                _n = int(_g) if _g.isdigit() else 0
+            if _n > 0:
+                return _n
+    return None
+
+
 def _global_topn1_intent(query: str):
     """问句是不是「最X的<实体>」= 全局 TOP-1？返回 `(排序列, 形容词)`，否则 None。
 
@@ -2696,7 +3019,23 @@ _FIX_STEP_MSG = {
     "_fix_topn_stable_tiebreak": "TOP-N 存在并列名次，已追加实体主键升序作为稳定次级排序键",
     "_fix_value_column_mismatch": "检测到「把维表属性值等值到事实表外键列」，已改写为维表子查询",
     "_fix_explicit_col_select": "问句点名了列名，已补齐该列的输出与分组",
+    "_fix_ratio_molecule_output_only":
+        "比值的分子原是「合格数 + 不良数」——不良已流出产线，"
+        "加进分子会让比值大于 1（本库 good+defect 已超过投入）。"
+        "已改为只取合格数（产出）参与除法。",
+    "_fix_unit_conversion":
+        "「每X」是单位换算问法（每小时/每件/每张/日均/人均…），"
+        "当前 SQL 只是把总量或均值直接当成「每X」的结果，量纲不对。"
+        "已改为显式除法：分子总量 ÷ 每单位分母（分母用标量子查询，无需 JOIN）。"
+        "多个单位词同时出现时会**叠加**（如「每台设备日均产出」= 总量÷设备数÷天数）。"
+        "分母字段本库不存在的（每人/人均/每批）不改写，由缺源字段闸门出声明。",
     "_fix_group_key_superset": "已补齐分组维度的关联键列（输出与分组同步扩展）",
+    # ★2026-10-06 补登记：二轮审计发现此步骤在改写链里但**没登记说明**，
+    #   触发后用户看不到「口径已调整」的提示，只看到数字变了。
+    #   （自动化检查见 tests/test_fix_steps_documented.py）
+    "_fix_parallel_metric_columns":
+        "问句要求多个指标并列（如「次数**和**总时长」），原 SQL 只投影了一个；"
+        "已补齐其余指标列",
     "_fix_detail_row_superset": "明细类问题已补齐全列（保留排序与行数不变）",
     "_fix_cte_rank_to_limit": "CTE 窗口排名已等价塌缩为 ORDER BY ... LIMIT（列集不再被裁剪）",
     "_fix_correlated_count_to_join": "逐行相关计数子查询已改为 LEFT JOIN + 按显示维度分组（同名/重复行合并）",
@@ -2748,6 +3087,261 @@ _COMPILED_FIX_SKIP = frozenset({
     "_align_period_compare_length",
     "_align_period_compare_trunc",
 })
+
+# 2026-10-06：表达式规则链产物专用的跳过集。
+# 为什么规则⓪ 的 SQL 必须挡掉 `_fix_dim_listing_limit`：
+#   规则⓪「每张工单从开工到完工用了多少天，排前二十」产出的是
+#       SELECT work_order_id, start_date, end_date,
+#              (end_date - start_date) AS "工期天数" ... LIMIT 20
+#   `_fix_dim_listing_limit` 判定它「像维度清单」→ 放开 LIMIT 并补
+#   `mes_work_order.*`，接着 `_fix_detail_row_superset` 把明细列补齐 →
+#   最终 SQL 里多了 `*`，又被退化输出守卫判成「返回原始明细」→
+#   整条被弃用、LLM 重生成成 `AVG(end_date-start_date)`（实测第四轮 Q4 回归）。
+# 规则链的 SQL 是**逐字设计**出来的，不该被明细补列改写链二次加工。
+_EXPR_RULE_FIX_SKIP = frozenset(_COMPILED_FIX_SKIP | {
+    "_fix_dim_listing_limit",
+    "_fix_detail_row_superset",
+})
+
+
+
+import re
+
+# 单位词 → (分母 SQL 片段, 是否可自动修, 口径说明)
+# ⚠ 2026-10-06 自测抓到两个真缺陷，都已修：
+#   ① 「每台设备日均产出」是**两个分母**（设备数 × 天数），首版只除天数
+#      ⇒ 69091.56（真值 1439.41 = 3109120/48/45）。故时间类量词与实体量词
+#      可以**叠加**，规则表改为「单位词 → 分母片段列表」而非单个片段。
+#   ② 「每件产出消耗多少投入」产出 1.03 而非 1.02505：SUM/SUM 在本库是
+#      numeric，但外层没强制 ::numeric 时结果精度由 PostgreSQL 决定。
+#      统一给分子加 ::numeric 后逐格相等。
+_UNIT_FIX_RULES = (
+    # 数量倍率：分子 ×N / 分母
+    # ★2026-10-06 补「每万件」：守卫侧（_UNIT_PER / _RATIO_ASK_RE）已有该词，
+    #   但本表缺它⇒ 问「每万件的投入」时守卫拦得住、修复器却命中不到任何规则
+    #   （`_scale_factor` 虽已含 10000，前置表没有就永远走不到那一步）
+    #   ⇒ 典型「拦得住、修不出」。凡守卫词表新增词，本表必须同步（审计探针④）。
+    ("每万件", "NULLIF(SUM(good_qty),0)", True, "按每万件产出折算"),
+    ("每千件", "NULLIF(SUM(good_qty),0)", True, "按每千件产出折算"),
+    ("每百件", "NULLIF(SUM(good_qty),0)", True, "按每百件产出折算"),
+    # 时间：÷ 天数 或 天数×小时
+    ("每小时", "NULLIF((SELECT count(DISTINCT stat_date) FROM mes_process_output) * 24, 0)",
+     True, "★按自然时折算（数据天数 × 24 小时）。本库无工时字段，"
+           "若贵司口径是 8 小时班次，请把结果除以 3"),
+    ("日均", "NULLIF((SELECT count(DISTINCT stat_date) FROM mes_process_output), 0)",
+     True, "按数据实际天数折算"),
+    ("每天", "NULLIF((SELECT count(DISTINCT stat_date) FROM mes_process_output), 0)",
+     True, "按数据实际天数折算"),
+    ("每月", "NULLIF((SELECT count(DISTINCT date_trunc('month', stat_date)) FROM mes_process_output), 0)",
+     True, "按数据实际月数折算"),
+    # 实体量词：÷ 对应实体计数
+    ("每张", "(SELECT count(*) FROM mes_work_order)", True, "按工单总数折算"),
+    ("每单", "(SELECT count(*) FROM mes_work_order)", True, "按工单总数折算"),
+    ("每台", "(SELECT count(*) FROM dim_equipment)", True, "按设备总数折算"),
+    ("每件", "NULLIF(SUM(good_qty),0)", True, "按合格产出件数折算"),
+    # 不可修：库里没有对应源字段
+    ("每人", None, False, "本库无人员/工时字段，无法按人均折算"),
+    ("人均", None, False, "本库无人员/工时字段，无法按人均折算"),
+    ("每批", None, False, "本库无批次字段（实测 mes_process_output / qms_inspection 均无 batch/lot 列），无法按每批折算"),
+    ("每次", None, False, "问「每次」时需先明确计的是什么事件，口径不明不宜自动折算"),
+)
+
+# 叠加分母：单位量词（时间/实体）可同时出现，如「每台设备**日均**产出」
+#   = 总量 ÷ 设备数 ÷ 天数。两张表都命中时**都要除**，
+#   只除一个就是量纲错（自测第 9 条：只除天数 → 69091.56，真值 1439.41）。
+_UNIT_STACKABLE = {
+    # 时间类
+    "每小时": "NULLIF((SELECT count(DISTINCT stat_date) FROM mes_process_output) * 24, 0)",
+    "日均": "NULLIF((SELECT count(DISTINCT stat_date) FROM mes_process_output), 0)",
+    "每天": "NULLIF((SELECT count(DISTINCT stat_date) FROM mes_process_output), 0)",
+    "每月": "NULLIF((SELECT count(DISTINCT date_trunc('month', stat_date)) FROM mes_process_output), 0)",
+    # 实体类
+    "每台": "NULLIF((SELECT count(*) FROM dim_equipment), 0)",
+    "每张": "NULLIF((SELECT count(*) FROM mes_work_order), 0)",
+    "每单": "NULLIF((SELECT count(*) FROM mes_work_order), 0)",
+}
+
+# 投影里可被换算的聚合形态：AVG(x) / SUM(x) / COUNT(x)
+_AGG_RE = re.compile(
+    r"\b(?P<fn>AVG|avg|SUM|sum|COUNT|count)\s*\(\s*(?P<col>[\w.]+)\s*\)")
+_FROM_SPLIT_RE = re.compile(r"\bFROM\b", re.I)
+
+
+def _scale_factor(word: str) -> int:
+    """数量倍率单位 → 倍数（每千件=1000…）。非倍率词返回 1。"""
+    return {"每千件": 1000, "每百件": 100, "每万件": 10000}.get(word, 1)
+
+
+def _fix_unit_conversion(query: str, sql: str) -> str:
+    """把「总量/均值」形态的投影改写为「总量 ÷ 每单位分母」。
+
+    只在**确实缺换算**时动手（投影里已有除法 → 原样返回）；
+    只处理**单个聚合**且无 GROUP BY 的形态（有 GROUP BY 说明用户要的是
+    逐组明细，那属于分组列举，本就不该换算，见 `_unit_conversion_reason`）。
+    """
+    try:
+        q = str(query or "")
+        s = str(sql or "")
+        if not q or not s:
+            return s
+        # 命中单位词
+        hit = None
+        for w, den, can, _note in _UNIT_FIX_RULES:
+            if w in q:
+                hit = (w, den, can)
+                break
+        if not hit:
+            return s
+        _word, _den, _can = hit
+        if not _can:
+            return s                    # 不可修 → 交缺源字段闸门出声明
+        # 已有除法 → 不动
+        parts = _FROM_SPLIT_RE.split(s, maxsplit=1)
+        proj = parts[0]
+        if "/" in proj:
+            return s
+        # 有 GROUP BY → 分组列举，不动
+        tail = parts[1] if len(parts) > 1 else ""
+        if re.search(r"\bGROUP\s+BY\b", tail, re.I):
+            return s
+        # COUNT 形态：COUNT(x) 本身是"条数"，问「每件/每张」时它就是分母不该被换算
+        m = _AGG_RE.search(proj)
+        if not m:
+            return s
+        if m.group("fn").lower() == "count" and _word in ("每件", "每张", "每单", "每台"):
+            return s
+        _col = m.group("col")
+        _f = _scale_factor(_word)
+        # ★ 收集**全部**可叠加的分母（自测第 9 条：「每台设备日均产出」
+        #   命中「每台」+「日均」两个单位词，只除一个 → 69091.56，真值 1439.41）
+        _dens = []
+        for _w2, _d2 in _UNIT_STACKABLE.items():
+            if _w2 in q and _w2 not in _dens:
+                _dens.append(_w2)
+        if _word not in _dens:
+            _dens.insert(0, _word)
+        _den_expr = " / ".join(
+            (_UNIT_STACKABLE.get(w) if w in _UNIT_STACKABLE else _den) or _den
+            for w in _dens)
+        # 分子：COUNT→改 SUM（同列），AVG/SUM 保持。统一 ::numeric 保证精度
+        #   （自测第 3 条：不给 ::numeric 时 1.02505 被显示成 1.03）
+        if _f > 1:
+            # ★2026-10-06 两轮自测 + 端到端复验才对清（这里原先错得很隐蔽）：
+            #   ① 首版分母写死 `SUM(good_qty)`，当被替换列恰好就是 good_qty 时
+            #      产出 SUM(good_qty)/SUM(good_qty)*1000 —— **恒等于 1000**，
+            #      与真值 1025.05 差 2.5% 却毫无征兆（端到端复验才发现）。
+            #   ② 二版改成"分子==分母就放弃改写" —— 能避免恒等值，但等于不修，
+            #      守卫拦下后没有修复，题又变成"不给答案"。
+            #   ③ 现按**问句要什么量**决定分子：倍率词（每千件/每百件/每万件）
+            #      语义是「每 N 件产出需要多少 X」，X 由问句给出：
+            #        问「投入」→ 分子 SUM(input_qty)
+            #        问「不良/缺陷/损耗」→ 分子 SUM(defect_qty)
+            #        问句没说清是哪一量 → **不擅自改写**（宁可不改也不给错值）
+            #   分母恒为产出件数 SUM(good_qty)（倍率词量的是"件"，件即产出件数）。
+            #  ⚠ 分子列的取法（自测第4 版才对）：**投影列本身就是候选分子**时直接用它，
+            #     不必再按问句改写；只有投影列与问句要的量**不一致**时才替换。
+            #     首版把条件写成 `_bare != "input_qty"` 就早退，结果
+            #     「投入产出比换算成每千件的投入」+ 投影 `SUM(input_qty)`
+            #     （列已正确、只缺 ×1000）反被判成"说不清"而不改 —— 逻辑写反了。
+            _bare = _col.split(".")[-1].lower()
+            if re.search(r"投入|input", q, re.I):
+                _m = "SUM(%s)" % _col if _bare == "input_qty" else "SUM(input_qty)"
+            elif re.search(r"不良|缺陷|损耗|报废|defect|scrap|rework", q, re.I):
+                _m = ("SUM(%s)" % _col
+                      if _bare in ("defect_qty", "rework_qty", "scrap_qty")
+                      else "SUM(defect_qty)")
+            else:
+                return s      # 问句没说清要折算哪个量 → 不动
+            # ★ 兜底：分子与分母同列（SUM(x)/SUM(x)）会恒等于 1，×N 后是 N ——
+            #   这种情况宁可不改，也不给一个看着正常的假数。
+            if _m.replace("SUM(", "").replace(")", "").lower() == "good_qty":
+                return s
+            _num = "%s::numeric / NULLIF(SUM(good_qty), 0) * %d" % (_m, _f)
+        else:
+            _num = "SUM(%s)::numeric / %s" % (_col, _den_expr)
+        # ⚠ 别名处理：原 SQL 常常已经写了 `AS <列名>`（如SUM(x) AS input_qty），
+        #   若无条件再加一次会产出 `... AS input_qty AS input_qty` → 语法错误
+        #   （自测第 1/2/3/4/5/7 条全栽在这）。
+        #   ⇒ 先看聚合片段**后面紧跟**是否已有 AS 别名：有就只替换聚合片段本身。
+        _tail_after = proj[m.end():]
+        _has_alias = bool(re.match(r"\s*AS\s+[\"`]?\w+[\"`]?", _tail_after, re.I))
+        if _has_alias:
+            _new_proj = proj[:m.start()] + "(%s)" % _num + _tail_after
+        else:
+            _new_proj = proj[:m.start()] + "(%s) AS %s" % (_num, _col) + _tail_after
+        return _new_proj + (" FROM " + tail if tail else _new_proj)
+    except Exception:
+        return sql
+
+
+
+def _fix_ratio_molecule_output_only(query: str, sql: str) -> str:
+    """比值分子里的「合格 + 不良」合计量 → 只留合格数（产出）。
+
+    为什么必须有这一步（2026-10-06 实测）：
+      守卫 ②.8-b 会拦下 `SUM(good_qty + defect_qty) * 1.0 / SUM(input_qty)`，
+      但**拦下不等于修好**——r11 实测 Q6「九月上旬和中旬的投入产出比」
+      在首生和直生兜底都被拦后，最终给用户 0 行 +「换个模型再试」，
+      而这个区间**是有数据的**（真值上旬 0.975373/ 中旬 0.975341）。
+      即"从给错答案"退化成"不给答案"，仍然是失败。
+      这个错误是**可确定性修复**的：产出就是 good_qty，不良不该进分子
+      （不良已流出产线；本库 good+defect=3,200,857 > 投入 3,187,009，比值恒 >1）。
+      ⇒ 在守卫之外补一个改写步骤，让被拦的 SQL 有机会被自动修好再执行。
+
+    只在「问句要的是比值」时动手，且只改**比值的分子**那处，
+    别处合法的 `good_qty + defect_qty`（问"合格+不良合计"时）不动。
+
+    ⚠ 分子位置有两种形态（Q5 r7 实测踩过），两种都必须能改：
+      ① **就地相邻**：`SUM(good_qty + defect_qty) * 1.0 / SUM(input_qty)`
+      ② **起了别名**：聚合在 CTE 里算成 `out_`，除法在下游
+         `SELECT out_ * 1.0 / NULLIF(inp,0) FROM agg`
+      ② 若不追踪别名，改写会整条漏掉（改完SQL 没变 → 等于没修）。
+    """
+    q = re.sub(r"\s+", " ", str(query or ""))
+    s = str(sql or "")
+    if not q or not s:
+        return sql
+    if not _RATIO_ASK_RE.search(q):
+        return sql
+    if not _expr_is_good_plus_defect(s):
+        return sql
+
+    _drop_bad_term = (lambda raw: re.sub(
+        r"(?i)([\w.]*\b(?:good|good_qty|goodqty|合格)\w*)\s*\+\s*"
+        r"[\w.]*\b(?:defect|rework|不良|次品|废品)\w*", r"\1", raw))
+
+    out = s
+    # 每改一处就重新扫一遍（长度会变，索引会漂）
+    for _ in range(8):
+        _hit = None
+        for raw in re.findall(
+                r"(?:SUM|sum|AVG|avg)\s*\([^()]*(?:\([^()]*\)[^()]*)*\)", out):
+            if not _expr_is_good_plus_defect(raw):
+                continue
+            idx = out.find(raw)
+            tail = out[idx + len(raw):]
+            # 形态①：片段后面紧跟乘除号 → 这处就是分子
+            if re.match(r"\s*(?:::\s*[\w\s]*?)?"
+                        r"(?:\*\s*[\d.]+\s*)?[/*]\s*", tail):
+                _hit = (idx, len(raw), _drop_bad_term(raw))
+                break
+            # 形态②：片段后面起了别名 → 到整句里找这个别名被当分子用的地方
+            #  ⚠ 别名后面通常跟的是逗号（`... AS out_, SUM(x) AS inp`）而不是
+            #    字符串结尾，**不能加行尾锚**，加了永远匹配不上。
+            _am = re.match(r"\s*(?:::[\w\s]*)?\s*AS\s+\"?([\w]+)\"?",
+                           tail[:80], re.I)
+            if _am and re.search(
+                    r'(?:[\w."]*\b%s\b"?)\s*(?:\*\s*[\d.]+\s*)?[/]' % re.escape(_am.group(1)),
+                    out):
+                _hit = (idx, len(raw), _drop_bad_term(raw))
+                break
+        if not _hit:
+            break
+        _i, _n, _new = _hit
+        if _new == out[_i:_i + _n]:
+            break
+        out = out[:_i] + _new + out[_i + _n:]
+    return out
 
 
 def apply_output_fixes(query: str, sql: str, fired: list | None = None,
@@ -2822,7 +3416,22 @@ def apply_output_fixes(query: str, sql: str, fired: list | None = None,
         ("_fix_window_drop_time_groupby", lambda s: _fix_window_drop_time_groupby(query, s)),
         ("_fix_window_diff_coalesce", lambda s: _fix_window_diff_coalesce(query, s)),
         ("_fix_topn_stable_tiebreak", lambda s: _fix_topn_stable_tiebreak(query, s)),
+        # 比值分子里的「合格+不良」→ 只留合格数。必须排在守卫之外的这个位置：
+        # 守卫负责拦，这个步骤负责**修**，两者缺一不可（r11 实测：只拦不修，
+        # Q6 有数据却给 0 行 + 「换个模型再试」）。
+        ("_fix_ratio_molecule_output_only",
+         lambda s: _fix_ratio_molecule_output_only(query, s)),
+        # 「每X」单位换算 → 显式除法（守卫 ②.5-b 负责拦，这里负责**修**）。
+        # 顺序上排在 ratio_molecule 之后：那条改的是"分子含 defect"，
+        # 本条改的是"缺分母"，两者都要在最终投影定型前完成。
+        ("_fix_unit_conversion",
+         lambda s: _fix_unit_conversion(query, s)),
         ("_fix_value_column_mismatch", lambda s: _fix_value_column_mismatch(s)),
+        # 并列指标补列（q12 Q3）：问「次数**和**总时长」只投影了次数。
+        # 放在 value_column_mismatch 之后 —— 那条管"值放错列"，
+        # 这条管"列压根少了一列"，两者都作用于最终投影，先纠正错位再补缺列。
+        ("_fix_parallel_metric_columns",
+         lambda s: _fix_parallel_metric_columns(query, s)),
         ("_fix_having_agg_select", lambda s: _fix_having_agg_select(query, s)),
         ("_fix_count_from_owner", lambda s: _fix_count_from_owner(query, s)),
         ("_fix_explicit_col_select", lambda s: _fix_explicit_col_select(query, s)),
@@ -3048,19 +3657,52 @@ def _detail_intent_reason(query: str, sql: str) -> str:
 # 为什么之前没拦住（重要教训）：
 #   · 提示词里**早已**写了硬约束「率/占比类必须真的做除法，不得返回分子的总量」，
 #     实测确认该提示词**确实注入了**——但模型没照做。
-#   · 而后端守卫只查 SQL **形态**（SELECT * / 有无 GROUP BY / 有无聚合函数），
-#     上面这条 SQL 有 SUM、有 ORDER BY，形态"完全合规" ⇒ 整条放行。
+#   · 而后端守卫只查 SQL **形态**（SELECT * / 有无GROUP BY / 有无聚合函数），
+#     上面这条 SQL 有 SUM、有 ORDER BY，形态完全合规 ⇒ 整条放行。
 #   ⇒ **提示词是软约束（模型可以不照做），只有确定性守卫才是硬约束。**
 #     凡「模型被要求做 X」而 X 是可判定性质，就必须有对应守卫兜住，
 #     否则这条要求等于没写。
 _RATIO_GATE_ON = os.getenv("QUALITY_GATE_RATIO_DIVISION", "1").strip() not in ("0", "false", "off")
+# ②.5-b「每X」单位换算守卫开关（2026-10-06）。独立开关，便于出问题时单项回退。
+_UNIT_GATE_ON = os.getenv("QUALITY_GATE_UNIT_CONVERSION", "1").strip() not in ("0", "false", "off")
 # 问句要「率」的信号。注意与 _AGG_METRIC_FORM（判是否需聚合）区分：
 # 那个判「要不要聚合」，这个判「结果是不是个比值」——「产量」要聚合但不是率。
+#
+# 分支说明：
+#  ① 「率/占比/比例/比重/份额/百分数」+ OEE/TEE/FTT/PPM
+#  ② 「比值|比率」独立成词：这类词前面往往没有业务名（如「这个比值怎么算」），
+#     既不在分支③里、也不能进 _RATIO_EXEMPT_RE 豁免（早期误豁免过，漏「投入产出比率」）。
+#  ③ 中文「X比」结构：比前须是以数量词结尾的业务名（投入产出/产出投入/投入/产出/
+#     良品/不良/回收/损耗/周转…），要求「比」前≥2 个汉字，避免「同比/环比/对比/相比」
+#     被误纳（同比环比要的是差值/变化率，不是两量相除）。
+#     实测 P0：问「九月份之后的投入产出比」→ SQL 是 SELECT SUM(good_qty) AS 投入产出比,
+#     SUM(input_qty) AS 投入量，返回 3,109,120 —— 那是产出件数不是比值
+#     （真值 SUM(good)/SUM(input)=0.97556）。
+#  ④ 单位换算型（2026-10-06 新增，根因 D）：「每件/每张/每小时/日均/人均…」在语义上
+#     同样是两个数量相除（总量 ÷ 每单位的量），但它们一个都不含「率/占比/比」
+#     ⇒ 整个比值守卫族（分子含 defect、百分数恒为 100、率值越界…）以及
+#     L3129 的**自动修复函数**全部跳过。实测 82 条里「每件产出消耗多少投入」SQL 是
+#       SUM(input_qty)/NULLIF(SUM(good_qty + defect_qty),0) = 0.9957
+#     分子含 defect 把分母抬高（真值 3,187,009/3,109,120 = **1.02505**）。
+#     纳入本词表后一处改动即让守卫族+ 修复函数同时生效，比逐个放宽 3 处守卫的
+#     前置条件更不容易漏。分组列举句式（「每张工单的投入」）由
+#     _ratio_without_division_reason / _unit_conversion_reason 的分组判据放行。
+#
+# ⚠ 排版铁律：本块**必须写成单行字符串**。曾用多行隐式拼接 + 大段注释，
+#   注释里的引号/花括号会让 tokenizer 与位置判定打架，报
+#   SyntaxError: forgot a comma 且**报错行号指向块首行、与真实位置无关**，
+#   照报错行排查会走偏（实测排查了 6轮）。改单行后一次通过。
 _RATIO_ASK_RE = re.compile(
-    r"(率|占比|比例|比重|份额|百分数)|"
-    r"\bOEE\b|\bTEE\b|\bFTT\b|\bPPM\b", re.I)
+    "(率|占比|比例|比重|份额|百分数)|\bOEE\b|\bTEE\b|\bFTT\b|\bPPM\b|比值|比率|[\u4e00-\u9fa5]{2,}比(?![率同环])|每小时|日均|每天|每月|每件|每张|每单|每台|每人|人均|每批|每次|每千件|每百件|每万件",
+    re.I)
 # 明确不是率的问法（避免「比率达成」这类误伤）
-_RATIO_EXEMPT_RE = re.compile(r"准确率|可靠率")
+_DATE_YEAR_GATE_ON = os.getenv("QUALITY_GATE_DATE_YEAR", "1").strip() not in ("0", "false", "off")
+# 「比」型比值指标的例外。**只豁免语义上确实不是「两个数量相除」的词**：
+#   · 同比/环比/对比/相比 → 要的是变化量或变化率，不是 A÷B；
+#   · 之比 → 固定文言语序（「A之比」= A/B），但前面必有业务名，已被「X比」分支覆盖，
+#     这里保留是为了防止「投入产出之比」这类写法因字面不匹配而漏网。
+# ⚠️ **不豁免「比率/比值」**（早期版本误加，实测会漏掉「投入产出比率」这类真问题）。
+_RATIO_EXEMPT_RE = re.compile(r"准确率|可靠率|同比|环比|对比|相比")
 
 # ── ⑪ 「率/占比」结果越界：效率类不可能 <0 或 >100（2026-10-05 实测 P0）────
 # ── 冲突已解决（2026-10-05）──────────────────────────────
@@ -3243,6 +3885,1575 @@ def _count_vs_ratio_mismatch_reason(query: str, sql: str) -> str:
         return ""
 
 
+# ── ②.8-b「产出」被写成「合格+不良」（2026-10-06 用户实测 P0）─────────────
+# 用户实测问「每条产线的每道工序分别有多少投入、多少产出、多少不良」，
+# 得到的 SQL 是：
+#     SUM(input_qty) AS total_input_qty,
+#     SUM(good_qty + defect_qty) AS total_output_qty,   --← 这一行
+#     SUM(defect_qty) AS total_defect_qty
+# 结果出现 **产出(85304) > 投入(85231)** 的物理不可能数字（投入就是上限）。
+#
+# 为什么难发现：`good+defect == input` 这个等式在 mes_process_output 里
+# **只在 194/2752 条记录成立**，其余 93% 的记录 good+defect ≠ input。
+# 所以「产出」这一列在**部分工序恰好正确、部分工序偏大**，
+# 表格里每一行看着都像正常整数，用户无从判断哪一行错了。
+#
+# 判据（两侧同时成立才拦，避免误伤）：
+#   左：问句同时点了「产出/产量/良品」与「不良/缺陷/次品」两个概念
+#       —— 说明用户是把它们当**并列的独立指标**，不是当一个公式的两项；
+#   右：SQL 里「产出」那个投影表达式是 `good + defect`（或等价的加法组合）。
+# ⚠ **不能**拦「投入产出损耗」这类**确实**要 good+defect 的口径：
+#   那类问句问的是「损耗/差异」，问句里不会有独立的「不良」诉求。
+_OUT_ASK_RE = re.compile(r"(产出|产量|良品|合格数|产出量|产出数量)")
+_DEFECT_ASK_RE = re.compile(r"(不良|缺陷|次品|废品)")
+# 「产出」列被写成 good+defect：投影里出现 SUM(good_x + defect_x) 形态。
+# ⚠ 2026-10-06 首版用了 `\b\w*good\w*\s*\+`，而真实 SQL 是
+#   `SUM(mpo.good_qty + mpo.defect_qty)` —— 列名**带表别名点号**，
+#   `good` 前面是 `.` 不是词边界，`\b` 在「点号 + 字母」处不成立 → 0 命中。
+#   改为「标识符（可带点号前缀）里含 good/合格 且 后面跟 + 再跟含 defect/不良 的标识符」。
+_ADDED_TERM = r"[A-Za-z_][\w]*(?:\s*\.\s*[A-Za-z_][\w]*)?"
+_OUT_AS_ADDED_DEFECT_RE = re.compile(
+    r"\b(?:SUM|sum)\s*\(\s*" + _ADDED_TERM + r"\s*\+\s*" + _ADDED_TERM + r"\s*\)",
+    re.I)
+
+
+def _expr_is_good_plus_defect(expr: str) -> bool:
+    """单个投影表达式是否为「合格 + 不良」形态（忽略表前缀）。
+
+    比正则更稳的做法：把标识符里的 good/合格 与 defect/不良/次品 分两类收集，
+    只要同一层括号里两类都出现且中间是加号，即判定为该形态。
+    """
+    t = str(expr or "")
+    if "+" not in t:
+        return False
+    # 逐个标识符（允许点号前缀）分类
+    toks = re.findall(_ADDED_TERM, t)
+    if not toks:
+        return False
+    has_good = any(re.search(r"good|合格", tk, re.I) for tk in toks)
+    has_def = any(re.search(r"defect|rework|不良|次品|废品", tk, re.I) for tk in toks)
+    return has_good and has_def
+
+
+def _output_counted_with_defect_reason(query: str, sql: str) -> str:
+    """问「产出 + 不良」两项，而 SQL 把产出写成 合格+不良 → 拦下要求只用合格数。"""
+    try:
+        q = str(query or "")
+        s = re.sub(r"\s+", " ", str(sql or ""))
+        if not q or not s:
+            return ""
+        # 问句只问产出、没问不良 → 「good+defect」可能就是它想要的合计量，放行
+        if not (_OUT_ASK_RE.search(q) and _DEFECT_ASK_RE.search(q)):
+            return ""
+        # 逐个投影表达式检查（比整句正则准：能定位到具体哪一列写错）
+        for proj in _proj_candidates(s):
+            for raw in re.findall(r"(?:SUM|sum)\s*\([^()]*(?:\([^()]*\)[^()]*)*\)", proj):
+                if not _expr_is_good_plus_defect(raw):
+                    continue
+                return ("问题把「产出」和「不良」当作两个**独立指标**分别问，而 SQL 里却把产出写成"
+                        "「合格数 + 不良数」——这会让产出大于等于投入（投入就是上限），"
+                        "物理上不成立；且该等式在本库只在少数记录成立，会导致同一列有的行对、"
+
+                        "有的行偏大，难以察觉。产出应直接取合格数列（如 SUM(good_qty)），"
+                        "不良单独一列；若真要「合格+不良」的合计口径，必须在列名与说明里写明。")
+        return ""
+    except Exception:
+        return ""
+
+
+# ── ②.8-b 比值的分子塞了 good+defect → 比值恒 > 1，量纲错 ──────────────────
+# 用户实测 Q5/Q6/Q7「投入产出比」，模型写成
+#     SUM(good_qty + defect_qty) * 1.0 / NULLIF(SUM(input_qty), 0)
+# 本库全量 good+defect = 3,200,857 > 投入 3,187,009（超13,848），
+# 于是比值稳定落在 1.0043 上下；界面把 1.00 当成答案给出，
+# 而真实投入产出比（= 良率口径）是 0.97556。用户据此下「上旬中旬基本持平」
+# 的结论——数字全错。
+#
+# 为什么单靠「比值必须做除法」拦不住：那题**确实做了除法**，
+# 错在分子 —— 分子是「合格+不良」这个合计量，不是产出。
+# 判据：问句要比值（率/占比/比），且分子的聚合表达式是 good+defect 形态。
+# 注意与 _output_counted_with_defect_reason 的区别：那个要求问句**同时**问
+# 「产出」和「不良」；这个只要问句要**比值**即可（比值的分子天然只应是产出）。
+_RATIO_MOLECULE_OUTDEF_GATE_ON = os.getenv(
+    "QUALITY_GATE_RATIO_MOLECULE", "1").strip() not in ("0", "false", "off")
+
+# 抽成常量：分子直接参与除法、被重试链改写后又被引用等多种形态都会命中同一句，
+# 文案只写一处，避免两处漂移成不同说法。
+_WHY_RATIO_MOLECULE_OUTDEF = (
+    "问题要的是「比值」（率/占比/比），比值的分子只能是**产出**本身，"
+    "而当前 SQL 的分子写成了「合格数 + 不良数」——不良是已经流出产线的"
+    "那部分，加进分子会让比值大于 1（本库全量 good+defect=3,200,857 "
+    "已超过投入 3,187,009，算出来恒为 1.00 上下），而真实比值是 0.9756 "
+    "这样 0~1 之间的数。请改为 SUM(good_qty) * 1.0 / "
+    "NULLIF(SUM(input_qty), 0)（需要百分数再 *100）。")
+
+
+def _first_from_index(s: str) -> int:
+    """返回第一个**顶层** FROM 的位置；找不到返回 -1。
+
+    为什么要「顶层」：Q6 真实 SQL 含 `EXTRACT(DAY FROM stat_date)`，
+    这个 FROM 在函数括号里。若按字面 `\bFROM\b` 切投影，
+    切点会落在 CASE 表达式中间，真正的分子
+    `SUM(good_qty + defect_qty)::NUMERIC / NULLIF(...)` 被切到投影之外
+    → 守卫 0/5 漏掉这条（2026-10-06 实测）。
+    """
+    depth = 0
+    for i, ch in enumerate(s):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0 and s[i:i + 4].upper() == "FROM" \
+                and (i == 0 or not (s[i - 1].isalnum() or s[i - 1] == "_")) \
+                and (i + 4 >= len(s) or not (s[i + 4].isalnum() or s[i + 4] == "_")):
+            return i
+    return -1
+
+
+_PROJ_STAR_RE = re.compile(
+    r"^\s*SELECT\s+(?:ALL\s+|DISTINCT\s+)?"
+    r"(?:[\w\"`\[\]\.]+\s*\.\s*)?\*", re.I)
+
+
+def _star_in_projection(proj: str) -> bool:
+    """投影片段里是否就是通配列（含 DISTINCT/ALL 修饰）。
+
+    与 `_SQL_SELECTSTAR_RE` 的差别：后者用 `search` 全串找，
+    `SELECT DISTINCT t.*` 里 SELECT 与 `*` 之间夹着 DISTINCT 就漏；
+    这里 `match` 到段首并显式放行 DISTINCT/ALL。
+    """
+    return bool(_PROJ_STAR_RE.match(str(proj or "")))
+
+
+def _final_select_is_star(s: str) -> bool:
+    """最终输出投影是不是 `SELECT *` / `SELECT 表.*`（CTE 内部的 `r.*` 不算）。
+
+    2026-10-06 实测 P0（规则⓪b 定稿时撞上）：`_SQL_SELECTSTAR_RE` 会把
+        n AS (SELECT r.*, ... ) FROM r, ...
+    里的 `r.*` 当成退化输出，于是**正确的**多 CTE 逐日环比查询被自家守卫
+    拦下、退化成裸明细。CTE 里展开自己的列是完全合法的写法，
+    只有**最后一个顶层 SELECT**（真正返回给用户的那份投影）出 `*` 才是退化。
+
+    做法：括号深度感知的扫描，从后往前找 depth==0 的最后一个 `SELECT`，
+    再看它到下一个 depth==0 的 `FROM` 之间有没有 `*`。
+    """
+    txt = str(s or "")
+    if not txt:
+        return False
+    depth = [0] * len(txt)
+    d = 0
+    for i, ch in enumerate(txt):
+        if ch == "(":
+            depth[i] = d
+            d += 1
+        elif ch == ")":
+            d = max(0, d - 1)
+            depth[i] = d
+        else:
+            depth[i] = d
+
+    def _kw(i, word):
+        """位置 i 开始的裸关键字（前后都不是标识符字符）。
+
+        ⚠ 不能写 `before in "_$"` —— Python 里 `"" in "_$"` 是 **True**
+        （空串是任意串的子串），位置 0 的关键字会被误判为「前有标识符字符」
+        而永不匹配，`last_sel` 停在 -1 → 静默退回旧正则 → 嵌套子查询被误判
+        （2026-10-06 实测 `SELECT z.n FROM (SELECT * ...) z` 返回 True）。
+        所以必须先判空再用 `in`。
+        """
+        if txt[i:i + len(word)].upper() != word:
+            return False
+        before = txt[i - 1] if i > 0 else ""
+        after_i = i + len(word)
+        after = txt[after_i] if after_i < len(txt) else ""
+        bad_before = bool(before) and (before.isalnum() or before in "_$")
+        bad_after = bool(after) and (after.isalnum() or after in "_$")
+        return not bad_before and not bad_after
+
+    last_sel = -1
+    i = 0
+    while i < len(txt) - 5:
+        if depth[i] == 0 and _kw(i, "SELECT"):
+            last_sel = i
+        i += 1
+    if last_sel < 0:
+        return bool(_SQL_SELECTSTAR_RE.search(txt))
+    # 从最后一个顶层 SELECT 到下一个顶层 FROM（或到串尾）之间的投影片段
+    j = last_sel + 6
+    while j < len(txt) - 3:
+        if depth[j] == 0 and _kw(j, "FROM"):
+            return _star_in_projection(txt[last_sel:j])
+        j += 1
+    return _star_in_projection(txt[last_sel:])
+
+
+def _proj_candidates(s: str) -> list:
+    """投影片段候选：顶层 FROM 之前 + 第一个 FROM 之前（覆盖 CTE 内分子）。"""
+    out = []
+    i = _first_from_index(s)
+    if i >= 0:
+        out.append(s[:i])
+    j = s.upper().find(" FROM ")
+    if j >= 0:
+        cand = s[:j]
+        if cand not in out:
+            out.append(cand)
+    return out or [s]
+
+
+def _ratio_molecule_has_defect_reason(query: str, sql: str) -> str:
+    """比值的分子是「合格+不良」合计量 → 拦；否则 ""。"""
+    if not _RATIO_MOLECULE_OUTDEF_GATE_ON:
+        return ""
+    try:
+        q = str(query or "")
+        s = re.sub(r"\s+", " ", str(sql or ""))
+        if not q or not s:
+            return ""
+        if not _RATIO_ASK_RE.search(q):
+            return ""
+        for proj in _proj_candidates(s):
+            # 找出所有「聚合( ... )」片段；某个片段是 good+defect 形态、
+            # 且它后面紧跟「* … /」或「/ …」→ 该片段就是比值的分子 → 命中。
+            #
+            # ⚠ 2026-10-06 首版判据写错：要求「同一个聚合片段内部含 '/'」。
+            # 真实 SQL 是 `SUM(good_qty + defect_qty) * 1.0 / NULLIF(SUM(input_qty),0)`
+            # —— 除号在**片段之间**，片段内永远没有 '/'，于是 0/5 全漏。
+            #
+            # ⚠⚠ 2026-10-06 二次补漏（Q5 r7 实测）：分子还会被**起别名**，
+            # 除法放到下游 CTE 里做：
+            #     agg AS (SELECT SUM(m.good_qty + m.defect_qty) AS out_ ...)
+            #     r   AS (SELECT agg.out_ * 1.0 / NULLIF(agg.inp,0) AS ratio FROM agg)
+            # 此时聚合片段后面紧跟的是 `AS out_`，不是除号 → 上面那条判据放行，
+            # 口径错误（good+defect > 投入，比值恒 1.00）就这么漏到用户面前。
+            # ⇒ 追加判据②：若 good+defect 片段带了别名，且该别名在别处
+            #   出现在「被除/乘除」的分子位置 → 同样命中。
+            _aliases = []      # (别名, 是否 good+defect 形态)
+            for raw in re.findall(
+                    r"(?:SUM|sum|AVG|avg)\s*\([^()]*(?:\([^()]*\)[^()]*)*\)", proj):
+                _hit = False
+                if not _expr_is_good_plus_defect(raw):
+                    continue
+                idx = proj.find(raw)
+                tail = proj[idx + len(raw):]
+                # 分子形态：* 1.0 / …、*100/…、/ NULLIF(…)、
+                #   ::NUMERIC / …（实测 Q6 真实 SQL 是
+                #   SUM(good+defect)::NUMERIC / NULLIF(…)，类型转换夹在分子与除号之间）
+                if re.match(r"\s*(?:::\s*[\w\s]*?)?"
+                            r"(?:\*\s*[\d.]+\s*)?[/*]\s*", tail) \
+                        or re.match(r"\s*\)\s*[/*]", tail):
+                    _hit = True
+                else:
+                    # 判据②：记下别名，去整句里找它被当分子用的地方
+                    _m = re.match(r"\s*(?:::[\w\s]*)?\s*AS\s+"
+                                  r'"?([\w]+)"?', tail, re.I)
+                    if _m:
+                        _aliases.append(_m.group(1))
+                if _hit:
+                    return _WHY_RATIO_MOLECULE_OUTDEF
+            # 判据②的落地：别名出现在「别名 * … / …」或「别名 / …」的分子位。
+            # ⚠ 别名前常有**表限定点号**（`agg.out_ * 1.0 / NULLIF(agg.inp,0)`），
+            #   所以这里不能加「前面不能有点号」的负向断言 —— 加了反而把真实
+            #   形态排除掉（实测：加了判0 命中，去掉才命中）。
+            for _al in _aliases:
+                if re.search(
+                        r'(?:[\w."]*\b%s\b"?)\s*(?:\*\s*[\d.]+\s*)?[/]'
+                        % re.escape(_al), s):
+                    return _WHY_RATIO_MOLECULE_OUTDEF
+        return ""
+    except Exception:
+        return ""
+
+
+# ── ②.8-c 问「多少天/耗时」却去聚合一个数量列 ─────────────────────────────
+# 用户实测 Q4「每张工单从开工到完工实际用了多少天，按耗时最长的排前二十」，
+# 真实生成的是：
+#     SELECT "work_order_id", SUM("plan_qty")::numeric AS 汇总
+#     FROM "mes_work_order" GROUP BY "work_order_id" ORDER BY 汇总 DESC LIMIT 20
+# mes_work_order.plan_qty 恒为 2000，于是 20 行全是 2000、合计 40000，
+# 界面还写「最高 2000、最低 2000、差异 1.0 倍」——完全是噪声。
+# 真实工期 = end_date - start_date，分布 0天135 / 1天109 / 2天96 / 3天4。
+#
+# 判据（两条同时成立才拦，避免误伤正常问法）：
+#   ① 问句明确问时间跨度：多少天 / 几天 / 耗时 / 工期 / 周期 / 用了多久；
+#   ② SQL 里**没有任何日期相减**（`-` 夹在两个日期列/EXTRACT/DATE 之间），
+#      却对非日期列做了 SUM/AVG 聚合 → 说明在拿数量列冒充时长。
+_DURATION_ASK_RE = re.compile(
+    r"(多少天|几天|多长(?:时间|久)?|耗时|工期|周期|跨度|用了多久|"
+    r"开工到完工|交付周期|生产周期)", re.I)
+# 时长词只作修饰、真正诉求是「某个量的分布/趋势」——这类不该按时长拦。
+# 实测误伤样本：「各产线的产量周期分布」（2026-10-06）。
+# ⚠ 只能匹配「数量指标 + 周期 + 分布类词」这一种结构，**不能**单写
+#   `周期(分布|走势|…)` 的宽泛分支——「每张工单的**生产周期分布**」
+#   问的确实是时长（生产周期=lead time），宽泛分支会误放行（实测 3/4）。
+# ⚠ 数量词表**只放真正的数量指标**，不能放「工单/产线/产品」这类主语。
+_DURATION_AS_MODIFIER_RE = re.compile(
+    r"(?:产量|数量|产出|投入|不良|缺陷数|良品|合格数|出货|销量|销售额)"
+    r"[^，。？?]{0,6}?周期[^，。？?]{0,4}?"
+    r"(?:分布|走势|趋势|占比|构成|排名|情况|明细|看|怎么|如何|变化|对照)",
+    re.I)
+# 形如 `end_date - start_date` / `end - start` / `julianday(a) - julianday(b)`
+_DATE_MINUS_RE = re.compile(
+    r"[\w\)\.\"]{2,}\s*-\s*[\w\(\.\"]{2,}", re.I)
+_DATEFUNC_RE = re.compile(
+    r"DATEDIFF|DATE_DIFF|DATEPART|EXTRACT\s*\(\s*(?:EPOCH|DAY|DAYS)|"
+    r"julianday|AGE\s*\(|INTERVAL\s+'", re.I)
+
+
+def _duration_avg_wrapped_reason(query: str, sql: str) -> str:
+    """「日期相减的结果」被 AVG/SUM 按**主体键** GROUP BY 压平 → 返回原因，否则 ""。
+
+    这类写法看起来做了日期运算、绕过了"数量列冒充天数"那条守卫，
+    实则把「每个主体的真实耗时」压成了「该主体的平均耗时」——
+    本库当前每个主体恰好一行时两者数值相同（所以测不出来），
+    一旦一主体多行（补录、改派）就会把不同天的记录平均掉。
+
+    判据（三条同时成立）：
+      ① SQL 里出现「日期相减」形态（`(end - start)`）；
+      ② 对相减结果做了 AVG/SUM，且有 GROUP BY；
+      ③ **问句要的是「每个主体的各自耗时」**——即出现
+         「每张 / 每台 / 每条 / 每个 / 各单 … 用了多少天」这类**逐主体**表述。
+         ③ 是关键，而且**必须靠问句判**，不能靠列名：
+           问「每张工单用了多少天」+ GROUP BY work_order_no → 把每张的耗时平均掉了，错；
+           问「各产线的平均工期」  + GROUP BY line_id      → 是按维度汇总平均，对，不能拦。
+         首版试过按"列名含 order/ticket/job"判断主体，两次都错：
+           `equipment_id` 这种同样的主体键被判成维度键 → 漏拦；
+           改成"分组键出现在外层投影里"→ `line_id` 也命中 → 误伤。
+         「逐主体」的诉求只有问句能说明白，SQL 结构本身区分不了。
+    """
+    q = re.sub(r"\s+", "", str(query or ""))
+    t = re.sub(r"\s+", " ", str(sql or ""))
+    if not t:
+        return ""
+    # ① 日期相减：减号两侧至少一侧像日期列/时间列
+    _dm = _DATE_MINUS_RE.search(t)
+    if not _dm:
+        return ""
+    frag = _dm.group(0)
+    if not re.search(r"(date|time|_dt|_day|日|期)", frag, re.I):
+        return ""
+    # ② AVG/SUM + GROUP BY
+    if not re.search(r"\bGROUP\s+BY\b", t, re.I):
+        return ""
+    if not re.search(r"\b(AVG|SUM)\s*\(", t, re.I):
+        return ""
+    _g = re.search(r"\bGROUP\s+BY\s+(.+?)(?:\bORDER\b|\bLIMIT\b|$)", t, re.I)
+    if not _g:
+        return ""
+    _keys = [_x.strip().strip('"`[]') for _x in _g.group(1).split(",")]
+    _keys = [_x.split(".")[-1].lower() for _x in _keys if _x]
+    if not _keys:
+        return ""
+    # ③ 问句要的是「每个主体各自的耗时」，而不是「按维度汇总平均」
+    #    「各产线/各工序/各设备的平均X」是**维度汇总**，正当需求，不能拦。
+    _each = bool(re.search(
+        r"(每(张|台|条|个|只|辆|批|款|种)|各个|逐个|逐一|每一条|各单)", q))
+    _agg_dim = bool(re.search(r"(各\s*[产线工序车间设备班组]|按\s*[产线工序车间设备班组])", q))
+    if _agg_dim and not _each:
+        return ""
+    if not _each:
+        return ""
+    _key = _keys[0]
+    return ("问题问的是「%s实际用了多少天」，"
+            "要的是**每条记录各自的**时长；而 SQL 先算出日期相减、"
+            "却又对它套了一层 AVG/SUM 并按 %s GROUP BY——"
+            "这是把「各自的真实耗时」压成「该%s的平均耗时」。"
+            "当前数据每个%s恰好一行时两者数值相同，所以看不出问题；"
+            "一旦出现多行（补录、改派），耗时就可能被平均掉，"
+            "用户看到的不是任何一条记录的真实时长。"
+            "请直接逐行给出，不要再聚合："
+            "SELECT %s, (end_date - start_date) AS \"时长天数\" "
+            "FROM <表> ORDER BY \"时长天数\" DESC LIMIT 20。"
+            % (q[:24], _key, _key, _key, _key))
+
+
+def _duration_answered_by_quantity_reason(query: str, sql: str) -> str:
+    """问时长却拿数量列聚合 → 拦；否则 ""。"""
+    try:
+        q = str(query or "")
+        s = re.sub(r"\s+", " ", str(sql or ""))
+        if not q or not s:
+            return ""
+        if not _DURATION_ASK_RE.search(q):
+            return ""
+        # 时长词与数量词共现时（「产量周期分布」「每种缺陷的周期」），
+        # 若数量词才是主诉求、时长词只是修饰（周期分布/周期怎么看），放行。
+        # 判据：问句里出现「分布|走势|趋势|排名|占比」等聚合意图词，
+        # 或时长词只以「周期分布」「周期变化」这类复合词出现 → 不拦。
+        if _DURATION_AS_MODIFIER_RE.search(q):
+            return ""
+        # ⚠ 2026-10-06 Q4 实测追加：「逐单直算被套一层 AVG + GROUP BY」也该拦。
+        # 模型这轮写的是：
+        #     WITH order_duration AS (SELECT work_order_no,
+        #            (end_date - start_date) AS duration_days FROM mes_work_order)
+        #     SELECT work_order_no, AVG(duration_days) FROM order_duration
+        #     GROUP BY work_order_no ORDER BY 2 DESC LIMIT 20
+        # 日期相减是对的，所以下面那条"无日期运算"判据放行；
+        # 但按**单号**分组再平均毫无意义——每张工单本来就一行，
+        # 这层AVG 一旦遇到一单多行（补录工单、改派）就会把真实工期平均掉，
+        # 而用户要的是「每张工单用了多少天」，本来就该逐行给。
+        # 判据：AVG/SUM 的参数是「日期相减的结果」**且** 外面套了 GROUP BY
+        #      且 GROUP BY 的键就是那个日期相减所依据的单/序列表→ 拦。
+        _wrapped = _duration_avg_wrapped_reason(q, s)
+        if _wrapped:
+            return _wrapped
+        # 有真实日期运算 → 放行
+        if _DATEFUNC_RE.search(s):
+            return ""
+        m = _DATE_MINUS_RE.search(s)
+        if m:
+            frag = m.group(0)
+            # 减号两侧只要有一侧像日期/时间列就算真日期差
+            if re.search(r"(date|time|_dt|_day|日|期)", frag, re.I):
+                return ""
+        # 到这里还没有任何日期运算，却对某个列做聚合 → 高度可疑
+        # 列名可能带双引号（实测真实 SQL：`SUM("plan_qty")::numeric AS 汇总`），
+        # 首版只匹配裸标识符 → 0/4 全漏。
+        for proj in _proj_candidates(s):
+            for raw in re.findall(r"(?:SUM|sum|AVG|avg|MAX|max|MIN|min)\s*\(\s*"
+                                  r'[`"\[]?([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?)[`"\]]?'
+                                  r"\s*\)", proj):
+                col = raw.split(".")[-1]
+                if re.search(r"(date|time|_dt|_day)", col, re.I):
+                    continue  # 聚合的是日期列，不算
+                return ("问题问的是**时间跨度**（多少天/耗时/周期），而 SQL 里没有任何日期相减，"
+                        "却对「%s」这个数量列做了聚合——数量当天数用，单位完全不同。"
+                        "工单时长应按 结束日期 - 开始日期 计算，如 "
+                        "SELECT work_order_id, (end_date - start_date) AS \"工期天数\" "
+                        "FROM mes_work_order ORDER BY \"工期天数\" DESC。" % col)
+        return ""
+    except Exception:
+        return ""
+
+
+# ── ②.8-c 占比恒为 100：先窗口排名再过滤，窗口的分区已被抽空 ──────────────
+# 用户实测问「每种缺陷类型主要由哪个责任工序负责，把数量和占比列出来」，返回 8 行
+# `percentage_within_type` **全部是 100**。SQL 形态是：
+#     SELECT ..., SUM(qty)*100.0 / NULLIF(SUM(qty) OVER (PARTITION BY type),0) AS pct
+#     FROM ( SELECT ..., ROW_NUMBER() OVER (PARTITION BY type ORDER BY SUM(qty) DESC) rn
+#            FROM ... GROUP BY type, process ) ranked
+#     WHERE rn = 1          --← 先过滤
+# 窗口函数在**过滤之后**求值：每个 type 分区只剩 1 行 → 分母 = 分子 → 占比恒 100。
+# 用户看到「该工序包揽了 100% 的缺陷」，结论完全反了（真实值 43.67%~52.58%）。
+#
+# 判据（确定性、可复现）：
+#   ① SQL 里同时出现 `OVER (PARTITION BY` 与 `WHERE ... rn/row_number = 1`（或 <= 1）；
+#   ② 被引用的分区列与排名列**指向同一个分区**（都是 PARTITION BY 同一个列）；
+#   ③ 存在一个投影是「某聚合 ÷ 同分区窗口聚合」的比值形态。
+# 三者同时成立 ⇒ 分母必被抽空，占比必然 100%。
+_PCT_OVER_PARTITION_RE = re.compile(r"OVER\s*\(\s*PARTITION\s+BY\s+([`\"\w\u4e00-\u9fff.]+)", re.I)
+_RN_FILTER_RE = re.compile(r"WHERE\b[^;]*?\b(rn|row_num|row_number|rank_no|rk)\s*=\s*1\b", re.I)
+# ⚠ 2026-10-06 首版要求「`)` 紧跟 `*100/`」才认作比值形态，而真实 SQL 是
+#   `total_defect_qty * 100.0 / NULLIF(SUM(total_defect_qty) OVER (PARTITION BY defect_type), 0)`
+# —— 分子是**已算好的列名**（子查询里算完再外层引用），不是聚合调用，
+# 首版首版要求 `)` → 0 命中。现在只要求「乘 100 后除以一个带 OVER(PARTITION BY) 的窗口聚合」。
+_PCT_DIV_OVER_RE = re.compile(
+    r"\*\s*100(?:\.0)?\s*/\s*(?:NULLIF\s*\()?\s*"
+    r"(?:SUM|COUNT|AVG|TOTAL)\s*\([^()]*\)\s*OVER\s*\(\s*PARTITION\s+BY",
+    re.I)
+
+
+def _pct_always_100_reason(query: str, sql: str) -> str:
+    """窗口排名后过滤导致占比恒 100 → 拦下要求先算占比再取Top1。"""
+    try:
+        s = re.sub(r"\s+", " ", str(sql or ""))
+        if not s:
+            return ""
+        if not _PCT_DIV_OVER_RE.search(s):
+            return ""          # 没有「窗口聚合做分母」的形态 → 不是这一类
+        parts = _PCT_OVER_PARTITION_RE.findall(s)
+        if not parts:
+            return ""
+        rn_part = None
+        mo = re.search(r"(?:ROW_NUMBER|RANK|DENSE_RANK)\s*\(\s*\)\s*OVER\s*\(\s*PARTITION\s+BY\s+"
+                       r"([`\"\w\u4e00-\u9fff.]+)", s, re.I)
+        if mo:
+            rn_part = mo.group(1)
+        if not _RN_FILTER_RE.search(s):
+            return ""          # 没有「只取第一名」的过滤 → 分母没被抽空
+        if rn_part and parts and rn_part.strip('`"') not in [p.strip('`"') for p in parts]:
+            # 排名用的分区与比值分母用的分区不同 → 分母仍完整，放行
+            return ""
+        return ("SQL 先用ROW_NUMBER() 按「%s」分区取第一名（WHERE rn=1），"
+                "再算「数量 ÷ 同分区总量」的占比——窗口函数在过滤之后才求值，"
+                "每个分区只剩自己一行，分母=分子，占比必然恒为 100%%，"
+                "会把「该工序只占一部分」错报成「占全部」。"
+                "请改为：先在子查询里算出每个分区的总量占比，再取第一名（或在外层用子查询取总量）"
+                % (rn_part or parts[0]))
+    except Exception:
+        return ""
+
+
+# ── ②.8-d 日期常量越界：SQL 里的年份超出库中实际数据年份（2026-10-06 实测 P0）──
+# 用户实测两题都栽在同一个病根上：
+#   「把九月上旬和中旬的投入产出比分开算」→ `stat_date >= '2023-09-01'`，库里是 **2026**
+#   「九月份之后的投入产出比」          → `stat_date >= '2024-10-01'`，库里是 **2026**
+#
+# 为什么这两条特别危险，比返回 0 行严重得多：
+#   ① 2023 那条命中 0 行 → 返回 `{"投入产出比": null}`，模型却照样在正文里写出了
+#      「97.54%/97.53%」这样的具体数字 —— 数据是空的，数字从哪来无从考证；
+#   ② 2024 那条因为下界早于真实数据，反而"命中"了全部记录 → 把
+#      「9 月之后」答成「2024-10 至今的全量」，是**假阴性**：本该 0 行（9/15 后无数据），
+#      却给了一个看起来完美的答案。用户无从发现。
+#
+# 判据：SQL 里的**日期字面量年份**与库中相关时间列的**实际数据年份**完全不相交。
+# 只在能确实查到数据范围时启用（查不到就放行，绝不猜）。
+# ⚠ 故意留一年容差：跨年数据（如 2025-12~2026-01）不该被误杀。
+_DATE_LITERAL_YEAR_RE = re.compile(r"'(\d{4})-\d{2}-\d{2}'")
+_DATE_RANGE_CACHE: dict[str, tuple] = {}
+_DATE_RANGE_TTL = 300
+_DATE_RANGE_LOCK = __import__("threading").RLock()
+# 候选时间列（按优先级）。只查**名字像日期**的列，避免误取业务编码。
+_DATE_COL_CANDIDATES = (
+    "stat_date", "record_date", "snapshot_date", "inspection_date",
+    "start_date", "end_date", "start_time", "create_time",
+    "created_at", "date", "order_date", "in_date",
+)
+
+
+# 「至今」类开放式上界会写成 9999-12-31 / 0000-01-01，这些不是真实年份，
+# 参与 min/max 会把错误年份掩盖掉（2026-10-06：'2024-10-01' AND '9999-12-31'
+# 的 min=2024 刚好落进容差，越界检查被哨兵救掉）。
+_DATE_SENTINEL_YEARS = frozenset({0, 9998, 9999})
+
+# 相对时间问句（「最近N天/近两周/本月」）在演示库里必然落空：
+# 库中数据止于 2026-09-15，而 current_date = 2026-10-06，
+# 于是 `stat_date >= CURRENT_DATE - INTERVAL '6 days'` 命中 0 行。
+# 用户看到的却是「查询执行成功，但当前数据范围内没有匹配的记录」——
+# 事实没错（区间确实没数据），但把**可答的问题**说成了没数据。
+# 正确做法：相对时间锚到**数据的最大日期**，也就是本系统编译器一直在用的
+# `date_trunc('year', MAX(stat_date))` / `(SELECT MAX(stat_date) FROM t)` 模式。
+_CURDATE_ANCHOR_GATE_ON = os.getenv(
+    "QUALITY_GATE_CURDATE_ANCHOR", "1").strip() not in ("0", "false", "off")
+# 相对时间问句（要最近/近/本月/上周这类滚动窗口）
+_ROLLING_ASK_RE = re.compile(
+    r"(最近|近\s*\d+|过去\s*\d+|本月|这个月|上周|这周|当天|今日|昨天|"
+    r"当天|本日|近一周|近两周)", re.I)
+
+
+def _curdate_anchor_empty_reason(query: str, sql: str) -> str:
+    """相对时间用 CURRENT_DATE 锚点，但数据窗口早于今天 → 大概率 0 行 → 拦。"""
+    if not _CURDATE_ANCHOR_GATE_ON:
+        return ""
+    try:
+        q = str(query or "")
+        s = re.sub(r"\s+", " ", str(sql or ""))
+        if not q or not s:
+            return ""
+        if not _ROLLING_ASK_RE.search(q):
+            return ""
+        # 已经在用数据锚点了 → 放行
+        if re.search(r"MAX\s*\(\s*\w*(?:stat_date|_date|date)\w*\s*\)", s, re.I):
+            return ""
+        if not re.search(r"CURRENT_DATE|CURRENT_TIMESTAMP|\bNOW\s*\(|date_trunc\s*\(\s*'day'",
+                         s, re.I):
+            return ""
+        # 拿库中最大日期跟今天比：差超过 3 天就说明 CURRENT_DATE 锚不到数据
+        for tbl in re.findall(r"\b(?:FROM|JOIN)\s+([a-zA-Z_][\w.]*)", s):
+            base = tbl.split(".")[-1].lower()
+            cols = _all_table_columns() or {}
+            if base not in cols:
+                continue
+            tcols = {str(c).lower(): str(c) for c in cols.get(base, [])}
+            for cand in _DATE_COL_CANDIDATES:
+                real_col = tcols.get(cand)
+                if not real_col:
+                    continue
+                rng = _db_actual_year_range(base, real_col)
+                if not rng:
+                    break
+                try:
+                    # ⚠ 执行入口是 `db.executor.execute_sql`（llm_service 顶部已导入），
+                    #   **不是** `database.execute_sql` —— 首版写成后者 → ImportError
+                    #   被外层 except 吞掉 → 守卫恒返回 ""（实测 0/4）。
+                    from db.executor import execute_sql as _es
+                    r = _es('SELECT MAX("%s")::date AS mx FROM "%s"' % (real_col, base))
+                    if r.get("success") and r.get("rows") and r["rows"][0].get("mx"):
+                        import datetime as _dt
+
+                        def _as_date(v):
+                            # 驱动可能回 date / datetime / str 三种类型，
+                            # 首版只处理 str 与 datetime，漏了 date →
+                            #   TypeError: unsupported operand type(s) for -: 'str'/'date'
+                            if isinstance(v, _dt.datetime):
+                                return v.date()
+                            if isinstance(v, _dt.date):
+                                return v
+                            if isinstance(v, str):
+                                try:
+                                    return _dt.date.fromisoformat(v.strip()[:10])
+                                except Exception:
+                                    return None
+                            return None
+
+                        mx = _as_date(r["rows"][0]["mx"])
+                        cur = _es("SELECT CURRENT_DATE AS d")
+                        today = _as_date(cur["rows"][0]["d"]) if (
+                            cur.get("success") and cur.get("rows")) else None
+                        if today and mx and (today - mx).days > 3:
+                            return ("问题问的是滚动时间窗口（最近/近N天/本周），但 SQL 用 "
+                                    "CURRENT_DATE 做锚点，而本库 `%s.%s` 的数据只到 **%s**，"
+                                    "今天是 %s——相差 %d 天，这么查必然 0 行，"
+                                    "而用户会以为库里没数据。\n"
+                                    "请改用**数据自身的最大日期**做锚点：把 "
+                                    "CURRENT_DATE 换成 (SELECT MAX(\"%s\") FROM \"%s\")，"
+                                    "或按编译器惯用写法 "
+                                    "date_trunc('year', MAX(\"%s\")) 构造区间。"
+                                    % (base, real_col, mx, today, (today - mx).days,
+                                       real_col, base, real_col))
+                except Exception:
+                    # 静默吞异常会让守卫变成「永远放行」而无人察觉
+                    # （2026-10-06 两次 0/N 都是这么来的）。留痕到调试日志。
+                    try:
+                        import logging as _lg
+                        _lg.getLogger(__name__).warning(
+                            "[curdate_anchor_guard] 探测失败 table=%s col=%s",
+                            base, real_col, exc_info=True)
+                    except Exception:
+                        pass
+                break
+    except Exception:
+        try:
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                "[curdate_anchor_guard] 守卫内部异常", exc_info=True)
+        except Exception:
+            pass
+    return ""
+
+
+def _db_actual_year_range(table: str, date_col: str) -> tuple[int, int] | None:
+    """查某表某时间列的实际数据年份区间 (min_year, max_year)；查不到返回 None。
+
+    ⚠ 必须同时给**表名和列名**（2026-10-06 修）：首版只给列名并把列名塞进
+    `FROM`，SQL 变成 `FROM stat_date` → 42P01 关系不存在 → except 静默吞掉
+    → 守卫恒返回 None（实测 0/2拦下，诊断见 _vequo_fb/yeargate_diag2.txt）。
+    列名加双引号以避开 date 等保留字；表名不加引号，保持与执行侧裸表名解析一致。
+    """
+    table = str(table or "").split(".")[-1]
+    date_col = str(date_col or "")
+    if not table or not date_col:
+        return None
+    key = "%s|%s|%s" % (_current_db_key(), table, date_col)
+    now = time.time()
+    with _DATE_RANGE_LOCK:
+        hit = _DATE_RANGE_CACHE.get(key)
+        if hit and now - hit[0] < _DATE_RANGE_TTL:
+            return hit[1]
+    out = None
+    try:
+        from database import get_db_type
+        if get_db_type() == "mysql":
+            cast = "YEAR(`%s`.`%s`)" % (table, date_col)
+        else:
+            cast = 'EXTRACT(YEAR FROM "%s"."%s")' % (table, date_col)
+        sql = ("SELECT MIN(%s) AS ymin, MAX(%s) AS ymax FROM %s"
+               % (cast, cast, table))
+        r = execute_sql(sql)
+        if r.get("success") and r.get("rows"):
+            row = r["rows"][0]
+            ymin, ymax = row.get("ymin"), row.get("ymax")
+            if ymin is not None and ymax is not None:
+                out = (int(float(ymin)), int(float(ymax)))
+    except Exception:
+        out = None
+    with _DATE_RANGE_LOCK:
+        _DATE_RANGE_CACHE[key] = (now, out)
+    return out
+
+
+def _date_literal_year_mismatch_reason(query: str, sql: str) -> str:
+    """SQL 里的日期年份与库中实际数据年份完全不相交 → 拦下。"""
+    if not _DATE_YEAR_GATE_ON:
+        return ""
+    try:
+        q = str(query or "")
+        s = re.sub(r"\s+", " ", str(sql or ""))
+        if not s:
+            return ""
+        years = set()
+        for m in _DATE_LITERAL_YEAR_RE.finditer(s):
+            try:
+                years.add(int(m.group(1)))
+            except Exception:
+                pass
+        # 剔除 9999-12-31 / 0000-01-01 这类「至今/不限」哨兵年，
+        # 否则 min(years) 会被拉到真实下界上，越界检查形同虚设。
+        years = {y for y in years if y not in _DATE_SENTINEL_YEARS}
+        if not years:
+            return ""
+        # SQL 里已经用了 CURRENT_DATE / NOW() 说明作者知道要走相对时间，放行
+        if re.search(r"CURRENT_DATE|CURRENT_TIMESTAMP|\bNOW\s*\(|date_trunc\s*\(\s*'month'\s*,\s*CURRENT", s, re.I):
+            return ""
+        cols = _all_table_columns() or {}
+        # 在SQL 提到的表里，找一个实际年份与之不相交的
+        for tbl in re.findall(r"\b(?:FROM|JOIN)\s+([a-zA-Z_][\w.]*)", s):
+            base = tbl.split(".")[-1].lower()
+            if base not in cols:
+                continue
+            tcols = {str(c).lower(): str(c) for c in cols.get(base, [])}
+            for cand in _DATE_COL_CANDIDATES:
+                real_col = tcols.get(cand)
+                if not real_col:
+                    continue
+                rng = _db_actual_year_range(base, real_col)
+                if not rng:
+                    continue
+                ymin, ymax = rng
+                # 留一年容差：跨年数据不算越界
+                if max(years) < ymin - 1 or min(years) > ymax + 1:
+                    return ("问题问的是近期数据，但 SQL 里的日期常量年份（%s）与本库实际数据"
+                            "时间范围（%s 表 %s 列为 %d~%d 年）完全不相交，"
+                            "结果要么是 0 行，要么把全量数据误当成问题要的区间。"
+                            "本库实际数据只到 %d 年，请改用该年份，"
+                            "或直接用 CURRENT_DATE / date_trunc 表达相对时间。"
+                            % ("/".join(str(y) for y in sorted(years)),
+                               base, real_col, ymin, ymax, ymax))
+                break
+    except Exception:
+        return ""
+    return ""
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ②.8-e 「N月之后」被当成「N月」：开区间被闭区间化（2026-10-06 实测 P0）
+# ══════════════════════════════════════════════════════════════════════
+# 用户实测：「九月份之后的投入产出比」→ SQL 是
+#     WHERE stat_date >= date_trunc('year', CURRENT_DATE) + INTERVAL '8 months'
+#       AND stat_date <  date_trunc('year', CURRENT_DATE) + INTERVAL '9 months'
+# 也就是**九月份整月**（[9-1, 10-1)）。问句要的是「九月之后」，
+# 正确区间是 stat_date > '2026-09-30'，两者差了一个月的语义。
+#
+# 为什么既有守卫全都没拦住（这三条都逐条实测过）：
+#   · ②.8-c 年份越界：SQL 里**没有日期字面量**（用的是 CURRENT_DATE）→ 判据不成立；
+#   · ②.8-d CURRENT_DATE 锚点：那个守卫拦的是「锚点落在数据窗口之外 → 必 0 行」，
+#     而这里锚点恰好落在数据窗口**之内**（数据止于 9-15，在 [9-1,10-1) 里）→ 放行；
+#   · ②.5 除法守卫：确实做了除法 → 放行。
+# ⇒ 三条守卫都没错，错的是**语义本身**：开区间被写成了闭区间。
+#
+# 为什么这比返回 0 行严重：它不是「查不到」，而是**自信地给出了一个错答案**
+# （0.9754 是九月的比值，而「九月之后」的正确答案是「无数据」）。用户无从发现。
+#
+# ── 判据演进史（三次实测踩坑，读代码前务必看这段）────────────────────
+# 【首版】只看「SQL 里有没有 `INTERVAL 'N months'` 这种月份平移锚点」。
+#   实测 6/6 拦、10/10 放行，看着是好的 —— 但有个致命缺口：模型重试时把写法
+#   换成日期字面量 `stat_date >= '2023-10-01' AND stat_date <= '9999-12-31'`，
+#   没有平移锚点 → 放行。而这条错得更离谱：'2023-10-01' 在九月之前。
+#   ⇒ 教训一：「按写法判」不如「按语义判」。
+#
+# 【第二版】改成按语义判（下界 vs 问句月末），但比较基准用了**下界自己的年份**：
+#     for _cand_y in (_lb.year, _lb.year+1, _lb.year-1): ...
+#   于是 '2023-10-01' 配候选年 2023 时九月月末=2023-09-30，`_lb > _eom` 成立
+#   → 第一轮就 return "" 放行。实测**必须拦 0/9**（比首版还差）。
+#   而且这版替换时把辅助函数一起删掉了（替换区间正好夹在两个标记之间），
+#   `module 'agent.llm_service' has no attribute '_sql_time_lower_bound'`。
+#   ⇒ 教训二：**先备份再做大段替换**，别让删除区间跨过别的定义。
+#
+# 【本版（第三版）】只判 (月, 日)，**彻底不管年份** —— 职责必须与 ②.8-c 分开：
+#   · ②.8-e 管的是「区间开闭对不对」：问「N月之后」，下界必须晚于 N月的月末；
+#   · ②.8-c 管的是「年份对不对」：字面量年份与库内实际数据年份是否不相交。
+#   两条守卫混在一起写会互相干扰（实测已证：把年份塞进 ②.8-e 后 0/9）。
+#
+#   做法：下界日期只取 (月, 日) 组成元组，与「(M, M月月末日)」比大小，年份一律丢弃。
+#     下界 = '2023-10-01' 问「九月之后」→ (10,1) > (9,30) → ②.8-e 放行；
+#       但年份 2023 vs 库里 2026 由 ②.8-c 拦下（职责各归其位）。
+#     下界 = '2026-09-01' 问「九月之后」→ (9,1) < (9,30) → ②.8-e 拦下（正是本月内）。
+#   于是 ②.8-e 对年份错误**完全免疫**，不会再出现第二版那种自我放行。
+#
+# 边界宽容：下界**恰好等于** (M, 月末) → 放行。
+#   `stat_date > '2026-10-31'`（问「十个月之后」）本身就是正确的月末开区间写法。
+#
+# 拦截阈值（三条同时成立才拦，宁可漏过也不误伤 —— 拦错比漏错更糟，
+#   用户问九月却因为守卫误伤而查不到数）：
+#   ① 问句点名了「N月」**并且**带开放式后缀（之后/以后/往后/起/及以后）；
+#   ② SQL 里**没有**月末开区间的写法特征（> 月末 / last_day / 月末-1day）；
+#   ③ SQL 能解析出时间下界，且该下界 (月,日) 早于 (M, M月月末日)
+#      —— 或解析不出下界但存在把区间落在 M 月的月份平移锚点。
+_AFTER_GATE_ON = os.getenv("QUALITY_GATE_AFTER_MONTH", "1").strip() not in (
+    "0", "false", "off")
+# 「之后/以后」类开放式后缀。「九月上中旬」不含这些词 → 放行。
+_AFTER_SUFFIX_RE = re.compile(r"(之后|以后|往后|及以后)")
+_MONTH_NUM_CN = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
+                 "七": 7, "八": 8, "九": 9, "十": 10, "十一": 11, "十二": 12,
+                 "元": 1}
+_ASK_MONTH_RE = re.compile(
+    r"([一二三四五六七八九十]{1,3}|[1-9]|1[0-2])\s*月")
+
+
+def _ask_months(query: str) -> set:
+    """从问句里取出月份数字集合（支持中文/阿拉伯）。"""
+    out = set()
+    for m in _ASK_MONTH_RE.finditer(str(query or "")):
+        t = m.group(1)
+        if t.isdigit():
+            v = int(t)
+        else:
+            v = _MONTH_NUM_CN.get(t) or _MONTH_NUM_CN.get(t[-1])
+        if v and 1 <= v <= 12:
+            out.add(v)
+    return out
+
+
+# SQL 里 `+ INTERVAL 'N months'` 的平移量（date_trunc('year',X)+Nmonths = 第 N+1 月）
+_SQL_MONTH_SHIFT_RE = re.compile(
+    r"INTERVAL\s*'\s*(\d{1,2})\s*months?\s*'", re.I)
+# 月末开区间的正确写法特征
+_SQL_AFTER_MOMENT_RE = re.compile(
+    r"(>\s*[^<]*?(?:-\s*INTERVAL\s*'\s*1\s*day'|last_day|end\s+of\s+month))|"
+    r"(INTERVAL\s*'\s*1\s*month'\s*-\s*INTERVAL\s*'\s*1\s*day'\s*)|"
+    r"(DATE\s*\+\s*INTERVAL\s*'\s*1\s*month'\s*-)", re.I)
+# 时间下界：>=/ > 后紧跟的日期字面量。
+_SQL_LOWER_RE = re.compile(r"(?:>=|>)\s*'(\d{4})-(\d{1,2})-(\d{1,2})'", re.I)
+
+
+def _month_last_day(month: int) -> int:
+    """该月的天数（month 取 1-12）。不关心年份。"""
+    import calendar as _cal
+    return _cal.monthrange(2024, int(month))[1]     # 2024 是闰年，2月取29
+    # ⚠ 对 2 月会有 1 天宽容（2026-02-28 ≤ 2026-02-29 → 放行）。
+    #   这是刻意的：守卫宁可漏过也不误伤，二月边界不值得为它引入闰年逻辑。
+
+
+def _sql_time_lower_md(sql: str):
+    """取 SQL 里**最早**的时间下界，返回 (月, 日) —— **刻意丢掉年份**。
+
+    为什么丢年份（2026-10-06 实测教训）：
+      首版/第二版都把年份算进去，于是「问九月之后」配下界 '2023-10-01' 时，
+      基准年取下界自己的年 → '2023-10-01' > '2023-09-30' → **自我放行**，
+      必须拦样本直接掉到 0/9。而年份错本来就是 ②.8-c 的活儿。
+      只比 (月,日) 之后：'2023-10-01' → (10,1) > (9,30) → ②.8-e 放行，
+      由 ②.8-c 按「年份与库内实际数据不相交」拦下，各司其职。
+
+    哨兵年（>2100，如 9999-12-31 表示「至今」）一律忽略，不当下界。
+    """
+    txt = re.sub(r"\s+", " ", str(sql or ""))
+    if not txt:
+        return None
+    mds = []
+    for m in _SQL_LOWER_RE.finditer(txt):
+        try:
+            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        except Exception:
+            continue
+        if y > 2100:                       # 「至今/不限」哨兵，不是真下界
+            continue
+        if not (1 <= mo <= 12 and 1 <= d <= 31):
+            continue
+        mds.append((mo, d))
+    if not mds:
+        return None
+    return min(mds)
+
+
+def _open_interval_after_month_reason(query: str, sql: str) -> str:
+    """问「N月之后」而 SQL 把它当成「N月/更早」→ 返回可读原因；否则 ""。
+
+    只判**区间开闭**，不判年份（年份由 ②.8-c 负责，见上方演进史）。
+    """
+    if not _AFTER_GATE_ON:
+        return ""
+    try:
+        q = str(query or "")
+        s = re.sub(r"\s+", " ", str(sql or ""))
+        if not q or not s:
+            return ""
+        # ① 问句要有「N月」+ 开放式后缀
+        if not _AFTER_SUFFIX_RE.search(q):
+            return ""
+        ask_m = _ask_months(q)
+        if not ask_m:
+            return ""
+        # ② 已经用了月末开区间写法 → 放行
+        if _SQL_AFTER_MOMENT_RE.search(s):
+            return ""
+        _why = ("问题问的是「%s之后」，这是**开区间**（该月结束之后才统计）；"
+                "但 SQL 统计的范围落在该月之内或更早 —— "
+                "会把「之后」答成「该月甚至更早」。"
+                "请改用该月月末之后作为起点，例如 stat_date > 「该月最后一天」；"
+                "若库里该月之后确实没有数据，"
+                "请明确回「该时间段无数据」并说明库里最新数据到哪一天。")
+
+        # ③ 主判据：时间下界 (月,日) vs 问句月的月末（年份无关）
+        _md = _sql_time_lower_md(s)
+        if _md is not None:
+            _eom = (sorted(ask_m)[0], _month_last_day(sorted(ask_m)[0]))
+            if _md < _eom:
+                # 下界落在该月之内或更早 ⇒ 错
+                return _why % ("/".join(str(x) for x in sorted(ask_m)))
+            return ""          # 下界晚于该月月末 → 区间语义正确
+
+        # ④ 回落：解析不出字面量下界（如 date_trunc + CURRENT_DATE）
+        #    → 只能用「月份平移锚点」判断。
+        #    `date_trunc('year',X) + INTERVAL '8 months'` = 9月1日（8+1=9 月），
+        #    若这个落点月 <= 问句月，就说明区间把问句那个月算进去了 ⇒ 错。
+        _shifts = set()
+        for _m2 in _SQL_MONTH_SHIFT_RE.finditer(s):
+            try:
+                _shifts.add(int(_m2.group(1)))
+            except Exception:
+                pass
+        if not _shifts:
+            return ""          # 连平移锚点也没有 → 不确定，保守放行
+        _ask_m = sorted(ask_m)[0]
+        if any((_sh + 1) <= _ask_m for _sh in _shifts):
+            return (_why % ("/".join(str(x) for x in sorted(ask_m)))
+                    + "（当前 SQL 用的是某个月的月初含/月末不含的闭区间窗。）")
+        return ""
+    except Exception:
+        return ""
+
+
+def _query_time_boundary(matched_tables: list):
+    """查候选表里时间列的真实数据边界 (min_date, max_date, col, table)。
+
+    实现要点（三处都是实测踩出来的坑）：
+      · **必须表名 + 列名一起查**，只给列名会变成 `FROM stat_date` → 42P01；
+      · ⚠⚠ **必须用本模块的 `execute_sql`，不能 `from database import
+        execute_sql`** —— `database` 模块里**根本没有**这个函数（真实入口是
+        `get_db()`），首版写成那样 → ImportError → 被下面 except 吞掉 →
+        函数恒返回 None → 整条「区间无数据」提示**从来没生效过**，
+        而测试只看到"没报错"就放过了。凡是 except 里直接 return None 的
+        取数函数，必须单独验证它真能取到数，不能只看它不抛异常；
+      · 查不到就返回 None，绝不猜；
+      · 逐表逐列试，第一个取到非空 MIN/MAX 的就返回。
+    用途：错误出口把「没能生成 SQL」纠正成
+         「你问的区间本库确实没有数据，数据最新到 X」——比"换个模型再试"有用得多。
+    """
+    try:
+        cols_map = _all_table_columns() or {}
+        tbls = []
+        for t in (matched_tables or [])[:4]:
+            if isinstance(t, dict):
+                nm = str(t.get("table_name", "")).split(".")[-1]
+            else:
+                nm = str(t).split(".")[-1]
+            if nm and nm.lower() in cols_map:
+                tbls.append(nm)
+        for tbl in tbls:
+            tcols = {str(c).lower(): str(c) for c in cols_map.get(tbl.lower()) or []}
+            for cand in _DATE_COL_CANDIDATES:
+                real_col = tcols.get(cand)
+                if not real_col:
+                    continue
+                sql = ('SELECT MIN("%s") AS lo, MAX("%s") AS hi FROM %s'
+                       % (real_col, real_col, tbl))
+                r = execute_sql(sql)      # 模块内函数，不是 database.execute_sql
+                if r.get("success") and r.get("rows"):
+                    row = r["rows"][0] or {}
+                    lo, hi = row.get("lo"), row.get("hi")
+                    if lo is None and hi is None:
+                        continue
+                    return (str(lo)[:10], str(hi)[:10], real_col, tbl)
+    except Exception:
+        return None
+    return None
+
+
+# ── 时间意图 vs 数据边界：与守卫**解耦**的独立核对（2026-10-06 实测 P0）──
+# 为什么要独立：守卫报告的是「SQL 这条写法哪里不对」，措辞五花八门
+# （「开区间被闭区间化」「年份越界」「缺除法」…）。若错误出口靠**匹配守卫文案**
+# 来决定要不要说「这个区间本来就没数据」，就等于把用户看到的提示
+# 绑死在内部措辞上 —— 实测就是这么漏的：问「九月份之后的投入产出比」，
+# 这次模型写的是 `stat_date >= '2024-01-01' AND <= '9999-12-31'`，
+# 守卫报的是「年份 2024 越界」，文案里没有「之后/开区间」字样，
+# 于是特判没触发，用户收到的仍是"换个模型再试"这种误导性提示。
+#
+# 这里改成**从问句直接抽时间意图**，再和真实数据边界对质，
+# 完全不看守卫说了什么：
+#     问句要 9月15日 之后  →  数据上界 ≤ 9月30日  ⇒  确认无数据，如实说明
+# 判断依据是事实（数据到哪天为止），不是内部文案。
+_TIME_AFTER_RE = re.compile(r"(之后|以后|往后)")
+_TIME_LAST_N_RE = re.compile(
+    r"(?:最近|近|过去)\s*([0-9]{1,4}|[一二两三四五六七八九十百]{1,4})\s*天")
+_CN_NUM = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
+           "七": 7, "八": 8, "九": 9, "十": 10}
+
+
+def _cn_int(t: str) -> int:
+    """中文数字转阿拉伯数字（覆盖十/十五/二十/九十/三百这类写法）。
+
+    守卫 `_ask_months` 里那套只够解析月份（最大十二），但「最近**九十**天」
+    「过去**三百**天」不在月份表里 —— 首版测出来 0/9，有 3 条就死在这里。
+    十位制：
+      十/一十=10、十五=15、二十=20、九十=90
+      百位：三百=300、三百五十=350（「三百五十」需逐段累加）
+    简化处理：逐位累积 + 单位乘数。
+      百/十 是单位：见到就把已累积的段乘上去，然后清段。
+        三百五十 → 段3遇百 → 300；段50遇十 → 500 ✗
+      正确做法：单位乘的是**它前面那一段**，后面若有新段则相加：
+        三百五十 → 「三百」=3*100=300 落定；「五十」=5*10=50 → 300+50=350 ✓
+    """
+    t = str(t or "")
+    if not t:
+        return 0
+    if t.isdigit():
+        return int(t)
+    if any(c not in _CN_NUM and c not in ("十", "百") for c in t):
+        return 0
+    total, section = 0, 0        # section = 已读数字但还没遇单位的累积值
+    for ch in t:
+        if ch in ("百", "十"):
+            mult = 100 if ch == "百" else 10
+            # 单位前没数字时，前提是 1（十五=15、十=10）
+            total += (section if section else 1) * mult
+            section = 0
+        else:
+            section += _CN_NUM.get(ch, 0)
+    return total + section        # 末尾没单位的部分直接加上（三=3）
+
+
+def _time_intent_exceeds_data(query: str, matched_tables: list):
+    """问句要的时间区间明显超出本库数据范围 → 返回可读说明；否则 None。
+
+    只覆盖三种**能明确判超范围**的意图（宁可漏判也不误判）：
+      ① 「N月之后/以后」  → 数据上界 ≤ N月月末 ⇒ 无数据
+      ② 「N月」（整月）    → 数据上界 < N月1日  ⇒ 该月完全无数据
+      ③ 「最近/近 N 天」   → 数据上界 < 实际数据起点 + N 天 ⇒ 窗口不完整
+    """
+    try:
+        q = re.sub(r"\s+", "", str(query or ""))
+        if not q:
+            return None
+        bx = _query_time_boundary(matched_tables)
+        if not bx:
+            return None
+        lo, hi, col, tbl = bx
+        try:
+            hi_d = datetime.date(int(hi[0:4]), int(hi[5:7]), int(hi[8:10]))
+            lo_d = datetime.date(int(lo[0:4]), int(lo[5:7]), int(lo[8:10]))
+        except Exception:
+            return None
+
+        # ① 「N月之后」
+        if _TIME_AFTER_RE.search(q):
+            am = _ask_months(q)
+            if am:
+                m = sorted(am)[0]
+                eom = datetime.date(hi_d.year, m, _month_last_day(m))
+                if hi_d <= eom:
+                    # ⚠ 回显只取月份，不要回显整句：整句已含"之后"，
+                    # 再拼一个"之后"会变成「九月份之后的投入产出比之后」——
+                    # 实测踩过，文案读起来像卡带。
+                    _cn = {1: "一", 2: "二", 3: "三", 4: "四", 5: "五", 6: "六",
+                           7: "七", 8: "八", 9: "九", 10: "十", 11: "十一",
+                           12: "十二"}.get(m, str(m))
+                    return ("你问的是「%s月之后」的数据，而本库这张表（%s 表 %s 列）的"
+                            "时间数据只到 **%s**，%s月末之后没有任何记录。\n"
+                            "这不是查询出错——换模型或换个说法都不会有结果，"
+                            "因为库里就没有这段时间的数据。\n"
+                            "可以改成问「截至 %s 的情况」。"
+                            "如果你认为库里应该有这段时间的数据，"
+                            "说明数据同步还没覆盖到这里。"
+                            % (_cn, tbl, col, hi, _cn, hi))
+                return None
+
+        # ② 「N月」整月（不带"之后"）：问的月份整月都落在数据上界之后
+        if not _TIME_AFTER_RE.search(q):
+            if ("上旬" not in q and "中旬" not in q and "下旬" not in q):
+                am2 = _ask_months(q)
+                if am2:
+                    m2 = min(am2)      # 取最早那个月（"八月和九月" → 八月）
+                    # 只有当问的月份**晚于数据上界所在月**时才判超范围。
+                    # 同月（数据到 9-15，问"九月的投入产出比"）属"部分覆盖"，
+                    # 不是"完全无数据" → 不归这里管，交给正常查询去出数。
+                    if m2 > hi_d.month:
+                        _cn2 = {1: "一", 2: "二", 3: "三", 4: "四", 5: "五",
+                                6: "六", 7: "七", 8: "八", 9: "九", 10: "十",
+                                11: "十一", 12: "十二"}.get(m2, str(m2))
+                        return ("你问的是「%s月份」的数据，而本库这张表"
+                                "（%s 表 %s 列）的时间数据只到 **%s**，"
+                                "没有覆盖到该月。\n"
+                                "换个模型或换个说法都不会有结果，"
+                                "因为库里没有这段时间的数据。\n"
+                                "可以改成问「截至 %s 的情况」。"
+                                % (_cn2, tbl, col, hi, hi))
+            # ③ 「最近/近 N 天」：数据跨度不够 N 天
+            mn = _TIME_LAST_N_RE.search(q)
+            if mn:
+                n = _cn_int(mn.group(1))
+                if n > 0:
+                    span = (hi_d - lo_d).days + 1
+                    if span < n:
+                        return ("你问「最近 %d 天」，但本库这张表（%s 表 %s 列）"
+                                "的数据只覆盖 **%s 到 %s**，一共 %d 天，"
+                                "不足 %d 天。\n换个说法或换模型都不会补出这段数据。\n"
+                                "可以改成问「本表全部数据范围的情况」。"
+                                % (n, tbl, col, lo, hi, span, n))
+        return None
+    except Exception:
+        return None
+
+
+# 「每X」单位词 → 必须除以的那个量（仅用于提示文案，不参与拦截判据）
+_UNIT_PER = (
+    ("每小时", "小时数（或明确声明按 24 小时/班次折算）"),
+    ("日均", "天数"), ("每天", "天数"), ("每月", "月数"),
+    ("每件", "件数（产出/良品数）"),
+    ("每张", "单据数（工单数）"), ("每单", "单据数（工单数）"),
+    ("每台", "设备台数"), ("每人", "人数"), ("人均", "人数"),
+    ("每批", "批次数"), ("每次", "次数"),
+    # 「每种/每个」只在带**数量量词**（每千件/每百件…）时才是换算诉求；
+    # 裸「每种缺陷类型各有多少件」是分组列举，由 _UNIT_GROUPING_RE 排除。
+    ("每千件", "件数×1000"), ("每百件", "件数×100"), ("每万件", "件数×10000"),
+)
+
+# 换算诉求词：出现这些才认为用户要的是「单位换算后的单值」而非分组列举
+_UNIT_CONVERT_ASK = re.compile(
+    r"多少|几多|几(?:件|次|张|台|个|种|批|单|人)|平均|均值|日均|消耗|分摊|摊到|折算|相当于")
+
+# 分组列举句式。要点：「每X**的**Y」或「每X + 各/分别/分别有」——
+#   要的是逐行明细，不是换算后的单值，不该拦。
+#   实测两种句式都真实存在：
+#     「每张工单的投入」        （的）
+#     「每种缺陷类型各有多少件」（各，无"的"）—— 首版只认「的」→ 误伤，已补。
+_UNIT_GROUPING_RE = re.compile(
+    r"每[\u4e00-\u9fa5]{1,4}(?:的[\u4e00-\u9fa5]{1,8}"
+    r"|[\u4e00-\u9fa5]{1,8}(?:各|分别))")
+
+
+def _unit_conversion_reason(query: str, sql: str) -> str:
+    """问句要「每单位多少」，但 SQL 没做任何单位换算（无除法）→ 返回拒绝原因。
+
+    ── 根因（2026-10-06，黄金题库 82 条实测）──────────────────────────
+    82 条里有 5 条栽在同一个坑：**单位换算被静默省略**。
+        #31「平均每张工单投入多少件」→ `AVG(input_qty)` = 1158.07
+             （应 3,187,009 / 344 张工单 = **9,264.56 件/单**）
+        #32「每件产出消耗多少投入」  → `SUM(input_qty)` = 3,187,009，**根本没除**
+             （应 3,187,009 / 3,109,120 = **1.02505**）
+        #35「每条产线每小时投入多少件」→ `SUM(input_qty)`，**没除时间**
+        #33「每千件的投入」        → 1,025.05 应是全厂单值，却按产品×工序×产线铺 1048 行
+    既有守卫 `_ratio_without_division_reason` 只认「率/占比/比例/比重/份额/百分数/X产出比」
+    （`_RATIO_ASK_RE`），**「每小时/每件/每张/日均/人均」这类单位词一个都不认**
+    ⇒ 整个「必须做除法」守卫族对它们全部失效，裸 SUM/AVG 直接放行。
+
+    ── 判据（三条同时成立才拦，宁可漏过不误伤）──────────────────────
+      ① 问句含单位词（每小时/每件/每张/每台/每人/人均/日均…）；
+      ② 问句有**换算诉求**（多少/几件/平均/日均/消耗/分摊/折算）；
+      ③ SQL 投影区没有任何除法。
+    放行的两类：
+      · 分组列举（「每张工单的投入」「每个仓库的库存量」）——要的是逐行明细；
+      · SQL 已做换算（投影含 `/`、`* 100` 或 `/ NULLIF(`）。
+    比值型问句（投入产出比/不良率）不归本守卫，交给 `_ratio_without_division_reason`。
+    """
+    if not _UNIT_GATE_ON:
+        return ""
+    try:
+        q = str(query or "")
+        s = str(sql or "")
+        if not q or not s:
+            return ""
+        units = [(w, d) for w, d in _UNIT_PER if w in q]
+        if not units:
+            return ""
+        # ★ 时间类单位词（每小时/每天/日均/每月）**恒为换算诉求**，
+        #   不可被分组句式豁免 —— 「每天的投入量」虽含「每天的」，
+        #   问的却是「日均投入」这个单值，不是逐日明细。
+        #   反之「每张/每件/每单/每台/每批」是**实体量词**，
+        #   「每X的Y」要的是逐行分组（每张工单的投入），必须放行。
+        _TIME_UNITS = ("每小时", "每天", "日均", "每月")
+        _is_time_unit = any(w in _TIME_UNITS for w, _ in units)
+        # 「每千件/每百件/每万件」是**数量倍率**，不是实体量词——
+        #   「每千件的投入」要的是折算后的单值，不是逐件分组，必须拦。
+        #   实测它会被 _UNIT_GROUPING_RE 的「每X的Y」误捕获。
+        _has_scale = any(w in ("每千件", "每百件", "每万件") for w, _ in units)
+        # 时间类单位词**自身即换算诉求**：说「每天的投入量」要的就是日均单值，
+        #   不必再出现「多少/平均」这类词。实测「每天的投入量」「每天各产线的产量」
+        #   都不含换算诉求词，靠这一条才拦得住。
+        #   但「每天各产线的产量」是逐日产线明细 → 用「各/分别」放行。
+        if _is_time_unit and re.search(r"各|分别|逐", q) \
+                and not re.search(r"平均|日均|日/天|每天平均", q):
+            return ""
+        if not _is_time_unit:
+            # 纯分组列举：每X的Y（各/分别）——要明细行，不是单值
+            if _UNIT_GROUPING_RE.search(q) and not _UNIT_CONVERT_ASK.search(q):
+                if not _has_scale:
+                    return ""
+            # 「每种缺陷类型各有多少件」：分组列举但含「多少」——
+            #   靠"实体量词 + 各/分别"组合放行，避免被误伤。
+            if _UNIT_GROUPING_RE.search(q) and re.search(r"各|分别", q) \
+                    and not _has_scale:
+                return ""
+            # 「每千件的产品有哪些」：疑问句问的是**有哪些实体**（列举），
+            #   不是"每千件是多少"（换算）。「有哪些/是什么/哪几」一律放行。
+            if re.search(r"有哪些|有哪几|是什么|都有什么|哪几个|哪几个", q):
+                return ""
+        if not _is_time_unit and not _has_scale and not _UNIT_CONVERT_ASK.search(q):
+            return ""
+        # 已做除法 → 通过
+        proj = re.split(r"\bFROM\b", s, maxsplit=1, flags=re.I)[0]
+        if "/" in proj or re.search(r"\*\s*100\b", proj) \
+                or re.search(r"/\s*NULLIF\s*\(", proj, re.I):
+            return ""
+        # 比率已在别处算出（CTE/子查询里先除，外层只 SELECT）
+        if re.search(r"\bAS\s+[\"`]?\w*(per|avg_per|rate|ratio)", s, re.I):
+            return ""
+        _w, _d = units[0]
+        _all = "、".join(w for w, _ in units)
+        return ("问题是「%s」这类**单位换算**问法（命中单位词：%s），"
+                "必须除以对应的%s才能得到单值；"
+                "当前 SQL 只是把某个总量/计数直接当成「%s」的结果输出，量纲不对。"
+                "正确做法是：把总量除以 %s（若该分母在库里不存在，如「人数」，"
+                "须在答案里说明缺源字段，而不是硬算）。"
+                % (_w, _all, _d, _w.rstrip("每"), _d))
+    except Exception:
+        return ""
+
+
+# 子守卫清单（2026-10-06 新增）：`_output_quality_reason` 内部逐个 return，
+# 首个命中即退出。要拿到「全部命中原因」只能在这里把子守卫各跑一遍。
+# ⚠ 这份清单**必须与 _output_quality_reason 内部实际挂载的子守卫保持一致**，
+#   否则会漏。新增/删除子守卫时两处都要改（代码里已留提醒注释）。
+_SUB_GUARDS = (
+    "_ratio_without_division_reason",
+    # ②.5-b「每X」单位换算（2026-10-06 新增）：②.5 的同族补充。
+    #   82 条实测 5 条栽在「单位换算被静默省略」：#31 AVG 顶替÷工单数、
+    #   #32 压根没除、#35 没除时间、#33 该给全厂单值却铺 1048 行。
+    "_unit_conversion_reason",
+    "_efficiency_out_of_range_reason",
+    "_count_vs_ratio_mismatch_reason",
+    "_output_counted_with_defect_reason",
+    "_pct_always_100_reason",
+    "_ratio_molecule_has_defect_reason",
+    # ②.5-c 分母形态（2026-10-06 新增）：比值分母写成 good+defect 同样错。
+    #   与分子守卫同源不同位：分子分母都要只取产出/投入本身。
+    #   实测 82 条「每件产出消耗多少投入」0.99567 vs 真值 1.02505。
+    "_ratio_denominator_has_defect_reason",
+    "_duration_answered_by_quantity_reason",
+    "_date_literal_year_mismatch_reason",
+    "_curdate_anchor_empty_reason",
+    "_open_interval_after_month_reason",
+    "_join_cross_domain_reason",
+    "_metric_amplified_reason",
+    # ↓ 2026-10-06 补：这4 条本来就在主链里，但没登记进本清单。
+    #   后果不是"漏拦"，而是 `_all_output_quality_reasons`（用于分辨病根）
+    #   取不到它们 —— Q7「九月份之后的投入产出比」当初就是这样被误判成
+    #   "问题只是少写了除法"，实际病根是开区间被闭区间化。
+    "_silent_impersonation_reason",
+    # 问句时间限定必须落地（2026-10-06 新增，遗留 #5）。
+    #   此前无任何机制检查「问句的时间词有没有出现在 SQL 里」，
+    #   「今天的缺陷数」因此报全量 2115且看起来完全正常。
+    "_time_condition_missing_reason",
+    "_cond_loss_reason",
+    "_detail_intent_reason",
+    "_dim_absent_reason",
+)
+
+
+def _all_output_quality_reasons(query: str, sql: str) -> list:
+    """返回**所有**命中的守卫原因（按清单顺序）。
+
+    与 `_output_quality_reason` 的区别：后者首个命中就return，只能拿到
+    「症状」；本函数拿全量，调用方能分辨「病根」。
+
+    实测价值（Q7「九月份之后的投入产出比」）：②.5「必须做除法」与
+    ②.8-e「开区间被当闭区间」同时命中，但 ②.5 在前 → 单看返回值会以为
+    问题只是"少写了除法"，于是提示用户"换个模型再试"；实际上区间本身就错，
+    补上除法也只是把「九月的比值」算得更精确而已，仍然答非所问。
+    """
+    out = []
+    try:
+        s = str(sql or "")
+        if not s:
+            return out
+        if _final_select_is_star(s):
+            r = _output_quality_reason(query, s)
+            return [r] if r else []
+    except Exception:
+        return out
+    for name in _SUB_GUARDS:
+        fn = globals().get(name)
+        if fn is None:
+            continue
+        try:
+            r = fn(query, s)
+        except Exception:
+            continue
+        if r:
+            out.append("[%s] %s" % (name.replace("_reason", ""), str(r)[:200]))
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 守卫 ②.9：JOIN 键跨域（值域不相交→ 必然 0 行）
+# ══════════════════════════════════════════════════════════════════════
+
+_JOIN_KEY_VALUES: dict = {}          # "表.列" -> [样本值...]
+_JOIN_KEY_CACHE_DONE = [False]
+
+
+def _sample_column_values(col: str, limit: int = 3):
+    """取某列的样本值（去重、非空）。
+
+    一次缓存、全批复用 —— 每条 SQL 最多十几个 JOIN 条件，
+    每个列采一次 3 行，全走 `SELECT DISTINCT col FROM t LIMIT 3`，很轻。
+    """
+    global _JOIN_KEY_VALUES
+    if col in _JOIN_KEY_VALUES:
+        return _JOIN_KEY_VALUES[col]
+    _JOIN_KEY_VALUES[col] = []# 先占位，防递归
+    try:
+        _tn, _cn = col.rsplit(".", 1)
+        # 表名可能带 schema 前缀，也可能被 SQL 里的别名替代 → 只取裸表名
+        _tn = _tn.split(".")[-1].strip('"')
+        if not re.match(r"^[A-Za-z_][\w]*$", _tn):
+            return _JOIN_KEY_VALUES[col]
+        if not re.match(r"^[A-Za-z_][\w]*$", _cn):
+            return _JOIN_KEY_VALUES[col]
+        _r = execute_sql('SELECT DISTINCT "%s" AS v FROM "%s" '
+                          'WHERE "%s" IS NOT NULL LIMIT %d'
+                          % (_cn, _tn, _cn, int(limit)))
+        if isinstance(_r, dict) and _r.get("success"):
+            _vals = [str(x.get("v")) for x in (_r.get("rows") or [])
+                     if x.get("v") is not None]
+            _JOIN_KEY_VALUES[col] = _vals
+    except Exception:
+        _JOIN_KEY_VALUES[col] = []
+    return _JOIN_KEY_VALUES[col]
+
+
+def _resolve_table_of_column(sql: str, alias: str, col: str):
+    """在 SQL 的 FROM/JOIN 段里找出 `alias.col` 里的 alias 指向哪张真实表。"""
+    if not alias:
+        return None
+    a = alias.strip().strip('"').lower()
+    # FROM xxx AS a / JOIN xxx a / FROM xxx a
+    for _m in re.finditer(
+            r"(?:from|join)\s+([\w.]+)(?:\s+(?:as\s+)?\"?([\w]+)\"?)?",
+            sql, re.I):
+        _tbl = _m.group(1).split(".")[-1].strip('"')
+        _al = (_m.group(2) or "").strip('"').lower()
+        if _al == a:
+            return _tbl
+    return None
+
+
+_JOIN_CROSS_DOMAIN_RE = re.compile(
+    r'([\w"]+)\.\"?(\w+)\"?\s*=\s*([\w"]+)\.\"?(\w+)\"?')
+
+
+def _join_cross_domain_reason(query: str, sql: str) -> str:
+    """JOIN 两端的键**值域不相交**→ 返回可读原因；否则 ""（通过）。
+
+    只在「等值 JOIN 的两侧列都能采到样本，且样本值集合无交集」时才判拦。
+    采不到值（表不存在/列不存在/全是NULL）一律放行 —— 宁可漏过也不误伤。
+    """
+    try:
+        s = re.sub(r"\s+", " ", str(sql or ""))
+        if not s or " join " not in (" " + s.lower() + " "):
+            return ""
+        for _m in _JOIN_CROSS_DOMAIN_RE.finditer(s):
+            _a, _ca, _b, _cb = _m.groups()
+            # 只看**两边都是不同列名**的情形；同名列（f.id=g.id）是正常外键
+            if _ca.lower() == _cb.lower():
+                continue
+            # 一侧是字面量（如 = '2026-09-15'）的不在匹配范围，已被正则排除
+            _ta = _resolve_table_of_column(s, _a.rsplit(".", 1)[0], _ca)
+            _tb = _resolve_table_of_column(s, _b.rsplit(".", 1)[0], _cb)
+            if not _ta or not _tb:
+                continue
+            _va = _sample_column_values("%s.%s" % (_ta, _ca))
+            _vb = _sample_column_values("%s.%s" % (_tb, _cb))
+            if not _va or not _vb:
+                continue
+            _sa, _sb = set(_va), set(_vb)
+            # 有交集 → 同域，正常 JOIN，放行
+            if _sa & _sb:
+                continue
+            # 无交集 → 两列取值形态都摆出来了，仍然不相交 ⇒ 跨域
+            return ("JOIN 两侧的键值域完全不相交：`%s.%s` 的取值形如 %s，"
+                    "`%s.%s` 的取值形如 %s，两者永不相等，这条 JOIN 必定返回 0 行。"
+                    "请换成真正对应的主键/外键（缺陷要归到产线，"
+                    "需经 qms_inspection.work_order_id → mes_work_order.line_id，"
+                    "qms_defect_detail 自身没有产线字段）。"
+                    % (_ta, _ca, "/".join(sorted(_sa)[:2]), _tb, _cb, "/".join(sorted(_sb)[:2])))
+    except Exception:
+        return ""
+    return ""
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 守卫 ②.10：度量被 JOIN 放大（SUM 重复计数）
+# ══════════════════════════════════════════════════════════════════════
+
+# 度量列 →它必须待着的"事件明细表"（出现别的表 JOIN 就是放大嫌疑）
+_METRIC_HOME_TABLE = {
+    "defect_qty": "qms_defect_detail",
+    "rework_qty": "mes_process_output",
+    "good_qty": "mes_process_output",
+    "input_qty": "mes_process_output",
+    "sample_qty": "qms_inspection",
+    "downtime_minutes": "eqp_downtime_record",
+}
+
+
+_ALL_PK_CACHE: list = []
+
+
+def _all_primary_keys() -> set:
+    """读库里所有表的主键列，返回 {"表.列"} 集合；读不到返回空集。
+
+    用 information_schema 的 CONSTRAINT 判定，比"列名等于表名+'_id'"可靠。
+    一次读取、全批复用。
+    """
+    global _ALL_PK_CACHE
+    if _ALL_PK_CACHE:
+        return set(_ALL_PK_CACHE)
+    try:
+        _r = execute_sql(
+            "SELECT tc.table_name AS t, kcu.column_name AS c "
+            "FROM information_schema.table_constraints tc "
+            "JOIN information_schema.key_column_usage kcu "
+            "  ON kcu.constraint_name = tc.constraint_name "
+            " AND kcu.table_schema = tc.table_schema "
+            "WHERE tc.constraint_type = 'PRIMARY KEY' "
+            "  AND tc.table_schema = 'public'")
+        if isinstance(_r, dict) and _r.get("success"):
+            for _x in (_r.get("rows") or []):
+                if _x.get("t") and _x.get("c"):
+                    _ALL_PK_CACHE.append("%s.%s" % (
+                        str(_x["t"]).lower(), str(_x["c"]).lower()))
+    except Exception:
+        _ALL_PK_CACHE = []
+    return set(_ALL_PK_CACHE)
+
+
+_COL_UNIQUE_CACHE: dict = {}       # "表.列" -> True/False（该列在本库是否唯一）
+
+
+def _column_is_unique(col: str):
+    """实测某列在本库是否**值唯一**（rows == count(distinct)）。
+
+    返回 True/False；采不到（表/列不存在、SQL 失败）返回 None。
+
+    为什么必须实测、不能看列名（2026-10-06 实测打回来的教训）：
+      首版规则是「两侧列名相同就当外键放行」。听起来合理，但真库上
+      `ON a.defect_qty = b.defect_qty` 两侧列名**确实相同**，
+      实测却是 qms_defect_detail 2115 行 JOIN qms_inspection 1376 行
+      → 533266 行、SUM 放大 380 倍。
+      度量列同名纯属巧合（两张表都叫 defect_qty），不是外键。
+      ⇒ 唯一性只能问数据库。
+    """
+    global _COL_UNIQUE_CACHE
+    col = str(col or "").lower()
+    if not col:
+        return None
+    if col in _COL_UNIQUE_CACHE:
+        return _COL_UNIQUE_CACHE[col]
+    _COL_UNIQUE_CACHE[col] = None          # 先占位，防递归
+    try:
+        _tn, _cn = col.rsplit(".", 1)
+        _tn = _tn.split(".")[-1]
+        if not (re.match(r"^[A-Za-z_][\w]*$", _tn)
+                and re.match(r"^[A-Za-z_][\w]*$", _cn)):
+            return None
+        _r = execute_sql(
+            'SELECT count(*) AS n, count(DISTINCT "%s") AS d FROM "%s"'
+            % (_cn, _tn))
+        if isinstance(_r, dict) and _r.get("success"):
+            rows = _r.get("rows") or []
+            if rows:
+                _n = rows[0].get("n")
+                _d = rows[0].get("d")
+                if _n is not None and _d is not None:
+                    _COL_UNIQUE_CACHE[col] = (int(_n) == int(_d))
+    except Exception:
+        _COL_UNIQUE_CACHE[col] = None
+    return _COL_UNIQUE_CACHE[col]
+
+
+def _metric_amplified_reason(query: str, sql: str) -> str:
+    """度量列被非主键连接**复制求和** → 结果虚高；否则 ""（通过）。
+
+    依据（2026-10-06 实测）：本库 7 张表主键全部 1:1 唯一
+    （rows == count(distinct pk)），所以：
+      · 沿主键↔主键直连（inspection_id、work_order_id…）→ 行数不变，不放大
+      · 用**普通业务字段**跨表连接（`responsible_process_id = mpo.process_id`）
+        → 一条明细匹配多行，SUM 被重复计数
+    实测 q12 Q5：`responsible_process_id = process_id` 使每条缺陷匹配 **344** 行，
+    老化异常 L04 的真值 194被放大成 48892。
+
+    职责单一：只管「行放大导致的虚高」。JOIN 跨域是守卫 ②.9 的事；
+    口径选错（该用检验却用产出）不在此列。
+    """
+    try:
+        q = re.sub(r"\s+", " ", str(query or ""))
+        s = re.sub(r"\s+", " ", str(sql or ""))
+        if not q or not s or " join " not in (" " + s.lower() + " "):
+            return ""
+        # ① 必须是分组统计；问明细清单的不该拦
+        #   ⚠ 首版用「各+最多4个汉字+的/有/是/分」定位分组意图，实测q12 Q5
+        #   原句「各产线"老化异常"这类缺陷各有多少」匹配不到 ——
+        #   「各」与「有」之间夹了引号内容和"这类缺陷"共8 个字，超出 {1,4}。
+        #   ⇒ 改为两组判据：句中**同时**出现「各/每/按…统计」的分组词
+        #     与「数量/总数/多少/分别是/分布」这类聚合意图词。
+        _grp_word = bool(re.search(
+            r"(各\s*[\u4e00-\u9fa5]|每[\u4e00-\u9fa5]{1,3}(?:的)?|"
+            r"按[\u4e00-\u9fa5]{1,4}(?:统计|分组|汇总)|分别统计|分(?:布|别))", q))
+        _agg_word = bool(re.search(
+            r"(数量|总数|多少|分别是|各是多少|占比|比例|合计|统计|汇总|"
+            r"分布|良率|率$|最大值|最小值|最高|最低)", q))
+        if not (_grp_word and _agg_word):
+            return ""
+        # ② 有 SUM(度量列)
+        _mcol = None
+        for _k in _METRIC_HOME_TABLE:
+            if re.search(r"SUM\s*\([^)]*\b%s\b" % _k, s, re.I):
+                _mcol = _k
+                break
+        if _mcol is None:
+            return ""
+        _home = _METRIC_HOME_TABLE[_mcol]
+        _tables = set(x.lower() for x in re.findall(
+            r"(?:from|join)\s+([\w]+)", s, re.I))
+        if _home not in _tables:
+            return ""            # 度量表没出现（全是别名形态）→ 判据不足，放行
+        # ③ 找「跳键」连接：两侧列都不是任何表的主键
+        _pk = _all_primary_keys()
+        if not _pk:
+            return ""            # 拿不到主键信息→ 放行，宁可漏过不误伤
+        for _m in _JOIN_CROSS_DOMAIN_RE.finditer(s):
+            _a, _ca, _b, _cb = _m.groups()
+            # ⚠ 必须「按表配对」判主键，不能只看列名。
+            #   首版只看"列名是否等于某表主键"，于是
+            #   `mpo.process_id` 因process_id 是 dim_process 的主键而被放行 ——
+            #   可 mes_process_output 的主键是 **output_id**，process_id 只是外键，
+            #   这正是 q12 Q5 那条放大 278 倍的连接。
+            _ta = _resolve_table_of_column(s, _a.rsplit(".", 1)[0], _ca)
+            _tb = _resolve_table_of_column(s, _b.rsplit(".", 1)[0], _cb)
+            _ka = "%s.%s" % ((_ta or "").lower(), _ca.lower())
+            _kb = "%s.%s" % ((_tb or "").lower(), _cb.lower())
+            # 该表自身的主键 → 1:1 直连，放行这一条
+            if _ka in _pk or _kb in _pk:
+                continue
+            # ⚠ 「两侧列名相同 → 外键 → 放行」这条首版规则已被实测推翻。
+            #   `ON a.defect_qty = b.defect_qty` 两侧同名却是**拿度量列当连接键**，
+            #   实测 2115×1376 → 533266 行、SUM 放大 380 倍。
+            #   ⇒ 改为实测唯一性：任一侧唯一 ⇒ N:1 ⇒ 不放大，放行；
+            #     两侧都不唯一 ⇒ M:N ⇒ 必然复制累加，拦。
+            #     采不到唯一性（表不存在等）→ 放行，宁可漏过不误伤。
+            _ua = _column_is_unique("%s.%s" % (_ta or "", _ca))
+            _ub = _column_is_unique("%s.%s" % (_tb or "", _cb))
+            if _ua is None or _ub is None:
+                continue
+            if _ua or _ub:
+                continue       # 有一侧唯一 → N:1，不放大
+            _same = (_ca.lower() == _cb.lower())
+            return ("`SUM(%s)` 的结果可能虚高：连接条件 `%s.%s = %s.%s` "
+                    "用的是**普通业务字段**（两侧都不是主键），"
+                    "而本库各表主键均唯一，这种连接会让一条%s 记录匹配到多行，"
+                    "同一笔%s 被重复累加%s。"
+                    "请改为沿主键逐级关联（缺陷→检验→工单→产线），"
+                    "或先用子查询把%s 聚合到目标维度后再 JOIN。"
+                    % (_mcol, _ta or _a, _ca, _tb or _b, _cb,
+                       _home, _mcol,
+                       "（两列在本库都**不唯一**——实测是 M:N 多对多）"
+                       if _same else "",
+                       _home))
+        return ""
+    except Exception:
+        return ""
+
+
 def _ratio_without_division_reason(query: str, sql: str) -> str:
     """问句要「率/占比」，但 SQL 里没有任何除法 → 返回可读原因；否则 ""（通过）。
 
@@ -3276,6 +5487,22 @@ def _ratio_without_division_reason(query: str, sql: str) -> str:
             return ""
         if re.search(r"(占比|比例|不良率|报废率|废品率|故障率|率).{0,6}"
                      r"(最大|最高|最低|最少|最多|前\s*\d+|top|排名|排行)", q, re.I):
+            return ""
+        # ★ 2026-10-06：`_RATIO_ASK_RE` 纳入「每X」单位词后，本守卫也会被
+        #   「每张工单的投入」这类**分组列举**句触发 → 误伤（正确 SQL 是
+        #   GROUP BY work_order_id 逐行明细，本就不该有除法）。
+        #   与 ②.5-b 共用同一判据：时间类单位词（每小时/每天/日均/每月）恒为换算诉求，
+        #   实体量词（每张/每件/每单/每台/每批）+「每X的Y」句式则是分组列举。
+        _T = ("每小时", "每天", "日均", "每月")
+        _hit_t = any(w in q for w in _T)
+        if not _hit_t:
+            if _UNIT_GROUPING_RE.search(q) and re.search(r"各|分别|逐", q):
+                return ""
+            if _UNIT_GROUPING_RE.search(q) and not _UNIT_CONVERT_ASK.search(q):
+                return ""
+            if re.search(r"有哪些|有哪几|是什么|都有什么", q):
+                return ""
+        elif re.search(r"各|分别|逐", q) and not re.search(r"平均|日均|每天平均", q):
             return ""
         # 投影区（SELECT ... FROM 之间）里找除法
         proj = re.split(r"\bFROM\b", s, maxsplit=1, flags=re.I)[0]
@@ -3353,11 +5580,133 @@ _UNREG_NEED_SOURCE = {
              r"客户订单|发货时间|交付时间|签收|delivery_status",
              r"order_status|end_date|start_date|plan_qty"),
     "齐套": (r"bom|kitting|齐套|配套|物料清单", r"available_qty|safety_stock_qty|input_qty|frozen_qty"),
+    # ★2026-10-06 新增：与规则表新增的「每批/每炉」条对应。
+    #   规则表加了一条却不加这个键 ⇒ _UNREG_CAT_ORDER 与 _UNREG_NEED_SOURCE
+    #   长度不等，「命中第N条规则 → 取第N个类别」就会**错位**
+    #   （守卫会拿别的类别的源字段特征去比对，判据全乱）。
+    #   已加自动化测试 `test_unreg_tables_aligned` 守住这个不变量。
+    "批次": (r"batch|lot|批次|批号|炉号|炉次号", r"work_order_id|stat_date|line_id|product_id"),
 }
 # 类别顺序 **必须与 _UNDERIVABLE_METRIC_RULES 的规则顺序一一对应**
 # （顺序错位会让「命中第N条规则」映射到错误的类别，守卫就会拿错源字段特征去比对）。
-# 依据 llm_service.py 10872-10929 逐条核对：人均→周转→OEE→成本→报废→交付→齐套→停机率。
-_UNREG_CAT_ORDER = ("人均", "周转", "OEE", "成本", "报废", "交付", "齐套", "OEE")
+# ★ 2026-10-06 补「批次」：与规则表新增的「每批/每炉」条对齐（原为 8 项、
+#   规则表 9 项 ⇒ 停机率之后的所有类别整体前移一位）。
+#注：「OEE」出现两次是**刻意**的——规则[2]是稼动率/OEE、规则[7]是停机率，
+#   两者共用同一组源字段特征（运行/计划时长），故复用同一类别名。
+_UNREG_CAT_ORDER = ("人均", "周转", "OEE", "成本", "报废", "交付", "齐套", "OEE",
+                    "批次")
+
+
+def _ratio_denominator_has_defect_reason(query: str, sql: str) -> str:
+    """比值的**分母**是「合格+不良」合计量 → 拦；否则 ""。
+
+    ── 为什么与分子守卫分开（2026-10-06）────────────────────────────
+    `_ratio_molecule_has_defect_reason` 只查分子。实测 82 条里
+    「每件产出消耗多少投入」的错误恰恰在**分母**：
+        SUM(input_qty) / NULLIF(SUM(good_qty + defect_qty), 0) = 0.99567
+    而「每件产出」的分子分母都应是产出本身，真值
+        3,187,009 / 3,109,120 = **1.02505**
+    （good+defect = 3,200,857，比 good 大 91,737，把每件消耗压低了 3%）。
+    语义与分子同源：不良已流出产线，计入「每单位产出」的分母会稀释结果。
+    与分子守卫一样受 `_RATIO_ASK_RE` 前置约束（该词表 2026-10-06 修好了
+    同名覆盖事故后才真正生效，见L3515 注释）。
+    """
+    if not _RATIO_MOLECULE_OUTDEF_GATE_ON:
+        return ""
+    try:
+        q = str(query or "")
+        s = re.sub(r"\s+", " ", str(sql or ""))
+        if not q or not s:
+            return ""
+        if not _RATIO_ASK_RE.search(q):
+            return ""
+        # 只看除号右侧（分母）——除号左侧是分子，交给分子守卫
+        for _m in re.finditer(r"/\s*(?:NULLIF\s*\()?\s*"
+                              r"(?:SUM|sum|AVG|avg)\s*\([^()]*(?:\([^()]*\)[^()]*)*\)", s):
+            if not _expr_is_good_plus_defect(_m.group(0)):
+                continue
+            return ("比值的**分母**写成了「合格数 + 不良数」——不良是已流出产线的那部分，"
+                    "计入分母会把「每单位产出」类指标系统性压低（本库 good=%s、"
+                    "good+defect=%s，差 %s 件）。分母应只取产出本身"
+                    "（通常 SUM(good_qty) 或 SUM(input_qty)，按口径定）。"
+                    % ("3,109,120", "3,200,857", "91,737"))
+    except Exception:
+        return ""
+    return ""
+
+
+# ── 问句时间限定必须落地（2026-10-06 新增，遗留 #5）──────────────────
+# 库里所有日期/时间列。SQL 里出现任一即认为时间过滤已落地。
+_TIME_COND_COLS = (
+    "stat_date", "inspection_date", "start_time", "end_time",
+    "start_date", "end_date", "snapshot_date", "downtime_date",
+    "record_date", "event_date", "check_date",
+)
+# 无日期字段的事实表 → 须经哪条路径取日期（本库实查结论，见函数注释）
+_NO_DATE_TABLE_PATH = {
+    "qms_defect_detail": "该表本身**没有日期字段**（information_schema 实查："
+                         "只有 defect_id/inspection_id/defect_type/defect_code/"
+                         "defect_qty/severity_level/responsible_process_id），"
+                         "时间条件必须经 inspection_id 关联 qms_inspection"
+                         " 的 inspection_date 才能落地",
+}
+_TIME_GATE_ON = os.getenv("QUALITY_GATE_TIME_CONDITION", "1").strip() not in ("0", "false", "off")
+
+
+def _time_condition_missing_reason(query: str, sql: str) -> str:
+    """问句要求限定时间（今天/最近/本月/9月…），但 SQL 里**没有任何日期过滤** → 拦。
+
+    ── 根因（2026-10-06，黄金题库 #5 实测）──────────────────────────
+    「今天的缺陷数」问的是今天，实际答的是**全量 2115**：
+        SELECT COUNT(*) AS "缺陷数" FROM qms_defect_detail f LIMIT 1
+    问句的「今天」在 SQL 里彻底消失，而结果**看起来完全正常**（一个数、不是 0 行）
+    ⇒ 空结果机制（第 16 轮 `_rows_effectively_empty`）对它无效：
+    `COUNT(*)` 即使 WHERE 恒假也返回真实行数（实测 2115），永远不会是空/全 NULL。
+    此前也没有任何机制检查「问句的时间词有没有出现在 SQL 里」——
+    守卫族只管「SQL 对不对」（形态校验），不管「SQL 有没有回答问句的限定」。
+
+    为什么不一律拦：实测 6 条时间类问句里 5 条**都正确落地**了
+    （今天的良率/产量/最近七天投入量/设备停机次数都带
+    `stat_date >= CURRENT_DATE`），只有 qms_defect_detail 这条漏，
+    因为**它是本库唯一无日期字段的事实表** —— 模型找不到可加条件的列，
+    索性连 WHERE 都不写了。所以判据是「有时间限定 且 SQL 完全没有日期列出现」。
+
+    放行：SQL 里出现任一日期列（可能配合了数据驱动锚点）即可——
+    锚点对不对由 `_fix_relative_date_anchor` / `_curdate_anchor_empty_reason`
+    那一族管，本守卫只管「有没有」。
+    """
+    if not _TIME_GATE_ON:
+        return ""
+    try:
+        q = str(query or "")
+        s = str(sql or "")
+        if not q or not s:
+            return ""
+        # 问句没有时间限定 → 不归本守卫
+        if not (_REL_WINDOW_RE.search(q) or _ANY_TIME_ASK_RE.search(q)):
+            return ""
+        # SQL 里已有日期列 → 已落地（锚点对不对另有人管）
+        if any(c in s.lower() for c in _TIME_COND_COLS):
+            return ""
+        # 定位涉及的表，给出可操作的原因
+        _tbls = sorted(_extract_sql_tables(s))
+        _hint = ""
+        for t in _tbls:
+            _bare = str(t).split(".")[-1].lower()
+            if _bare in _NO_DATE_TABLE_PATH:
+                _hint = _NO_DATE_TABLE_PATH[_bare]
+                break
+        if not _hint:
+            _hint = ("当前 SQL 涉及的表（%s）里没用到任何日期列，时间限定无处落地"
+                     % ("、".join(_tbls) if _tbls else "未识别"))
+        return ("问句要求限定时间（命中相对/绝对时间词），但当前 SQL **完全没有日期过滤条件**，"
+                "等于把全量数据当成了这段时间的数据回答。%s。"
+                "正确做法：加上时间过滤（如 WHERE 日期列 >= CURRENT_DATE）；"
+                "若该表本身无日期字段，须先经关联表取到日期再加条件。"
+                "注意这类错误**不会表现为空结果**——COUNT 类聚合照常返回一个数，"
+                "看起来正常实则答非所问。" % _hint)
+    except Exception:
+        return ""
 
 
 def _silent_impersonation_reason(query: str, sql: str) -> str:
@@ -3555,7 +5904,7 @@ def _output_quality_reason(query: str, sql: str) -> str:
     if not s:
         return ""
     try:
-        if _SQL_SELECTSTAR_RE.search(s):
+        if _final_select_is_star(s):
             # 2026-10-04：豁免**明细意图**问句。「最近5条设备维护记录」「列出所有产品」
             # 本来就要 `SELECT *`（用户要的就是原始记录），拦它会逼模型硬凑列名，反而更差。
             # 此前只拦裸 `SELECT *` 时问题不显眼，把正则放宽到 `表名.*` 后才暴露 ——
@@ -3601,6 +5950,12 @@ def _output_quality_reason(query: str, sql: str) -> str:
         _why_ratio = _ratio_without_division_reason(query or "", s)
         if _why_ratio:
             return _why_ratio
+        # ②.5-b「每X」单位换算守卫（2026-10-06 新增，与 ②.5 同族）
+        #   ②.5 只认「率/占比/比」，「每小时/每件/每张/日均/人均」这类单位词
+        #   一个都不认 ⇒ 82 条题里 5 条裸 SUM/AVG 被当合法结果放行（量纲全错）。
+        _why_unit = _unit_conversion_reason(query or "", s)
+        if _why_unit:
+            return _why_unit
         # ②.6 效率类结果越界 / 量词形态错位（2026-10-05 实测 P0/P1）
 # ── 冲突已解决（2026-10-05）──────────────────────────────
 # 合并说明：远端(EB971ee) 在此处**无内容**（冲突块远端侧为空），
@@ -3614,10 +5969,69 @@ def _output_quality_reason(query: str, sql: str) -> str:
         _why_cnt = _count_vs_ratio_mismatch_reason(query or "", s)
         if _why_cnt:
             return _why_cnt
+        # ②.8-a「产出」被写成 合格+不良 → 产出 ≥ 投入，物理不可能（2026-10-06 实测 P0）
+        _why_outdef = _output_counted_with_defect_reason(query or "", s)
+        if _why_outdef:
+            return _why_outdef
+        # ②.8-b 窗口排名后过滤导致占比恒 100（2026-10-06 实测 P0）
+        _why_pct100 = _pct_always_100_reason(query or "", s)
+        if _why_pct100:
+            return _why_pct100
+        # ②.8-b2 比值的分子塞了 good+defect → 比值恒>1（2026-10-06 实测 P0）
+        _why_rmol = _ratio_molecule_has_defect_reason(query or "", s)
+        if _why_rmol:
+            return _why_rmol
+        # ②.8-b2b 比值的**分母**塞了 good+defect → 每单位产出被系统性压低
+        #   （2026-10-06 实测 82 条：0.99567 vs 真值 1.02505，差 3%）
+        _why_rden = _ratio_denominator_has_defect_reason(query or "", s)
+        if _why_rden:
+            return _why_rden
+        # ②.8-b3 问「多少天/耗时」却聚合数量列（2026-10-06 实测 P0）
+        _why_dur = _duration_answered_by_quantity_reason(query or "", s)
+        if _why_dur:
+            return _why_dur
+        # ②.8-c 日期常量年份与库中实际数据范围不相交（2026-10-06 实测 P0）
+        _why_year = _date_literal_year_mismatch_reason(query or "", s)
+        if _why_year:
+            return _why_year
+        # ②.8-d 滚动窗口用 CURRENT_DATE 锚点，但数据窗口早于今天 → 必 0 行
+        _why_anchor = _curdate_anchor_empty_reason(query or "", s)
+        if _why_anchor:
+            return _why_anchor
+        # ②.8-e 「N月之后」被当成「N月」：开区间被闭区间化（2026-10-06 实测 P0）
+        # 必须放在 ②.8-d 之后：那条守卫判"锚点落在数据窗口外"，而本题锚点
+        # 恰好落在窗口**内**（数据止于 9-15，在 [9-1,10-1) 里）→ 放行。
+        # 两条守卫互补：一个管"锚点太新→0 行"，一个管"锚点对但区间闭了→答错值"。
+        _why_after = _open_interval_after_month_reason(query or "", s)
+        if _why_after:
+            return _why_after
+        # ②.9 JOIN 键跨域：两侧值域不相交 → 必然 0 行（2026-10-06 实测 P0）
+        #   ⚠ 2026-10-06 修：这条与下面 ②.10 曾经**只写进 _SUB_GUARDS 清单、
+        #     没挂进本函数**。清单只用于「取全量命中原因」，不参与实际判定，
+        #     于是子守卫单独跑能报出跨域、真实链路却一路放行 ——
+        #     12 题实测 Q4/Q5/Q12 三条跨域 SQL 全部 0 行却零拦截。
+        #     ⇒ 新守卫必须同时改 _SUB_GUARDS **和**本函数，两处缺一即失效。
+        #   位置：放在 ②.8-e 之后、②.7 之前。跨域是「结构错」，
+        #   比 ②.7（口径静默冒充）更基础，先报出来对用户更有用。
+        _why_jd = _join_cross_domain_reason(query or "", s)
+        if _why_jd:
+            return _why_jd
+        # ②.10 度量列被非主键连接复制求和 → 结果虚高（2026-10-06 实测 P0）
+        #   必须排在 ②.9 之后：②.10 只管"虚高"，跨域那条是"0 行"，
+        #   病根不同，先报更根本的那个。
+        _why_amp = _metric_amplified_reason(query or "", s)
+        if _why_amp:
+            return _why_amp
         # ②.7 缺源字段口径的静默冒充（列名冒充实指标且无任何诚实标注）
         _why_imp = _silent_impersonation_reason(query or "", s)
         if _why_imp:
             return _why_imp
+        # ②.9-b 问句限定时间但 SQL 完全没有日期过滤 → 把全量当成了这段时间的数据
+        #   （2026-10-06 遗留 #5：问「今天的缺陷数」答 2115 = 全量，
+        #     COUNT 类不返空/不返 NULL，所以第 16 轮的「一行全 NULL」机制对它无效）
+        _why_tc = _time_condition_missing_reason(query or "", s)
+        if _why_tc:
+            return _why_tc
         # ③ 「值放错列」不在这里拦截 —— 实测（2026-09-15）**拒绝型闸门在这一类上是负收益**：
         #    拦下之后只剩直生兜底，而思考型模型在剩余预算内常常出不来 → 2 题直接从
         #    WRONG 掉成 GEN_FAIL（3/6 vs 4/6），比给出一个"0 行的错误答案"更糟。
@@ -3756,6 +6170,12 @@ _STRONG_DATA = [
     "工单", "设备", "在制", "合格", "不合格", "销量", "金额", "营收", "成本",
     "同比", "环比", "分布", "明细", "报表", "指标", "求和", "总数", "总量",
     "记录数", "记录条数", "考勤", "班次", "缺勤", "迟到", "早退", "请假",
+    # ── 2026-10-06补：投入/产出类（实测「最近七天的投入产出比和之前七天比，
+    #    哪天跌得最厉害」整句被判成 chat → 走 _respond_chat 让模型闲聊，
+    #    模型回「我需要先了解您的数据库结构」，用户一个数都没拿到）。
+    #    原表有「产量」却没有「投入/产出」——而「投入产出比」是制造业问法里
+    #    极高频的指标名，缺了它整类问句都会掉进闲聊兜底。
+    "投入", "产出", "投入产出", "产出投入", "投入量", "产出量",
 ]
 # 强闲聊信号：出现即判 chat（问候/寒暄/自我介绍类，与数据无关）
 _STRONG_CHAT = [
@@ -5788,6 +8208,19 @@ class LLMService:
                     "basis": _basis,
                 })
 
+                # ── 2026-10-06：确定性表达式规则链 ──
+                # 真正的调用点在下面的 SQL 生成段入口（先于一切 LLM 调用，
+                # 且能复用后续的守卫/归一/执行/RLS 全链路）。
+                # 这里只做一次**预判**，用于把「表匹配」这步的依据写清楚，
+                # 避免同一条规则跑两遍。
+                try:
+                    _expr_pre = _try_expr_rules(
+                        self.query, self.matched_tables,
+                        _all_table_columns() or {})
+                except Exception:
+                    _expr_pre = None
+                self._expr_rule_hit = bool(_expr_pre and _expr_pre.get("sql_draft"))
+
                 # 2026-10-03：进入 LLM 生成前的预告。
                 # 这一步实测耗时 30~100s（深度思考模型要"先想后答"，首 token 常达 20~40s），
                 # 此前这段时间 SSE 一个字都不吐，前端只有一句静态的「正在生成 SQL…」，
@@ -5919,10 +8352,42 @@ class LLMService:
                     _sql = ""
                     _rejected_fallback = ""      # 闸门打标后被弃用的 SQL（保底用，见下）
                     _why_q = ""                  # 被质量闸门拒绝的原因（透传给兜底重生成）
+                    # ── 2026-10-06：确定性表达式规则链（**最先一步，零 LLM**）──
+                    # 位置很关键。原先 `_try_expr_rules` 只挂在
+                    # `_infer_analysis_confirm()` → `infer_query_analysis` 里，
+                    # 但那条路从 2026-09-07「不再弹窗确认」起就实际不走了，
+                    # 规则链在真实链路上一次都没跑过（第四轮回归实测：
+                    # Q4 退回 `SUM("plan_qty")` 恒 2000，而单测里规则⓪ 是好的）。
+                    # 放在这里而不是「表匹配之后」是因为：这里已有 try/except 保护、
+                    # 后面的守卫/大小写归一/执行/RLS 全部照常复用，
+                    # 且 `_infer_analysis_confirm()` 内部还会二次调用规则链（幂等，
+                    # 命中就直接返回，不会重复跑 LLM）。
+                    try:
+                        _cmap_q = _all_table_columns() or {}
+                        _expr_q = _try_expr_rules(
+                            self.query, self.matched_tables, _cmap_q)
+                    except Exception:
+                        _expr_q = None
+                        logging.getLogger(__name__).warning(
+                            "[expr_rules] 规则链异常，问题=%r", self.query,
+                            exc_info=True)
+                    if _expr_q and _expr_q.get("sql_draft"):
+                        _sql = str(_expr_q.get("sql_draft") or "")
+                        self._expr_rule_hit = True
+                        for _rk in (_expr_q.get("risks") or []):
+                            self._fix_notes.append(str(_rk))
+                        yield _step("SQL生成", "命中确定性表达式规则（零 LLM）", {
+                            "input": self.query,
+                            "output": _expr_q.get("understanding") or "确定性规则",
+                            "basis": "问题语义命中内置表达式规则，SQL 由规则拼出，未经 LLM",
+                        })
+                    else:
+                        self._expr_rule_hit = False
                     # 对快慢 provider 都跑结构化推断（慢 provider 走 invoke 模式，见 infer_query_analysis）
-                    _analysis = self._infer_analysis_confirm()
-                    if _analysis:
-                        _sql = str(_analysis.get("sql_draft") or "")
+                    if not _sql:
+                        _analysis = self._infer_analysis_confirm()
+                        if _analysis:
+                            _sql = str(_analysis.get("sql_draft") or "")
                     # 输出质量闸门（2026-09-15）：覆盖**所有**生成路径——包括 MQL 内部的
                     # 逃生舱（它产出的 SQL 不经过 _run_escape_sql_v2 的校验，实测 #4 的
                     # 「裸倒主键列」就是从那里出来的）。退化输出宁可弃用，落到下面的直生
@@ -5930,13 +8395,39 @@ class LLMService:
                     if _sql:
                         _why_q = _output_quality_reason(self.query, _sql)
                         if _why_q:
-                            # 2026-09-17 保底：闸门是"宁可误杀"的启发式，重生成也不保证有产出。
-                            # 旧行为是弃用即丢 → 兜底再失败就变成「AI 未能生成 SQL」（什么都没给）。
-                            # 对用户「0 分的错答案」远好过「没有答案」，所以留一份保底，
-                            # 只在重生成**完全没产出**时启用（有产出就仍用重生成的）。
-                            _rejected_fallback = _sql
-                            yield _step("SQL校验", "生成的 SQL 未通过输出质量检查，改用直生兜底：" + _why_q[:46])
-                            _sql = ""
+                            # ⚠ 2026-10-06（实测 P0）：拦下之后**先试确定性修复**，
+                            # 别直接丢。有些守卫判定的错误是可确定性改好的
+                            #（最典型：比值分子写成「合格数 + 不良数」），
+                            # 直接丢的结果是"从给错答案退化成不给答案"——
+                            # r11 实测 Q6 有数据（真值上旬 0.975373）却给 0 行
+                            # +「换个模型再试」，仍然是失败。
+                            # 改完再过一次守卫：过了就用，不过才继续走兜底。
+                            _repair_fired: list = []
+                            _repaired = apply_output_fixes(
+                                self.query, _sql, _repair_fired)
+                            _why_after = ""
+                            if _repaired and _repaired != _sql:
+                                try:
+                                    _why_after = _output_quality_reason(
+                                        self.query, _repaired)
+                                except Exception:
+                                    _why_after = "unknown"
+                            if _repaired and _repaired != _sql \
+                                    and not _why_after:
+                                for _nm in _repair_fired:
+                                    yield _step("SQL校验", _FIX_STEP_MSG.get(_nm, _nm))
+                                _sql = _repaired
+                                _why_q = ""
+                            else:
+                                # 2026-09-17 保底：闸门是"宁可误杀"的启发式，重生成也不保证有产出。
+                                # 旧行为是弃用即丢 → 兜底再失败就变成「AI 未能生成 SQL」（什么都没给）。
+                                # 对用户「0 分的错答案」远好过「没有答案」，所以留一份保底，
+                                # 只在重生成**完全没产出**时启用（有产出就仍用重生成的）。
+                                _rejected_fallback = _sql
+                                yield _step("SQL校验",
+                                            "生成的 SQL 未通过输出质量检查，改用直生兜底："
+                                            + _why_q[:46])
+                                _sql = ""
                     if not _sql:
                         # 兜底：自由生成，拿剩余预算（下限 6s 保证至少一次完整尝试）
                         # 带上一版被拒原因（若有）→ 让兜底"知道错在哪"，不是从零重赌
@@ -5944,10 +8435,98 @@ class LLMService:
                         _sql = _direct_gen_sql(self.query, self.matched_tables,
                                                budget_s=_left,
                                                reject_reason=_why_q or "") or ""
+                        # ⚠⚠ 2026-10-06 修（实测 P0）：直生兜底的产出**原来完全不过守卫**，
+                        # 直接赋给 self.sql 就去执行了。
+                        # 实测 Q6「九月上旬和中旬的投入产出比」的完整链路：
+                        #   ① 首生 SQL 被 ②.8-b（分子塞了 good+defect）拦下；
+                        #   ② 走直生兜底，兜底又产出`SUM(good_qty + defect_qty)`；
+                        #   ③ 因为兜底结果不再过守卫 → 直接执行 → 用户拿到
+                        #      上旬 1.0044 / 中旬 1.0045，
+                        #      而真值是 0.975373 / 0.975341（分子多了不良，比值恒 >1）。
+                        # 日志里只留了「改用直生兜底」，看上去像是兜底成功了，
+                        # 实际兜底产出的是**同样错**的 SQL。
+                        # ⇒ 兜底产出与首生产出走**同一把尺子**，不因为"是兜底"而豁免。
+                        if _sql:
+                            _why_dg = _output_quality_reason(self.query, _sql)
+                            if _why_dg:
+                                # 同上：兜底产出也先试确定性修复，再判是否弃用。
+                                _dg_fired: list = []
+                                _dg_repaired = apply_output_fixes(
+                                    self.query, _sql, _dg_fired)
+                                _dg_why2 = ""
+                                if _dg_repaired and _dg_repaired != _sql:
+                                    try:
+                                        _dg_why2 = _output_quality_reason(
+                                            self.query, _dg_repaired)
+                                    except Exception:
+                                        _dg_why2 = "unknown"
+                                if _dg_repaired and _dg_repaired != _sql \
+                                        and not _dg_why2:
+                                    for _nm in _dg_fired:
+                                        yield _step("SQL校验",
+                                                    _FIX_STEP_MSG.get(_nm, _nm))
+                                    _sql = _dg_repaired
+                                else:
+                                    _dg_all = []
+                                    try:
+                                        _dg_all = _all_output_quality_reasons(
+                                            self.query, _sql)
+                                    except Exception:
+                                        _dg_all = []
+                                    yield _step(
+                                        "SQL校验",
+                                        "直生兜底产出同样未通过质量检查（%s）→ 弃用，"
+                                        "不拿错口径去执行" % _why_dg[:40])
+                                    # 记下原因：供错误出口判断该不该说"区间无数据"，
+                                    # 以及让后续修复链知道上一版错在哪。
+                                    self._rejected_sql_reason = _why_dg
+                                    self._rejected_sql_reasons_all = _dg_all
+                                    _sql = ""
+                                    # ⚠ 不恢复 _sql：它同样没过守卫。
+                                    #   本项目是 fail-close 取向 —— 宁可如实说明，
+                                    #   也不拿一个已知口径错的查询去出数。
+                                    #   首生那条是否恢复，由下面的
+                                    #   `if not _sql and _rejected_fallback` 分支
+                                    #   重新过守卫后自行决定。
                     if not _sql and _rejected_fallback:
-                        _sql = _rejected_fallback
-                        yield _step("SQL校验", "兜底重生成未产出 SQL，回退使用被质量闸门标记的那条"
-                                               "（口径推断可能不全，请重点核对结果）")
+                            # ⚠ 2026-10-06 修（实测 P0）：这条「保底回退」原本
+                            # **无条件**把被守卫拒绝的 SQL 捞回来，等于给守卫开了个后门。
+                            # 实测原题「九月份之后的投入产出比」的完整链路：
+                            #   ① 首生 SQL 被 ②.8-e 开区间守卫拦下；
+                            #   ② 直生兜底「未产出 SQL」（模型在剩余预算内没给）；
+                            #   ③ 走到这里，把①那条被拒的 SQL 原样恢复 → self.sql；
+                            #   ④ 后续所有守卫复查都发生在**执行之后**，而这条路
+                            #      在 `_rejected_fallback` 分支后**根本不进入修复链**
+                            #      （`ok` 直接为真）⇒ 错答案直达用户。
+                            # 实测那次给的是 `投入产出比 = 3109120`（真实值 0.9754）。
+                            #
+                            # 修法：保底回退也要过守卫。守卫既然判了不合格，
+                            # 就不能因为「它是第一次生成的」而豁免。
+                            # 真正过不了守卫时 → 记下原因，交给下游如实说明，
+                            # 而不是把错值当答案端出去。
+                            _rf_why = ""
+                            _rf_all = []
+                            try:
+                                _rf_why = _output_quality_reason(self.query,
+                                                                   _rejected_fallback)
+                                # ⚠ 必须拿**全量**原因，不能只看首个：②.5「缺除法」
+                                # 排在 ②.8-e「开区间语义错」前面，只看首个会以为
+                                # 病根是"少写了除法"，进而写出"换个模型再试"
+                                # 这种把用户往错方向引的提示。真正要判的是
+                                # 「区间本身错了」—— 补上除法也只是把错区间算得更精确。
+                                _rf_all = _all_output_quality_reasons(
+                                    self.query, _rejected_fallback)
+                            except Exception:
+                                _rf_why = ""
+                            if _rf_why:
+                                # 不恢复。记录原因，让下游走"说明而非骗"的路。
+                                self._rejected_sql_reason = _rf_why
+                                self._rejected_sql_reasons_all = _rf_all
+                                _sql = ""
+                            else:
+                                _sql = _rejected_fallback
+                                yield _step("SQL校验", "兜底重生成未产出 SQL，回退使用被质量闸门标记的那条"
+                                                       "（口径推断可能不全，请重点核对结果）")
                     self.sql = _sql
                     # 2026-10-05：字符串字面量大小写归一（主链启用，此前仅 BIRD 档位）。
                     # 实测根因（用户测「产能利用率是多少」）：LLM 写
@@ -5975,9 +8554,12 @@ class LLMService:
                     # LIMIT 归一 → 窗口差值兜底 → TOP-N 稳定次序 → 值放错列 → 补列。
                     # 步骤日志由 fired 回放，消息表见 _FIX_STEP_MSG。
                     _fired: list = []
+                    _fix_skip = (_EXPR_RULE_FIX_SKIP
+                                 if self._expr_rule_hit else None)
                     _after = apply_output_fixes(self.query, self.sql, _fired,
                                                 sqlexec=self._exec_sql_for_probe,
-                                                notes=self._fix_notes)
+                                                notes=self._fix_notes,
+                                                skip=_fix_skip)
                     if _after != self.sql:
                         self.sql = _after
                         for _nm in _fired:
@@ -6014,6 +8596,67 @@ class LLMService:
                         # 幻觉字段）。对用户宣称"AI 没能生成"是失实的，也会把排查方向
                         # 带偏到"换个模型试试"。现在如实说明两类可能原因。
                         self.error = (self.error or "未能产出可用的查询 SQL。")
+                        # ⚠ 2026-10-06（实测 P0）：上面 6791 起的「保底回退」不再
+                        # 无条件捞回被守卫拒绝的 SQL 后，有一类问题会落到这里 ——
+                        # 问句的区间语义本身就超出数据范围（如「九月份之后的投入产出比」，
+                        # 而库里数据止于 9-15）。对这类问题说"未能生成 SQL / 换个模型再试"
+                        # 是**误导**：SQL 能生成、也执行得了，只是那个区间本来就没数据，
+                        # 换一百个模型还是没数据。
+                        # 这里查真实数据边界，把「生成失败」纠正成「区间无数据」，
+                        # 用户一眼能看懂该怎么办。
+                        _r_why = str(getattr(self, "_rejected_sql_reason", "") or "")
+                        _r_all = list(getattr(self, "_rejected_sql_reasons_all", None) or [])
+                        # 从**全量**原因里找区间语义类的那条（病根），
+                        # 而不是只看首个 —— 首个往往只是"缺除法"这种症状。
+                        _sem = ""
+                        for _x in _r_all:
+                            if re.search(r"(之后|以后|开区间|闭区间|答成本月)", _x):
+                                _sem = _x
+                                break
+                        _sem = _sem or _r_why
+
+                        # ⚠ 2026-10-06 二次修（实测 P0）：**优先用独立的
+                        # 时间意图核对器**，不要再靠匹配守卫文案来决定。
+                        # 实测漏判就是这样来的：模型这轮写的是
+                        #   stat_date >= '2024-01-01' AND stat_date <= '9999-12-31'
+                        # 守卫报的是「年份 2024 越界」，文案里压根没有
+                        # 「之后/开区间」字样 → 下面那条正则匹配不上 →
+                        # 用户收到的仍是"换个模型再试"，而真因是
+                        # 「九月之后本库没数据」，换个模型一百次也没用。
+                        # 现在改成从问句直接抽时间意图、和真实数据边界对质，
+                        # 判断依据是事实（数据到哪天为止），与内部措辞无关。
+                        _sem = _sem or ""
+                        _range_msg = ""
+                        try:
+                            _range_msg = _time_intent_exceeds_data(
+                                self.query, self.matched_tables) or ""
+                        except Exception:
+                            _range_msg = ""
+                        if not _range_msg and _sem and re.search(
+                                r"(之后|以后|开区间|闭区间)", _sem):
+                            # 核对器查不到边界时的回落（保留旧逻辑兜底）
+                            _bx = _query_time_boundary(self.matched_tables)
+                            if _bx:
+                                _lo, _hi, _col, _tbl = _bx
+                                _range_msg = (
+                                    "你问的是「%s之后」的数据，而本库这张表的时间数据只到 **%s**"
+                                    "（%s 表 %s 列），该区间确实没有记录。\n"
+                                    "这不是查询出错——换模型或换个说法都不会有结果，"
+                                    "因为库里就没有这段时间的数据。\n"
+                                    "可以改成问「截至 %s 的情况」。"
+                                    "如果你认为库里应该有这段时间的数据，"
+                                    "说明数据同步还没覆盖到这里。"
+                                    % (self.query, _hi, _tbl, _col, _hi))
+                        if _range_msg:
+                            self.error = _range_msg
+                            yield _step("口径说明",
+                                        "问句区间超出本库数据范围 → 如实说明数据边界，不返回错值")
+                            try:
+                                _record_unmatched_query(self.query)
+                            except Exception:
+                                pass
+                            yield {"type": "error", "message": self.error}
+                            return
                         self.error += (
                             "\n可能原因有两类：① 模型这一轮没有产出语句；"
                             "② 产出的语句未通过安全或口径校验（例如引用了数据底座里不存在的"
@@ -6029,11 +8672,19 @@ class LLMService:
                     # 权限缺表是"生成失败"的高频真因：此时提示"换个说法"毫无意义，
                     # 必须点名缺哪张表，用户才知道要去找管理员开通什么。
                     if self.acl_dropped_tables:
+                        # ⚠ 2026-10-06 修（静态体检 test_no_silent_fmt_mismatch 抓出）：
+                        #   原式 `"...%s...%s" % "、".join(...), self.error` 少了括号。
+                        #   Python 里 `%` 优先级**低于**函数调用，实际只把
+                        #   `"、".join(...)` 当成右操作数（传 1 个实参给 2 个占位），
+                        #   运行到这行抛 TypeError → 被上面 except 吞掉 →
+                        #   用户该看到"缺哪张表"却只看到一段乱码。
+                        #   ⇒ 右操作数必须整体加括号。
                         self.error = (
                             "本次问题需要的表（%s）当前角色无权访问，可用表不足以算出正确结果，"
                             "因此未能生成 SQL。请联系管理员开通该数据集权限，"
                             "或改用你有权限的数据提问。\n（原提示：%s）"
-                            % "、".join(self.acl_dropped_tables[:3]), self.error)
+                            % ("、".join(self.acl_dropped_tables[:3]),
+                               self.error))
                     yield {"type": "error", "message": self.error}
                     return
 
@@ -6197,29 +8848,11 @@ class LLMService:
         # 校验，于是"零 LLM、高置信"地返回 20 行冒充前 5。本条校验作为该缺陷的回归网。
         if ok and self.sql:
             try:
-                _topn = None
-                # 2026-10-03 修复：本校验（前置校验 9）是「编译器 N 提取缺陷」的回归网，
-                # 但它的正则同样只认 \d+ → 中文数词问句（「产量最高的前三个产品」）
-                # 在这里匹配不到 → **不校验** → 编译器返回 20 行时无人拦截。
-                # 即"改了编译器不改这里 = 回归网仍是死网"。现同步放宽数词。
-                _np = r"(\d+|[一二两三四五六七八九十]{1,3})"
-                for _m in re.finditer(
-                        rf"(?:前\s*{_np}"
-                        rf"|(?:最高|最低|最大|最小|最多|最少|最长|最短|最好|最差"
-                        rf"|最晚|最早|最新|最旧|排行)"
-                        rf"[的]?\s*(?:前)?\s*{_np}|TOP\s*{_np})"
-                        rf"\s*(?:个|名|条|家|项|台|道|种)?",
-                        self.query, re.I):
-                    _g = next((g for g in _m.groups() if g), None)
-                    if _g:
-                        # 中文数词换算：复用 metric_compiler 的 _cn_num（能处理 十一/二十/三十二）
-                        try:
-                            from agent.metric_compiler import _cn_num as _cn
-                            _topn = int(_g) if _g.isdigit() else (_cn(_g) or 0)
-                        except Exception:
-                            _topn = int(_g) if _g.isdigit() else 0
-                        if _topn > 0:
-                            break
+                # 2026-10-06：抽成共用谓词 `_topn_count_from_query`。
+                # 原内联正则把「最近**两周**每天…」的"两"当成 TOP-2
+                # （q12 Q11 实测），把14 天日趋势截成 1 行。
+                # 共用谓词会排除「数词 + 时间单位」的片段。
+                _topn = _topn_count_from_query(self.query)
                 if _topn and 0 < _topn <= 100:
                     _lims = re.findall(r"\bLIMIT\s+(\d+)", self.sql, re.IGNORECASE)
                     if _lims and int(_lims[-1]) != _topn:
@@ -6311,7 +8944,12 @@ class LLMService:
         # 撞上「相对时间问句 vs 静态演示数据」这个坑，所以这层必须覆盖它。
         self._data_range_hint = ""
         if (ok and self.sql_result.get("success")
-                and not (self.sql_result.get("rows") or [])
+                # ★ 2026-10-06 根因A 统一修复：判空从「零行」扩到「实质为空」
+                #   （含裸聚合无匹配返回的「一行全 NULL」）。
+                #   原为 `not (rows or [])`，只认零行 ⇒ 问「今天的投入产出比」
+                #   得`[{ratio: None}]` 被当成正常出数，不探数据范围，
+                #   答复只说「建议放宽时间范围」，不提数据只到 2026-09-15。
+                and _rows_effectively_empty(self.sql_result.get("rows") or [])
                 and (self.sql or "").strip()
                 and _REL_WINDOW_RE.search(str(self.query or ""))):
             try:
@@ -6367,7 +9005,8 @@ class LLMService:
         _first_result = dict(self.sql_result or {})
         _first_acl = {k: list(v) for k, v in (self.acl_applied or {}).items()}
         if (ok and self.sql_result.get("success")
-                and not (self.sql_result.get("rows") or [])
+                # ★ 根因A 同上：一行全 NULL 也算「没算出来」，该给修正机会
+                and _rows_effectively_empty(self.sql_result.get("rows") or [])
                 and (self.sql or "").strip()
                 and not getattr(self, "compiled_mql", None)
                 and not getattr(self, "_semantic_hit", False)):
@@ -6523,7 +9162,10 @@ class LLMService:
                     _r_fired: list = []
                     _r_after = apply_output_fixes(self.query, self.sql, _r_fired,
                                                   sqlexec=self._exec_sql_for_probe,
-                                                  notes=self._fix_notes)
+                                                  notes=self._fix_notes,
+                                                  skip=(_EXPR_RULE_FIX_SKIP
+                                                        if self._expr_rule_hit
+                                                        else None))
                     if _r_after != self.sql:
                         self.sql = _r_after
                         for _nm in _r_fired:
@@ -6623,9 +9265,25 @@ class LLMService:
                 # ⇒ 恢复最初那次可执行的结果（哪怕是明细），并强制加一条声明，
                 # 明确告诉用户「这是相关表的原始记录，不是你要的指标值，口径缺失」，
                 # 把「静默骗」降级为「标注着给」。真正的修复入口由声明指向「去登记口径」。
+                # ⚠ 2026-10-06 修（实测 P0）：这道兜底原本**不看守卫判定**就恢复首生结果，
+                # 于是「守卫已明确判定答非所问 → 重试链也确实没改出来」的情况下，
+                # 那条被判失败的 SQL 照样被恢复并返回给用户 —— 守卫等于白拦。
+                # 实测原题「九月份之后的投入产出比」：
+                #   · ②.8-e 开区间守卫拦下 `date_trunc+CURRENT_DATE` 闭区间写法；
+                #   · 重试链又产出 `SUM(good_qty) AS "投入产出比" ... >= '2024-10-01'`，
+                #     ②.5（无除法）与 ②.8-c（2024 与库中 2026 不相交）**同时拦下**；
+                #   · 2 轮修复耗尽 → 落进本兜底 → 无条件恢复首生 SQL →
+                #     用户看到 `投入产出比 = 3109120`（真实比值是 0.9754，差了 318 万倍）。
+                # ⇒ 守卫判定过的 SQL 不能因为"是第一次生成的"就被豁免。
+                # 现在：恢复前再过一次守卫；只有「守卫没意见」的首生结果才允许兜底。
+                _deg_ok = False
+                _deg_why = ""
                 try:
-                    _deg_ok = bool((_first_result or {}).get("success")
-                                   and (_first_result or {}).get("rows"))
+                    if (bool((_first_result or {}).get("success"))
+                            and (_first_result or {}).get("rows")
+                            and (_first_sql or "").strip()):
+                        _deg_why = _output_quality_reason(self.query, _first_sql)
+                        _deg_ok = not _deg_why
                 except Exception:
                     _deg_ok = False
                 if _deg_ok and (_first_sql or "").strip():
@@ -6646,8 +9304,32 @@ class LLMService:
                                "columns": self.sql_result["columns"],
                                "rows": self.sql_result["rows"],
                                "row_count": self.sql_result["row_count"]}
+                elif _deg_why:
+                    # 首生结果也被守卫判为答非所问 → 明确告知，不再无声地把错答案交出去。
+                    # 走 2026-10-04 产品决策里定的路：**给声明、给入口，但不假装算出来了**。
+                    # 「拒绝」与「骗」之间取「标注着说明」，这是三条硬标准里唯一站得住的。
+                    try:
+                        from database import execute_sql as _esq
+                        _mr = _esq("SELECT MAX(stat_date) FROM mes_process_output")
+                        _mx = ((_mr.get("rows") or [{}])[0] or {}).get("max")
+                    except Exception:
+                        _mx = None
+                    _tail = ("；本库相关数据最新到 %s，你问的区间可能确实没有数据"
+                             % (str(_mx)[:10],)) if _mx else ""
+                    self._fix_notes.append(
+                        "本次没能按你的问题算出结果：%s%s。"
+                        "已经尝试了重新生成与定向修复都没能得到正确口径的查询，"
+                        "与其给一个看起来完整但实际不对的数字，这里直接说明原因。"
+                        % (_deg_why[:200], _tail))
+                    yield _step("口径说明",
+                                "生成与修复均未得到有效口径 → 如实说明原因，不返回错值")
+                    self._no_effective_answer = True
 
-            if not ok:
+            # ⚠ 2026-10-06：守卫判定首生也不合格时（上面 `self._no_effective_answer`
+            # 为真），**不要再跑通用 _fallback_sql**。那条兜底只会拿一张最相关的表
+            # 做 SELECT，正好是 ②.8-e 这类守卫专门要拦的东西 —— 跑它等于把刚拦下的
+            # 错答案换个形式再送出去。直接如实说明，让上层输出「无法给出有效答案」。
+            if not ok and not getattr(self, "_no_effective_answer", False):
                 fallback_sql = _fallback_sql(self.query, self.matched_tables)
                 if fallback_sql and fallback_sql != self.sql:
                     self.sql = fallback_sql
@@ -6663,7 +9345,9 @@ class LLMService:
                                "row_count": self.sql_result["row_count"]}
 
             # 0 行重试跑完仍无行 → 如实返回 0 行（与旧版行为一致，不把"确实没数据"误报成失败）
-            if _zero_retry and not (self.sql_result.get("rows") or []):
+            # ★ 根因A：判空同步扩到「一行全 NULL」—— 重试链跑完仍只算出一行 None 时，
+            #   同样应回滚到原查询，而不是把 `{ratio: None}` 当作有效结果留在页面上。
+            if _zero_retry and _rows_effectively_empty(self.sql_result.get("rows") or []):
                 self.sql = _zero_orig_sql
                 self.sql_result = _zero_orig_result
                 self.executed_sql = _zero_orig_exec
@@ -6875,14 +9559,22 @@ class LLMService:
         # 且命中侧（run() 的 _semantic_cache_hit）会跳过 LLM 复查直接复用 →
         # 错误答案此后 0.2s 稳定复现一整天，比慢更难发现。
         # 只影响"是否沉淀"，不阻断本次结果返回，误伤代价仅为下次不命中缓存。
-        if not self.fast and self.sql_result.get("success") and self.sql_result.get("rows") \
+        # ★ 根因A：加实质空判定。原 `get("rows")` 对「一行全 NULL」为真，
+        #   这类"什么都没算出来"的 SQL 会被沉淀进语义缓存（维度表 TTL 86400s），
+        #   命中侧直接复用不再复查 → 同一个空答案此后 0.2s 稳定复现一整天。
+        if not self.fast and self.sql_result.get("success") \
+                and not _rows_effectively_empty(self.sql_result.get("rows") or []) \
                 and not self._result_warning and not self._validate_result() \
                 and not _output_quality_reason(self.query, self.sql):
             self._semantic_cache_store()
 
         # ── Step 6: 图表生成（先按真实数据结构校正图表类型）──
         # 评测快速模式（fast）跳过图表渲染：评测只需要 SQL + 执行结果，SVG 生成纯属额外耗时
-        if not self.fast and self.sql_result.get("rows") and len(self.sql_result["rows"]) >= 2:
+        # ★ 根因A：图表只在「有≥2 行且含实质值」时生成。
+        #   一行全 NULL（裸聚合无匹配）凑不够 2 行，本就不会进来；
+        #   这里显式带上实质值判定，防止后续放宽行数条件时把空图放出去。
+        if (not self.fast and not _rows_effectively_empty(self.sql_result.get("rows") or [])
+                and len(self.sql_result["rows"]) >= 2):
             _ct = _validate_chart_type(
                 self.chart_type,
                 self.sql_result.get("columns") or [],
@@ -7470,7 +10162,9 @@ class LLMService:
         needs_agg = _needs_aggregation(self.query)
 
         # 1. 空结果：条件可能过严 / 表选错
-        if not rows:
+        # ★ 根因A：裸聚合无匹配会返回「一行全 NULL」，`not rows` 判不出来，
+        #   于是这类"什么都没算出来"被排除在归因之外，用户拿不到「条件过严」的提示。
+        if _rows_effectively_empty(rows):
             reasons = ["查询返回 0 行。可能是筛选条件过严、时间范围不对，或选错了表。"]
             if re.search(r"WHERE[\s\S]*?(=\s*'[^']+'|LIKE\s*'[^']+')", sql_upper):
                 reasons.append("请放宽或去掉硬编码的字符串等值/模糊条件，改用更宽松的匹配。")
@@ -8331,7 +11025,9 @@ class LLMService:
         # 只在这里追加而**不改写 SQL**：编译产物的确定性必须保住，
         # 该做的是把「库里没有这个时间段」如实告诉用户，而不是偷偷换一个区间给他。
         hint = getattr(self, "_data_range_hint", "")
-        if hint and not rows:
+        # ★ 根因A：与 hint 的生成条件（L8473 附近）保持同一判空口径，
+        #   否则会出现「提示已生成但拼不进答复」或「拼了但提示为空」的错配。
+        if hint and _rows_effectively_empty(rows):
             text = (text or "").rstrip() + hint
         # 确定性改写链的说明（2026-09-29）：如「时间锚点已按最新有数据的月份重定」、
         # 「改写会造成 0 行已回滚」。必须落到答案里——重定锚点等于替用户换了一个时间段，
@@ -10228,6 +12924,57 @@ def _rule_insight(rows: list[dict], cols: list[str]) -> str:
 
     lines = [f"共查询到 {len(rows)} 条记录，覆盖 {len(cols)} 个字段（{'、'.join(disp[c] for c in cols[:6])}）。"]
 
+    # 2026-10-06 修复：SQL 查到了行、但**可能为数值的列全是 NULL** 时，
+    # 原逻辑把它们全划进 dim_cols，走到「纯清单型结果」分支，输出
+    #   「· 结果为xx的明细清单，前 5 条为：None。」
+    # ——用户看到的是"明细清单 + None"，完全不知道是"算出来是空"。
+    # 实证：Q7「九月份之后的投入产出比」问的是比值，SQL 正确但区间无数据，
+    # SUM(good)/SUM(input) 得 NULL → 界面说"前 5 条为 None"。
+    #
+    # ⚠ 判据必须是「**至少有一列看起来该是数值**（列名像指标）且它全为空」，
+    #   不能是「所有列都空」——纯文本清单（名称列）本来就没有数值，
+    #   那样判会把正常清单也接管成"空值"提示（实测误伤）。
+    def _looks_numeric_col(c):
+        if _is_ratio_like(c):
+            return True
+        return bool(re.search(
+            r"(qty|quantity|count|num|rate|ratio|pct|percent|roi|yield|"
+            r"avg|mean|max|min|total|sum|value|score|index|"
+            r"值|率|数|量|占比|良率|不良|投入|产出|产量|停机|工时|天数|费用|金额)",
+            str(c), re.I))
+
+    _numlike_cols = [c for c in cols if _looks_numeric_col(c)]
+    _all_num_null = bool(_numlike_cols)
+    for c in _numlike_cols:
+        ok_c, _v = True, []
+        for r in rows:
+            v = r.get(c)
+            if v is None or v == "":
+                continue
+            try:
+                _v.append(float(v))
+            except (ValueError, TypeError):
+                ok_c = False
+                break
+        if ok_c and _v:
+            _all_num_null = False
+            break
+    if _all_num_null and rows:
+        _c0 = cols[0] if cols else ""
+        return "\n".join(lines + [
+            "",
+            "【主要发现】",
+            f"· 查询本身命中了 {len(rows)} 条记录，但"
+            f"{'、'.join(disp[c] for c in _numlike_cols[:3])}计算结果为**空值**"
+            "——通常说明筛选区间内没有符合条件的数据。",
+            f"· 当前结果里 {_c0} = "
+            + "、".join(str(r.get(_c0)) for r in rows[:3]) + "。",
+            "",
+            "【建议关注】",
+            "· 建议放宽时间范围或减少筛选条件后重试；若确认区间内应有数据，"
+            "可继续追问「该区间内有哪些记录」核对底表。",
+        ])
+
     # 无任何数值列 → 纯清单型结果，只给概览与前几条，不做统计（避免瞎算）
     if not num_cols:
         lines += ["", "【主要发现】"]
@@ -11206,13 +13953,23 @@ def _has_group_or_window(sql: str) -> bool:
 # 模型才能自觉声明差异，而不是照旧一本正经地编。
 
 _UNDERIVABLE_METRIC_RULES: list[tuple[re.Pattern, re.Pattern, str]] = [
-    (re.compile(r"人均|每人|按人头|人天产出"),
+    # 人均类：★2026-10-06 补量词变体。原来只认「人均|每人|按人头|人天产出」，
+    # 题单第62/67 条（「每个工人一天能产多少件」「每个工人一天能产多少件」）
+    # 实测**识别不到** → 缺源字段闸门失效，系统会给一个把总量当人均的数。
+    # 现补：每个/每位/每名/每工 + 工人/员工/职工/作业员/人员/工。
+    # 判据用「量词 + 人」两个字都出现，避免误纳「每人每���」之外的普通问法。
+    (re.compile(r"人均|每人|按人头|人天产出|"
+                r"(?:每个|每位|每名|每工|逐个)\s*(?:工人|员工|职工|作业员|人员|工人岗|操作工)"),
      re.compile(r"人数|员工数|headcount|employee_count|staff_count|worker_count|"
                 r"person_count|num_workers|manpower", re.I),
      "人均类指标需要「人数」字段（员工数/工人数）做分母。当前数据库没有人数类字段，"
      "无法计算人均值（只有产量/产值总量）。请接入人数数据源，"
      "或在结果卡片「去登记口径」明确人均的计算公式。"),
-    (re.compile(r"周转率|周转天数|周转次数"),
+    # 周转类：★2026-10-06 补口语变体。原词表「周转率|周转天数|周转次数」是
+    # 名词直陈，题单第 64/65 条问的是「一个月能周转**几次**」「平均库存周转**要多少天**」——
+    # 「周转」与量词之间插了字（能/要多少），旧正则匹配不到 ⇒ 缺源字段闸门失效
+    # （实测 4/10 条缺源题识别不到，本条占2 条）。现按「周转」二字 + 任意修饰匹配。
+    (re.compile(r"周转"),
      re.compile(r"出库|消耗|领用|销售量|发货|shipment|consumption|issue_qty|out_qty|"
                 r"sold|usage_qty|sale_qty", re.I),
      "库存周转类指标需要「出库/消耗/销售」流量数据（周转率=消耗/平均库存，"
@@ -11238,7 +13995,21 @@ _UNDERIVABLE_METRIC_RULES: list[tuple[re.Pattern, re.Pattern, str]] = [
     # 用户实测（三组测试 C 组）：报废率/订单满足率/物料齐套率/停机率走 LLM 直生时，
     # 会拿无关列冒充（报废率→缺陷数、停机率→停机记录条数），产出"一本正经的错误答案"。
     # 与上方四条同逻辑：生成前拒绝 + 引导到已注册的替代口径，而不是让 LLM 编一个能跑的 SQL。
-    (re.compile(r"报废率|报废数|报废量|废品率|废品数|报废"),
+    # 报废/废品类：★2026-10-06 补口语变体。原词表列的是「报废率/报废数/废品数」等
+    # 名词形，题单第 66 条问「**废品有多少**」——「废品」与量词「有多少」之间
+    # 断开了，旧正则匹配不到。
+    # ⚠⚠ 收窄到只认「比率/计数」两类硬表达（自测两次才收敛）：
+    #   ① 裸「报废|废品」      → 误伤「各产线的报废**情况**」（可从 defect 近似，合法）
+    #   ② 加「情况」仍误伤  → 「情况」属开放问法，不构成"要报废数"的诉求
+    #   ③ 现只留：率/数/量/多少/几个/占比 —— 都是明确的"要一个数"
+    #   ④ ★自测第 4 轮才发现：词表里的 `多少` 前有 `\s*`，它**只能吃空白、吃不掉
+    #      「有多少」这三个字**，所以「废品有多少」（题单第 66 条原句）仍漏。
+    #      ⇒ 显式把「有多少」作为可选后缀列进 alternation。
+    #   验算：5种口语变体全中（「废品/报废有多少」「有多少废品」「废品有多少件」
+    #      「今天废品有多少」），而「各产线的报废**情况**」「哪类缺陷」不中（无误伤）。
+    (re.compile(r"(?:报废|废品)\s*(?:率|数|量|有多少|几个|占比|件数)|"
+                r"(?:报废|废品)(?:率|数|量)|"
+                r"(?:多少|几)(?:件|个|条|批)?\s*(?:的)?\s*(?:报废|废品)"),
      re.compile(r"报废|废品|scrap|waste|reject", re.I),
      "报废率需要「报废/废品数量」字段（报废率=报废数/投入数）。当前数据库只有"
      "「不良(defect)」「返工(rework)」数据，报废≠不良，不能用缺陷数冒充。"
@@ -11262,6 +14033,18 @@ _UNDERIVABLE_METRIC_RULES: list[tuple[re.Pattern, re.Pattern, str]] = [
      "当前数据库只有停机记录（停机时长/原因），没有计划运行时长，无法计算停机率。"
      "已注册口径中「设备可用率」「设备故障停机占比」及各类停机原因时长可查停机相关情况；"
      "如需停机率请接入计划工时数据，或在结果卡片「去登记口径」明确计算公式。"),
+    # 「每批/每炉/每次」类：★2026-10-06 新增（第 17 轮词表同步测试抓出）。
+    #   守卫侧 ②.5-b 会拦「每批产出多少」（单位换算但库里有产出量），
+    #   但本库**全库无批次字段**（information_schema 实查：mes_process_output /
+    #   qms_inspection / mes_work_order / qms_defect_detail /
+    #   inv_inventory_snapshot 五个表的 batch/lot 类列均为 0 个）
+    #   ⇒ 修复器不能改写，若不给声明出口，用户就只看到"拒绝"而无从知道为什么。
+    (re.compile(r"每批|每炉|每炉次|逐批"),
+     re.compile(r"batch|lot|批次|批号|炉号", re.I),
+     "「每批/每炉」类问法需要「批次」字段（批号/炉号）做分母。"
+     "当前数据库**全库没有批次字段**（产出/检验/工单/缺陷/库存五张表均无 batch/lot 列），"
+     "无法按批次折算。已注册口径中可查按产线/工序/产品/日期的统计；"
+     "如需按批次统计请接入批次数据源，或在结果卡片「去登记口径」明确计算公式。"),
 ]
 
 
@@ -12842,6 +15625,124 @@ def _try_warning_rule(query: str, matched_tables: list, cmap: dict) -> dict | No
         return None
 
 
+def _parse_topn(q: str, default: int | None = None) -> int | None:
+    """从问句里取 TOP-N 的 N，支持阿拉伯数字与中文数字。
+
+    2026-10-06：用户写「按耗时最长的排**前二十**」，`(?:前|top)\\s*(\\d{1,3})`
+    只认阿拉伯数字 → 漏 → 规则退回全量 344 行（实测 Q4 返回 344 行而非 20 行）。
+    """
+    s = str(q or "")
+    m = re.search(r"(?:前|top|Top|TOP)\s*(\d{1,4})", s)
+    if m:
+        try:
+            return max(1, min(1000, int(m.group(1))))
+        except Exception:
+            pass
+    m = re.search(r"(?:前|top|Top|TOP)\s*([零一二三四五六七八九十百两]+)", s)
+    if m:
+        return _cn_to_int(m.group(1))
+    return default
+
+
+_CN_DIGIT = {"零": 0, "〇": 0, "一": 1, "壹": 1, "二": 2, "两": 2, "贰": 2,
+             "三": 3, "叁": 3, "四": 4, "肆": 4, "五": 5, "伍": 5,
+             "六": 6, "陆": 6, "七": 7, "柒": 7, "八": 8, "捌": 8,
+             "九": 9, "玖": 9}
+
+
+# 滚动窗口 + 比值 + 环比/变化：三条都要占（缺一条就不该走规则⓪b，
+# 否则「各产线的良率是多少」这种静态比值会被硬塞成逐日环比表）
+_ROLL_WINDOW_RE = re.compile(
+    r"(最近|近\s*[\d一二三四五六七八九十两]|过去\s*[\d一二三四五六七八九十两]|"
+    r"上个月|上月|本周|这周|当月|本月)", re.I)
+# ⚠⚠ 2026-10-06 修同名覆盖事故（根因 D 的真正根因）：
+#   此前本变量名与 L3515 的 `_RATIO_ASK_RE` **完全同名**，本行在模块加载时
+#   **后执行 → 直接覆盖**它。后果：L3515 那套精心维护的判据
+#   （X产出比/比值/比率/单位词…）自始至终**从未生效**，凡是依赖它的守卫
+#   （_ratio_without_division_reason / _ratio_molecule_has_defect_reason /
+#     L3129 自动修复函数）跑的都是下面这个窄词表。
+#   实测症状：「每件产出消耗多少投入」里「每件」不在窄词表 ⇒ 分子含 defect
+#   照常放行（0.9957 vs 真值 1.02505）；且改 L3515 那个词表**改了等于没改**。
+#   ⇒ 已重命名为 `_ROLL_RATIO_ASK_RE_NARROW`，与L3529 的 `_ROLL_RATIO_ASK_RE`
+#      区分开（本变量更窄：只认静态比值词，不含滚动窗口词）。
+#   教训：**同一模块内禁止同名全局正则**；新增时先 grep 确认不重名。
+_ROLL_RATIO_ASK_RE_NARROW = re.compile(
+    r"(投入产出比|产出比|投入产出|良率|合格率|报废率|不良率|缺陷率|"
+    r"占比|比率|比值|同比|环比)", re.I)
+_ROLL_COMPARE_RE = re.compile(
+    r"(环比|同比|前一日|前一天|比前|较前|变化|涨跌|跌|涨|升降|"
+    r"对比|相比|哪个|哪天|哪一天|几天)", re.I)
+_ROLL_RATIO_ASK_RE = re.compile(
+    r"(最近|近\s*[\d一二三四五六七八九十两]|过去\s*[\d一二三四五六七八九十两]|"
+    r"上个月|上月|本周|这周|当月|本月)", re.I)
+
+
+def _is_roll_ratio_question(q: str) -> bool:
+    """滚动窗口 + 比值 + 对比，三要素是否同时成立。
+
+    ⚠ **不要用三个 lookahead 拼一个正则**（2026-10-06 实测 0/6）：
+    `(?=.*A)(?=.*B)(?=.*C)` 里每个 lookahead 都从**同一位置**起匹配，
+    `.*` 是贪婪且不共享消耗，A 吃掉整串后 B/C 无子串可用 → 恒不匹配。
+    必须三个正则各自 search 再取与。
+    """
+    s = str(q or "")
+    # ★ 2026-10-06：原先此处写 `_RATIO_ASK_RE`，实际取到的是**本模块下方那个同名
+    #   窄词表**（L3515 那个被覆盖了）。覆盖消失后必须显式指向窄词表，
+    #   否则滚动窗口判定会突然开始认「每件/日均」等词，把静态问句误判成滚动比值题。
+    return bool(_ROLL_WINDOW_RE.search(s)
+                and _ROLL_RATIO_ASK_RE_NARROW.search(s)
+                and _ROLL_COMPARE_RE.search(s))
+
+
+def _parse_rolling_days(q: str, default: int = 7) -> int:
+    """从问句里取滚动窗口天数，支持中文数字（默认 7 天）。"""
+    s = str(q or "")
+    m = re.search(r"(?:最近|近|过去)\s*(\d{1,3})\s*天", s)
+    if m:
+        try:
+            return max(1, min(365, int(m.group(1))))
+        except Exception:
+            pass
+    m = re.search(r"(?:最近|近|过去)\s*([一二三四五六七八九十两]+)\s*天", s)
+    if m:
+        v = _cn_to_int(m.group(1))
+        if v:
+            return max(1, min(365, v))
+    m = re.search(r"(?:最近|近|过去)\s*(\d{1,3})\s*(?:周|星期)", s)
+    if m:
+        try:
+            return max(1, min(365, int(m.group(1)) * 7))
+        except Exception:
+            pass
+    return default
+
+
+def _cn_to_int(txt: str) -> int | None:
+    """中文数字转整数（支持 一~九十九 / 一百 / 一百二十三）。"""
+    t = str(txt or "").strip()
+    if not t:
+        return None
+    if t == "十":
+        return 10
+    total, section, last = 0, 0, None
+    for ch in t:
+        if ch in _CN_DIGIT:
+            last = _CN_DIGIT[ch]
+            section = last
+        elif ch == "十":
+            section = (last if last is not None else 1) * 10
+            total += section
+            section, last = 0, None
+        elif ch == "百":
+            section = (last if last is not None else 1) * 100
+            total += section
+            section, last = 0, None
+        else:
+            return None
+    total += section
+    return total or None
+
+
 def _try_expr_rules(query: str, matched_tables: list, cmap: dict) -> dict | None:
     """确定性「表达式/子查询/CASE」规则通道（2026-09-06 yans 题库评测后补）。
 
@@ -12875,6 +15776,94 @@ def _try_expr_rules(query: str, matched_tables: list, cmap: dict) -> dict | None
                     "filters": [], "time_range": "", "sql_draft": sql,
                     "confidence": 0.8, "risks": risks,
                     "llm_generated": True, "escape_hatch": True, "deterministic": True}
+
+        # ── ⓪ 工单工期天数（**放在所有规则最前，且不依赖 _has**）──
+        # 2026-10-06 实测 P0：Q4「每张工单从开工到完工实际用了多少天，
+        # 按耗时最长的排前二十」。原规则⑤（下方）要求 `_has("mes_work_order")`，
+        # 即 mes_work_order 必须出现在**表匹配结果**里；本题模型匹配到别的表，
+        # 规则 ⑤ 直接不触发 → 落进 LLM 兜底 → 写出
+        #     SELECT work_order_id, SUM(plan_qty) ...      （plan_qty 恒 2000）
+        # 或  SELECT work_order_id, AVG(end_date-start_date) ... LIMIT 1000（344 行）
+        # 两者都与问题不符。工期语义在这张库里**只有一处**实现方式
+        # （end_date - start_date），没有第二种可能，所以不必等表匹配。
+        _DUR_RULE_RE = re.compile(
+            r"(多少天|几天|耗时|工期|周期|跨度|用了多久|多长时间|"
+            r"开工到完工|开工到结束|生产周期|制造周期|交付周期)", re.I)
+        if (_DUR_RULE_RE.search(q)
+                and ("工单" in q or "生产" in q or "订单" in q or "制造" in q)
+                and not re.search(r"(停机| downtime|维修|保养)", q, re.I)):
+            _topn2 = _parse_topn(q)
+            if _topn2:
+                sql = ('SELECT work_order_id, start_date, end_date, '
+                       '(end_date - start_date) AS "工期天数" '
+                       'FROM mes_work_order WHERE end_date IS NOT NULL '
+                       'AND start_date IS NOT NULL '
+                       'ORDER BY "工期天数" DESC, work_order_id LIMIT %d' % _topn2)
+                _note = ("按 结束日期-开始日期 计算工单工期，降序取前 %d 条；"
+                         "工期=end_date-start_date（单位天），请核对日期口径" % _topn2)
+            else:
+                sql = ('SELECT work_order_id, start_date, end_date, '
+                       '(end_date - start_date) AS "工期天数" '
+                       'FROM mes_work_order WHERE end_date IS NOT NULL '
+                       'AND start_date IS NOT NULL ORDER BY work_order_id')
+                _note = "按 结束日期-开始日期 计算工单工期，单位天，请核对日期口径"
+            _b = _build(sql, "命中「工单工期天数」规则：" + _note, [_note])
+            if _b:
+                return _b
+
+        # ── ⓪b 滚动窗口比值 + 逐日环比（**不依赖 _has，用数据锚点而非 CURRENT_DATE**）──
+        # 2026-10-06 实测 P0：Q5「最近七天的投入产出比和之前七天比，哪天跌得最厉害」。
+        # 守卫 8 能拦住 `CURRENT_DATE` 锚点，但拦完只是让重试链改写，
+        # 思考型模型在剩余预算内改不出来 → 退化成
+        #     SELECT * FROM mes_process_output ORDER BY stat_date DESC LIMIT 20
+        # （实测 0 行 → 退化为裸明细，正是守卫要防的东西）。
+        # 根因是「最近N天」在这张库里**只能**锚到 MAX(stat_date)：
+        # 数据止于 2026-09-15，而 current_date=2026-10-06，CURRENT_DATE 必然 0 行。
+        # 所以要在这里直接给出正确锚点的确定性 SQL，不指望模型改。
+        # SQL 形态（与 ground truth A/B/C 三套核算逐位一致，见 diag_rule0b2.txt）：
+        #   CTE 逐日聚合 → LAG 算环比 → 分段窗口函数给两段均值 → 按 delta 排序。
+        if _is_roll_ratio_question(q) and not re.search(
+                r"(停机|维修|保养|设备|工单|库存|订单|客户|供应商|金额|成本|销售额)",
+                q, re.I):
+            _rw = _parse_rolling_days(q) or 7
+            _rs = _rw * 2 - 1
+            _rdir = "DESC" if re.search(r"(涨|升|升幅|最高|最大|最好)", q) else "ASC"
+            # ⚠ 全部用 f-string 拼，不要用相邻字面量 + `%`：
+            # 隐式拼接先合成一个长串再套 `%`，占位符个数对不上会在运行时抛
+            # TypeError，又被本函数外层的 `except Exception` 静默吞掉 →
+            # 规则看起来"永不命中"（2026-10-06 实测 0/6，排查了很久）。
+            sql = (
+                "WITH last AS (SELECT MAX(stat_date)::date AS mx "
+                "FROM mes_process_output), "
+                "d AS (SELECT gs::date AS dd FROM last, generate_series("
+                f"mx - INTERVAL '{_rs} days', mx, INTERVAL '1 day') gs), "
+                "agg AS (SELECT d.dd, SUM(m.input_qty) AS inp, "
+                "SUM(m.good_qty) AS out_ FROM d "
+                "LEFT JOIN mes_process_output m ON m.stat_date = d.dd "
+                "GROUP BY d.dd), "
+                "r AS (SELECT agg.dd, agg.inp, agg.out_, "
+                "agg.out_ * 1.0 / NULLIF(agg.inp, 0) AS ratio, "
+                f"CASE WHEN agg.dd > last.mx - INTERVAL '{_rw} days' "
+                f"THEN '最近{_rw}天' ELSE '之前{_rw}天' END AS seg "
+                "FROM agg, last), "
+                "n AS (SELECT r.dd, r.seg, r.inp, r.out_, r.ratio, "
+                "r.ratio - LAG(r.ratio) OVER (ORDER BY r.dd) AS delta, "
+                "AVG(r.ratio) OVER (PARTITION BY r.seg) AS seg_avg "
+                "FROM r) "
+                'SELECT dd AS "日期", seg AS "窗口", inp AS "投入", '
+                'out_ AS "产出", ROUND(ratio::numeric, 6) AS "投入产出比", '
+                'ROUND(delta::numeric, 6) AS "较前一日变化", '
+                'ROUND(seg_avg::numeric, 6) AS "窗口平均投入产出比" '
+                "FROM n WHERE delta IS NOT NULL "
+                f"ORDER BY delta {_rdir} LIMIT 10"
+            )
+            _note2 = (f"以库内最新日期 MAX(stat_date) 为锚取最近 {_rw} 天，"
+                      "逐日算投入产出比(good_qty/input_qty)并与前一日比较，"
+                      f"按变化幅度{_rdir}排序；不用 CURRENT_DATE 是因为本库数据"
+                      "只到最新有数的日期，用今天做锚点必然 0 行")
+            _b2 = _build(sql, "命中「滚动窗口比值环比」规则：" + _note2, [_note2])
+            if _b2:
+                return _b2
 
         # ── ① 损耗 = 列 - 列（投入-产出/损耗）──
         if ("损耗" in q or "损失" in q or "损耗量" in q) and _has("mes_process_output"):
@@ -12951,11 +15940,36 @@ def _try_expr_rules(query: str, matched_tables: list, cmap: dict) -> dict | None
                           ["分档阈值 1×/1.5× 安全库存，与指标注册表「库存分档统计」同口径，请核对"])
 
         # ── ⑤ 工期天数 = 结束日期 - 开始日期（列间日期差）──
-        if ("工期" in q or "周期" in q or "耗时" in q) and "工单" in q and _has("mes_work_order"):
-            sql = ("SELECT work_order_id, (end_date - start_date) AS \"工期天数\" "
-                   "FROM mes_work_order ORDER BY work_order_id")
-            return _build(sql, "命中「工期天数」规则：按 结束日期-开始日期 计算工单工期",
-                          ["工期=end_date-start_date（单位天），请核对日期口径"])
+        # 2026-10-06 扩触发词：「从开工到完工实际用了多少天」原本只因缺
+        # 「工期/周期/耗时」而落到 AI 兜底，模型写成 SUM(plan_qty)，
+        # 而 plan_qty 恒为 2000 → 20 行全 2000、合计 40000（用户截图实证）。
+        if ("工期" in q or "周期" in q or "耗时" in q
+                or "多少天" in q or "几天" in q or "多长时间" in q
+                or "用了多久" in q or "开工到完工" in q) \
+                and ("工单" in q or "生产" in q) and _has("mes_work_order"):
+            # 「前N/排前N」→ 按工期倒序取N 条；否则给全量（工单数不大）
+            import re as _re
+            _topn = None
+            _m = _re.search(r"(?:前|top|Top|TOP)\s*(\d{1,3})", q)
+            if _m:
+                try:
+                    _topn = max(1, min(200, int(_m.group(1))))
+                except Exception:
+                    _topn = None
+            if _topn:
+                sql = ("SELECT work_order_id, start_date, end_date, "
+                       "(end_date - start_date) AS \"工期天数\" "
+                       "FROM mes_work_order WHERE end_date IS NOT NULL "
+                       "AND start_date IS NOT NULL "
+                       "ORDER BY \"工期天数\" DESC, work_order_id LIMIT %d" % _topn)
+                note = ("按 结束日期-开始日期 计算工单工期，降序取前 %d 条；"
+                        "工期=end_date-start_date（单位天），请核对日期口径" % _topn)
+            else:
+                sql = ("SELECT work_order_id, start_date, end_date, "
+                       "(end_date - start_date) AS \"工期天数\" "
+                       "FROM mes_work_order ORDER BY work_order_id")
+                note = "按 结束日期-开始日期 计算工单工期，单位天，请核对日期口径"
+            return _build(sql, "命中「工期天数」规则：" + note, [note])
 
         # ── ⑥ 整个车间/全体的投入合格不良总量（不分组 SUM）──
         if ("整个" in q or "全体" in q or "整体" in q) and \
@@ -12965,6 +15979,10 @@ def _try_expr_rules(query: str, matched_tables: list, cmap: dict) -> dict | None
             return _build(sql, "命中「全体总量」规则：车间整体投入/合格/不良求和（不分组）",
                           ["总量不分组，请核对是否需要按车间/产线维度拆分"])
     except Exception:
+        # 2026-10-06：本行曾把 `%` 占位符个数不匹配的 TypeError 静默吞掉，
+        # 表现是「规则永远不命中」，排查耗时很长。规则链里的异常必须留痕。
+        logging.getLogger(__name__).warning(
+            "[_try_expr_rules] 规则链异常，问题=%r", query, exc_info=True)
         return None
     return None
 

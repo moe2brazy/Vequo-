@@ -206,7 +206,7 @@ class DashboardRequest(BaseModel):
 # ── LLM 配置（自定义模型：运行时切换 API）─────────────────
 
 class LLMConfigRequest(BaseModel):
-    model: str = "deepseek-v4-flash"
+    model: str = "deepseek-flash"
     api_key: str = ""
     base_url: str = "https://api.deepseek.com/v1"
     temperature: float = Field(0.2, ge=0.0, le=2.0)
@@ -247,7 +247,14 @@ def get_llm_config_api():
     }
 
 
-@app.post("/api/llm/config", dependencies=[Depends(require_roles("admin"))])
+# 2026-10-07：放开模型切换的管理员限制 —— 改为**只需登录**（不再限admin）。
+# 原为require_roles("admin")，导致 viewer / qc_user / eqp_user 等账号在前端
+# 看不到可用入口（按钮 disabled + title「仅管理员…」），后端也一律 403。
+# ⚠ 配置是**全局单份**（config.update_llm_config 写 .env、所有模块共享同一dict 引用），
+#    不是按账号隔离 —— 任一账号保存后**对所有账号生效**，这是本次的既定取舍
+#    （用户为赶时间选择全局共享）。若日后要按账号隔离，需把配置改成按 username 存库、
+#    并让问数链路用当前用户去读，不能只放开这里的权限。
+@app.post("/api/llm/config", dependencies=[Depends(require_login())])
 def save_llm_config_api(req: LLMConfigRequest):
     """保存 LLM 配置（热生效）；test_only=True 只测试连接"""
     from config import update_llm_config, test_llm_connection, get_llm_config
@@ -295,7 +302,10 @@ def save_llm_config_api(req: LLMConfigRequest):
     }
 
 
-@app.post("/api/llm/restore-default", dependencies=[Depends(require_roles("admin"))])
+# 2026-10-07：同/api/llm/config —— 「恢复默认」也只需登录。
+# 注意它回写的是**系统内置默认**（LLM_DEFAULT_*，本身是全局冻结值），
+# 任一账号点它都会把全系统配置重置，影响所有人。
+@app.post("/api/llm/restore-default", dependencies=[Depends(require_login())])
 def restore_llm_default_api():
     """将当前生效配置恢复为系统内置默认（冻结的 LLM_DEFAULT_*）"""
     from config import restore_llm_default, get_llm_config, test_llm_connection
@@ -846,26 +856,21 @@ def metric_compile_api(req: MetricCompileRequest, authorization: str = Header(No
 @app.put("/api/metrics/{name}", dependencies=[Depends(require_roles("admin"))])
 def update_metric(name: str, req: MetricRequest):
     """更新用户自定义指标（内置指标只读）"""
-    from agent.metric_registry import BUILTIN_METRICS, _load_user_metrics, save_user_metrics
+    from agent.metric_registry import BUILTIN_METRICS, user_metrics_transaction
     if any(m["name"] == name for m in BUILTIN_METRICS):
         raise HTTPException(status_code=400, detail="内置指标只读，不能修改")
-    user_metrics = _load_user_metrics()
     target = req.model_dump()
     target["name"] = target.get("name") or name
-    for i, m in enumerate(user_metrics):
-        if m["name"] == name:
-            user_metrics[i] = target
-            save_user_metrics(user_metrics)
-            # 第三层：向量库即时重建
-            try:
-                from agent.metric_memory import get_metric_memory
-                get_metric_memory().rebuild()
-            except Exception:
-                pass
-            return {"success": True, "metric": target}
-    # 不存在则新增
-    user_metrics.append(target)
-    save_user_metrics(user_metrics)
+    # 2026-10-08：读-改-写整段进事务，防止并发 PUT 相互覆盖
+    # （原实现「先读全量→改内存→整份写回」，两个管理员并发改不同指标时后写者
+    #   用陈旧快照覆盖前者，指标凭空消失且无任何报错）
+    with user_metrics_transaction() as user_metrics:
+        for i, m in enumerate(user_metrics):
+            if m["name"] == name:
+                user_metrics[i] = target
+                break
+        else:
+            user_metrics.append(target)   # 不存在则新增
     # 第三层：向量库即时重建
     try:
         from agent.metric_memory import get_metric_memory
@@ -878,14 +883,16 @@ def update_metric(name: str, req: MetricRequest):
 @app.delete("/api/metrics/{name}", dependencies=[Depends(require_roles("admin"))])
 def delete_metric(name: str):
     """删除用户自定义指标（内置指标只读）"""
-    from agent.metric_registry import BUILTIN_METRICS, _load_user_metrics, save_user_metrics
+    from agent.metric_registry import BUILTIN_METRICS, user_metrics_transaction
     if any(m["name"] == name for m in BUILTIN_METRICS):
         raise HTTPException(status_code=400, detail="内置指标只读，不能删除")
-    user_metrics = _load_user_metrics()
-    remaining = [m for m in user_metrics if m["name"] != name]
-    if len(remaining) == len(user_metrics):
-        raise HTTPException(status_code=404, detail=f"指标「{name}」不存在")
-    save_user_metrics(remaining)
+    # 2026-10-08：存在性检查也必须在锁内做，否则「检查」与「删除」之间
+    # 会被并发插入挤入，出现「删掉了别人刚加的同名指标」
+    with user_metrics_transaction() as user_metrics:
+        remaining = [m for m in user_metrics if m["name"] != name]
+        if len(remaining) == len(user_metrics):
+            raise HTTPException(status_code=404, detail=f"指标「{name}」不存在")
+        user_metrics[:] = remaining
     # 第三层：向量库即时重建（删除指标后不再被检索命中）
     try:
         from agent.metric_memory import get_metric_memory
@@ -1554,6 +1561,25 @@ async def agent_stream_api(req: AskRequest, authorization: str = Header(None)):
     u = get_current_user(authorization)
     from security.enforcer import build_acl_context
     acl = build_acl_context(u)
+
+    # 2026-10-05 修复（P0）：报告分支绕过 export 操作权限。
+    # ask_stream 内部会把「生产周报」这类问句分流到 periodic_report 生成完整报告，
+    # 但**报告意图是在 stream 内部判定的**，入口层看不到，所以同族的
+    # /api/overview/report、/api/overview/report-html、/api/ask/report 全都做了
+    # `_require_action(authorization, "export")` 校验（注释里明确写了「报告是把数据
+    # 带出去的动作」），唯独这条 SSE 入口漏了 —— 未开通 export 的账号（实测
+    # region_manager 的 allowed_actions=[]）只要发一句「生产周报」就能拿到完整报告。
+    # 这里在入口层复现同一个判定：命中报告意图就先校验 export。
+    try:
+        from agent.report_intent import is_report_request as _is_rpt
+        if _is_rpt(req.query or ""):
+            _require_action(authorization, "export")
+    except HTTPException:
+        raise
+    except Exception:
+        # 报告识别自身出错时**放行**给原问数链路（与 ask_stream 内部一致的容错策略）
+        pass
+
     return StreamingResponse(
         ask_stream(req.query, req.history, acl=acl, user=u, no_confirm=req.no_confirm),
         media_type="text/event-stream",
@@ -2653,12 +2679,36 @@ def suggest_questions_api(limit: int = 6, seed: int | None = None):
 # ── 全库分析报告（流式 / 导出）──────────────────────────
 
 def _build_report_context(allowed_tables: set[str] | None = None,
-                          row_filters: dict[str, str] | None = None) -> tuple[str, str, dict, list]:
+                          row_filters: dict[str, str] | None = None,
+                          acl=None) -> tuple[str, str, dict, list]:
     """构建报告上下文：表清单 + 行数 + 数据摘要 + 行业推断。
 
     权限过滤（安全关键）：allowed_tables 非 None 时只统计有权限的表；
-    row_filters 提供时数据摘要按行级条件过滤。返回 (context, industry, counts, real_tables)。
+    row_filters 提供时数据摘要按行级条件过滤。
+
+    2026-10-05 新增 acl：本函数产出的数据摘要会**直接进入 LLM prompt**
+    （「关键数据摘要」段），所以列级脱敏在这里尤其重要 ——
+    原实现是 `SELECT *` 且只做行级过滤，被脱敏列的**明文会出境到模型侧**。
+    现在改为：显式列清单 + enforcer.rewrite_sql 列级脱敏 + 结果层兜底剔除 deny 列。
+
+    返回 (context, industry, counts, real_tables)。
     """
+    from agent.question_report import _apply_column_acl, _mask_rows_by_acl
+
+    def _table_columns_safe(tbl_name: str) -> list[str]:
+        """取表列名清单（失败返回空列表，调用方跳过该表而不是退回 SELECT *）。"""
+        try:
+            from database import SessionLocal
+            from sqlalchemy import inspect as _insp
+            _db = SessionLocal()
+            try:
+                cols = _insp(_db.get_bind()).get_columns(tbl_name)
+                return [c["name"] for c in cols if c.get("name")]
+            finally:
+                _db.close()
+        except Exception:
+            return []
+
     from db.executor import execute_sql, get_table_row_counts
     try:
         counts = get_table_row_counts()
@@ -2724,11 +2774,25 @@ def _build_report_context(allowed_tables: set[str] | None = None,
                     valid, _err, _clean = validate_sql_safety(f"SELECT 1 WHERE {_rf}")
                     if valid:
                         row_cond = f" WHERE {_rf}"
-            r = execute_sql(f"SELECT * FROM {qname}{row_cond} LIMIT 3")
+            # 2026-10-05（P0）：原为 `SELECT *` —— 列级脱敏列的明文会随
+            # data_brief 整段进 LLM prompt（敏感数据出境）。改为：
+            #   ① 显式列清单（最多 10 列，避免 prompt 爆炸）
+            #   ② 过 enforcer.rewrite_sql 做列级脱敏/拒绝
+            #   ③ 结果层再兜底剔除 deny 列
+            raw_cols = _table_columns_safe(name)
+            if not raw_cols:
+                continue
+            sel_list = ", ".join(quote_ident(c) for c in raw_cols[:10])
+            brief_sql = f"SELECT {sel_list} FROM {qname}{row_cond} LIMIT 3"
+            brief_sql, col_err = _apply_column_acl(brief_sql, acl)
+            if col_err:
+                continue
+            r = execute_sql(brief_sql)
             if r["success"] and r["rows"]:
+                rows_safe = _mask_rows_by_acl(r["rows"], r.get("columns") or [], acl)
                 detail = find_table_by_name(name)
                 alias = detail["table_alias"] if detail else name
-                data_brief.append(f"【{alias}】\n" + "\n".join(str(row) for row in r["rows"]))
+                data_brief.append(f"【{alias}】\n" + "\n".join(str(row) for row in rows_safe))
         except Exception:
             pass
 
@@ -2797,7 +2861,8 @@ async def overview_report(authorization: str = Header(None), _req: AnalysisReque
             yield f"data: {json_mod.dumps({'t': '正在汇总数据并生成分析报告…'})}\n\n"
             context, industry, _counts, _tables = await asyncio.to_thread(
                 _build_report_context,
-                allowed_tables=acl.allowed_tables, row_filters=acl.row_filters or None)
+                allowed_tables=acl.allowed_tables, row_filters=acl.row_filters or None,
+                acl=acl)
             async for token in generate_report_stream(context, industry=industry):
                 payload = json_mod.dumps({"t": token})
                 yield f"data: {payload}\n\n"
@@ -2856,7 +2921,8 @@ async def overview_report_export(authorization: str = Header(None)):
     # regenerate_report_asset 的 2871 行）都已包 to_thread，只有这里漏了。
     context, industry, counts, real_tables = await asyncio.to_thread(
         _build_report_context,
-        allowed_tables=acl.allowed_tables, row_filters=acl.row_filters or None)
+        allowed_tables=acl.allowed_tables, row_filters=acl.row_filters or None,
+        acl=acl)
 
     full: list[str] = []
     async for token in generate_report_stream(context, industry=industry):
@@ -2931,7 +2997,8 @@ async def regenerate_report_asset_api(rid: str, authorization: str = Header(None
     acl = build_acl_context(u)
     context, industry, _counts, _tables = await asyncio.to_thread(
         _build_report_context,
-        allowed_tables=acl.allowed_tables, row_filters=acl.row_filters or None)
+        allowed_tables=acl.allowed_tables, row_filters=acl.row_filters or None,
+        acl=acl)
     full: list[str] = []
     async for token in generate_report_stream(context, industry=industry):
         full.append(token)
@@ -2979,8 +3046,10 @@ def overview_report_html(authorization: str = Header(None)):
         try:
             from routers.knowledge import _cached
             from agent.html_report import build_html_report
+            # acl 一并传入：报告的样例数据需要列级脱敏（2026-10-05）。
+            # 缓存键 fp 已含权限指纹，不同权限不会共享同一份 HTML。
             html = _cached(f"report_html:{fp}", build_html_report, db,
-                           acl.allowed_tables, acl.row_filters or None)
+                           acl.allowed_tables, acl.row_filters or None, acl)
         finally:
             try:
                 db.close()
@@ -3036,7 +3105,7 @@ def overview_report_download(authorization: str = Header(None), format: str = "d
             from agent.html_report import build_html_report
             from agent.report_export import parse_report_blocks, blocks_to_docx, blocks_to_pdf
             html = _cached(f"report_html:{fp}", build_html_report, db,
-                           acl.allowed_tables, acl.row_filters or None)
+                           acl.allowed_tables, acl.row_filters or None, acl)
             blocks = parse_report_blocks(html)
             data = blocks_to_docx(blocks) if fmt == "docx" else blocks_to_pdf(blocks)
         finally:
@@ -3115,7 +3184,7 @@ async def ask_generate_report(req: QuestionReportRequest, authorization: str = H
 
     data = await asyncio.to_thread(
         QR.collect_question_data, question, req.sql or "",
-        acl.allowed_tables, acl.row_filters or None)
+        acl.allowed_tables, acl.row_filters or None, 200, acl)
 
     if not data.get("ok"):
         # 取数失败也要给用户一个能看懂的出口，而不是 500
@@ -3187,7 +3256,7 @@ def ask_report_download(req: QuestionReportRequest, authorization: str = Header(
     from agent import question_report as QR
 
     data = QR.collect_question_data(question, req.sql or "",
-                                   acl.allowed_tables, acl.row_filters or None)
+                                   acl.allowed_tables, acl.row_filters or None, 200, acl)
     if not data.get("ok"):
         raise HTTPException(
             status_code=422,

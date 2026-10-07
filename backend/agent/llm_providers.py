@@ -19,8 +19,10 @@ _PROVIDERS: list[dict] = [
         "models": ["deepseek"],
         "hosts": ["deepseek.com"],
         "base_url": "https://api.deepseek.com/v1",
-        # V4-Flash 为官方现行主力（deepseek-chat/reasoner 已于 2026-07-24 退役）
-        "example_model": "deepseek-v4-flash",
+        # V4.1-Flash 为官方现行主力（模型 ID 已改为 deepseek-flash；
+        # 旧的 deepseek-v4-flash 对应模型已于 2026-09-10 下线，
+        # deepseek-chat/reasoner 亦于 2026-07-24 退役）
+        "example_model": "deepseek-flash",
         "temperature": "clamp",
         "json_mode": True,
     },

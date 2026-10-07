@@ -1139,7 +1139,10 @@
       "良率",
       "各工序良率",
       "工序合格率",
-      "各工序的良率"
+      "各工序的良率",
+      "产出良率",
+      "过程良率",
+      "产出合格率"
     ],
     "unit": "%",
     "tables": [
@@ -1147,7 +1150,7 @@
     ],
     "sql_expression": "SUM(good_qty) * 100.0 / NULLIF(SUM(input_qty), 0)",
     "formula": "Σ(good_qty) / Σ(input_qty) × 100%",
-    "description": "工序良率（口径：Σgood_qty / Σinput_qty × 100%；yans 基准 97.56%，md 第5节权威定义）。⚠️ 与「一次直通率」FPY=(input-rework)/input 不同（良率含返工件）；与「低于标准良率工序数」也不同（本口径是比率，后者是未达标工序计数）。",
+    "description": "工序良率（口径：Σgood_qty / Σinput_qty × 100%；yans 基准 97.56%，md 第5节权威定义）。⚠️ 与「一次直通率」FPY=(input-rework)/input 不同（良率含返工件）；与「低于标准良率工序数」也不同（本口径是比率，后者是未达标工序计数）。｜★ 注意：本口径是**产出良率**（基准表 mes_process_output，SUM(good_qty)/SUM(input_qty)），**不是检验良率**。问「检验良率 / 检验合格率 / 抽检良率」请用 qms_inspection 口径。",
     "dims": [
       "产线",
       "车间",
@@ -2034,5 +2037,86 @@
     "description": "考勤状态为请假的记录条数",
     "dims": [],
     "version": 1
+  },
+  {
+    "name": "责任工序缺陷数",
+    "aliases": [
+      "责任工序缺陷",
+      "按责任工序统计缺陷",
+      "缺陷责任工序分布",
+      "各责任工序缺陷数量",
+      "缺陷由哪个工序负责",
+      "主责工序缺陷数"
+    ],
+    "unit": "件",
+    "tables": [
+      "qms_defect_detail",
+      "dim_process"
+    ],
+    "sql_expression": "COUNT(*)",
+    "formula": "按 qms_defect_detail.responsible_process_id 关联 dim_process 统计缺陷记录条数",
+    "description": "按 qms_defect_detail.responsible_process_id 关联 dim_process 统计缺陷。**同一问法有两套口径**：缺陷记录数=COUNT(*)（缺陷单据条数）、缺陷件数=SUM(defect_qty)（不良品个数），两者差约3 倍（实测 701 vs 2340）。本口径默认同时给出两套数字与各自占比，不必由提问者替口径做选择。口径边界：不可用 mes_process_output（那是过程产出不良，另一回事）；responsible_process_id 在本库只有 PR03/PR06/PR07/PR08 四个取值，所以最多只能出4 行；只能按责任工序出数，不能按产出工序出数。",
+    "dims": [
+      "工序",
+      "缺陷类型",
+      "严重程度"
+    ],
+    "valid_from": "",
+    "valid_to": "",
+    "exec_sql": "SELECT dp.process_name AS \"责任工序\", COUNT(*) AS \"缺陷记录数\", ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS \"记录数占比(%)\", SUM(d.defect_qty) AS \"缺陷件数\", ROUND(SUM(d.defect_qty) * 100.0 / SUM(SUM(d.defect_qty)) OVER (), 2) AS \"件数占比(%)\" FROM qms_defect_detail d JOIN dim_process dp ON d.responsible_process_id = dp.process_id GROUP BY dp.process_name ORDER BY \"缺陷件数\" DESC LIMIT {limit}"
+  },
+  {
+    "name": "责任工序缺陷量",
+    "aliases": [
+      "责任工序缺陷数量合计",
+      "责任工序不良量"
+    ],
+    "unit": "个",
+    "tables": [
+      "qms_defect_detail",
+      "dim_process"
+    ],
+    "sql_expression": "SUM(defect_qty)",
+    "formula": "按 qms_defect_detail.responsible_process_id 关联 dim_process 后求 defect_qty 之和",
+    "description": "与「责任工序缺陷数」同口径、同基准表（qms_defect_detail），区别是聚合列：件数用 COUNT(*)（一条缺陷记录算 1 件），本口径用 SUM(defect_qty)（同一条记录可能含多个不良，故量 > 件数）。实测四工序合计 5273 个 / 2115 件。★ 仍不可用 mes_process_output。",
+    "dims": [
+      "工序",
+      "缺陷类型",
+      "严重程度"
+    ],
+    "valid_from": "",
+    "valid_to": "",
+    "exec_sql": "SELECT dp.process_name AS \"责任工序\", SUM(d.defect_qty) AS \"缺陷数量\" FROM qms_defect_detail d JOIN dim_process dp ON d.responsible_process_id = dp.process_id GROUP BY dp.process_name ORDER BY \"缺陷数量\" DESC LIMIT {limit}"
+  },
+  {
+    "name": "检验良率",
+    "aliases": [
+      "检验合格率",
+      "抽检良率",
+      "检验批良率",
+      "检验环节良率",
+      "各工序检验良率",
+      "来料检验良率"
+    ],
+    "unit": "%",
+    "tables": [
+      "qms_inspection",
+      "dim_process"
+    ],
+    "sql_expression": "(SUM(sample_qty) - SUM(defect_qty))::numeric / NULLIF(SUM(sample_qty), 0) * 100.0",
+    "formula": "(检验样本总数 - 检验不良总数)::numeric / 检验样本总数 × 100%，工序维度取 qms_inspection.process_id",
+    "description": "问「检验良率 / 检验合格率 / 抽检良率」一律指本口径，基准表是 **qms_inspection**，工序维度是它的 **process_id**（不是 responsible_process_id）。分母是 sample_qty（抽样数），不是检验批次数。★ **不要用 mes_process_output 的工序良率**：那是产出良率（SUM(good_qty)/SUM(input_qty)），与检验良率是两个概念，实测同一工序两者可差 1 个百分点以上（PR06 检验 94.78% vs 产出 95.80%）。★ 实测边界：8 道工序里只有 4 道有检验记录（PR03 / PR06 / PR07 / PR08，各 344 批），故按工序分组时**只出 4 行**。实测值：PR03 99.02%、PR06 94.78%、PR07 95.29%、PR08 99.08%。\n【算式注意】PostgreSQL 中 sample_qty/defect_qty 为 integer，必须先 ::numeric 再相除；若写成 (a-b)/NULLIF(a,0)::numeric 或先除后转，小数部分会在整数除法里被截断为 0（×100 也救不回来）。",
+    "dims": [
+      "工序",
+      "产品",
+      "日期"
+    ],
+    "valid_from": "",
+    "valid_to": "",
+    "exec_sql": "SELECT dp.process_name AS \"工序名称\", ROUND((SUM(qi.sample_qty) - SUM(qi.defect_qty))::numeric / NULLIF(SUM(qi.sample_qty), 0) * 100.0, 2) AS \"检验良率(%)\", ROUND(MAX(dp.standard_yield_rate) * (CASE WHEN MAX(dp.standard_yield_rate) <= 1.5 THEN 100.0 ELSE 1.0 END), 2) AS \"标准良率(%)\", ROUND((SUM(qi.sample_qty) - SUM(qi.defect_qty))::numeric / NULLIF(SUM(qi.sample_qty), 0) * 100.0 - MAX(dp.standard_yield_rate) * (CASE WHEN MAX(dp.standard_yield_rate) <= 1.5 THEN 100.0 ELSE 1.0 END), 2) AS \"差距(百分点)\" FROM qms_inspection qi JOIN dim_process dp ON qi.process_id = dp.process_id GROUP BY dp.process_name ORDER BY \"差距(百分点)\" ASC LIMIT {limit}",
+    "exec_sql_by_dim": {
+      "工序": "SELECT dp.process_name AS \"工序名称\", ROUND((SUM(qi.sample_qty) - SUM(qi.defect_qty))::numeric / NULLIF(SUM(qi.sample_qty), 0) * 100.0, 2) AS \"检验良率(%)\", ROUND(MAX(dp.standard_yield_rate) * (CASE WHEN MAX(dp.standard_yield_rate) <= 1.5 THEN 100.0 ELSE 1.0 END), 2) AS \"标准良率(%)\", ROUND((SUM(qi.sample_qty) - SUM(qi.defect_qty))::numeric / NULLIF(SUM(qi.sample_qty), 0) * 100.0 - MAX(dp.standard_yield_rate) * (CASE WHEN MAX(dp.standard_yield_rate) <= 1.5 THEN 100.0 ELSE 1.0 END), 2) AS \"差距(百分点)\" FROM qms_inspection qi JOIN dim_process dp ON qi.process_id = dp.process_id GROUP BY dp.process_name ORDER BY \"差距(百分点)\" ASC LIMIT {limit}",
+      "_default": "SELECT dp.process_name AS \"工序名称\", ROUND((SUM(qi.sample_qty) - SUM(qi.defect_qty))::numeric / NULLIF(SUM(qi.sample_qty), 0) * 100.0, 2) AS \"检验良率(%)\", ROUND(MAX(dp.standard_yield_rate) * (CASE WHEN MAX(dp.standard_yield_rate) <= 1.5 THEN 100.0 ELSE 1.0 END), 2) AS \"标准良率(%)\", ROUND((SUM(qi.sample_qty) - SUM(qi.defect_qty))::numeric / NULLIF(SUM(qi.sample_qty), 0) * 100.0 - MAX(dp.standard_yield_rate) * (CASE WHEN MAX(dp.standard_yield_rate) <= 1.5 THEN 100.0 ELSE 1.0 END), 2) AS \"差距(百分点)\" FROM qms_inspection qi JOIN dim_process dp ON qi.process_id = dp.process_id GROUP BY dp.process_name ORDER BY \"差距(百分点)\" ASC LIMIT {limit}"
+    }
   }
 ]

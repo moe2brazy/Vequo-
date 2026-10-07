@@ -12,8 +12,15 @@ dist
 dist2
 dist-ssr
 # 历史构建产物变体 / 前端备份 / npm 缓存（仅保留最新 dist，其余为磁盘冗余）
-dist_v
+# 注意：以下规则必须能覆盖 dist_xxx / dist-xxx 等**任意**变体名。
+# 2026-10-08 修正：原规则里只有 dist_v 与 dist[0-9]*，导致
+#   dist_prev_20261005/（dist 后跟字母，匹配不上 [0-9]*）
+#   dist_vq_tmp2/     （只匹配字面量 dist_v，不匹配 dist_vq_tmp2）
+# 这两个目录共 213 个构建文件完全没被挡住，`git add .` 会全部进仓库。
+# 一律用 dist_* 统一覆盖，任何 dist_ 开头的目录都不入库。
+dist_*
 dist[0-9]*
+dist-*
 dist_check
 dist_gz
 dist_new_*
@@ -60,6 +67,21 @@ config/secrets*.json
 
 # 临时诊断脚本（本地排查用，禁止提交）
 _diag/
+
+# ── 手工备份文件（2026-10-08 补）──
+# 理由：原先只针对 backend/tests/ 写了 `backend/tests/*.bak-*`，
+# 但实际排查过程中在 backend/ 根目录、backend/agent/ 下也留了一批
+#   llm_service.py.bak_20261006_ampfix（900 KB）
+#   metrics_registry.json.bak_20261006_*（5 个，各约 90 KB）
+#   metrics_registry.json.corrupt（损坏时刻的自动备份）
+# 这些全部未被任何规则挡住，`git add .` 会进仓库。
+# 统一用「.bak 开头/结尾 + .corrupt」两条兜住，与日期后缀写法无关。
+*.bak
+*.bak-*
+*.bak_*
+*.corrupt
+*.probe_bak*
+*.probe_realbak*
 
 # Editor directories and files
 .vscode/*

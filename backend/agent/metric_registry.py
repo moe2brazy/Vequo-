@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import contextlib
+import threading
 from pathlib import Path
 
 _logger = logging.getLogger("metric_registry")
@@ -1111,6 +1113,9 @@ def save_user_metrics(metrics: list[dict]) -> None:
     2026-10-03 修复：原为 open(_REGISTRY_PATH, "w") 原地覆盖 —— 该模式会先 truncate
     原文件，json.dump 途中抛异常（不可序列化对象/磁盘满/进程被杀）就留下半截文件，
     配合 _load_user_metrics 的静默兜底会导致整个用户指标注册表清空且无法恢复。
+
+    ⚠ 本函数**只保证单次写不撕裂文件**，不保证「读-改-写」的合并语义。
+    跨线程的读-改-写请用 `user_metrics_transaction()` 包裹（见下）。
     """
     tmp = _REGISTRY_PATH.with_suffix(".json.tmp")
     try:
@@ -1126,6 +1131,36 @@ def save_user_metrics(metrics: list[dict]) -> None:
         except OSError:
             pass
         raise
+
+
+# ── 用户指标「读-改-写」事务锁 ────────────────────────────────
+# 【2026-10-08 新增】save_user_metrics 是「全量覆盖」语义：
+#     metrics = _load_user_metrics()   # 读全量快照
+#     metrics.append(...)              # 改内存副本
+#     save_user_metrics(metrics)       # 把整份写回
+# FastAPI 多线程受理下，两个管理员同时改不同指标时，后写者拿的是自己那份**陈旧快照**，
+# 会把前者的修改整体覆盖掉 —— 表现为「指标莫名消失」，且**没有任何报错**，
+# save_user_metrics 本身还是原子写，丢的是合并语义，日志里也看不到痕迹。
+#
+# 修法：把「读 → 改 → 写」整段放进同一把锁（RLock而非 Lock：回调里可能再取锁）。
+# 用法：
+#     with user_metrics_transaction() as metrics:
+#         metrics.append(new_metric)      # 直接改列表
+#     # 退出 with 时自动写盘
+_USER_METRICS_LOCK = threading.RLock()
+
+
+@contextlib.contextmanager
+def user_metrics_transaction():
+    """把「读取 → 修改 → 写回」包成原子事务，退出时自动落盘。
+
+    解决并发丢更新：两个请求同时进入时，第二个必须等第一个写完才能读，
+    读到的是最新值，不会用自己的陈旧快照覆盖别人的修改。
+    """
+    with _USER_METRICS_LOCK:
+        metrics = _load_user_metrics()
+        yield metrics
+        save_user_metrics(metrics)
 
 
 def _infer_metric_type(metric: dict) -> str:
@@ -1522,7 +1557,20 @@ def _left_guard_vocab() -> set[str]:
                   #   「库存那边让我看下各仓库还有多少货」→ run="库存那边让我看下各仓库"
                   #   逐字剥到"库存"后停住（"看下/那边/让我/库存"缺位）→ 命中被误杀。
                   # "库存" 与已有 "停机/记录/检验记录/工单记录" 同类，是事实表的口语指代。
-                  "看下", "看一下情况", "那边", "让我", "分别", "库存", "数据"])
+                  "看下", "看一下情况", "那边", "让我", "分别", "库存", "数据",
+                  # 2026-10-06 修复（同族问题第四次复发）：**比较/并列连词**缺位。
+                  # 黄金题库 Q7「各工序的检验良率是多少，跟标准良率比哪个差得最多」实测：
+                  #   第 0 层子串命中 4 条（含「标准良率」pos=13），到第 1 层只剩 1 条 ——
+                  #   「标准良率」左侧 run="跟"（"…是多少，" 之后的比较连词）不在词表，
+                  #   剥不掉 → suspect=True → 该命中作废。后果是双层：
+                  #     ① find_metrics 只剩「检验良率」，并列对比的两个口径只进了一个；
+                  #     ② resolve_metric_intent 顶部「标准良率」专属守卫因"未精确命中
+                  #        标准良率"而**整句 skip**，已命中的检验良率口径也一并丢掉。
+                  # 「跟」是句法功能词、不改变口径语义（剥掉后「跟一次合格率」仍剩
+                  # 「一次」→ 照常拦截），与「同比/环比」「分析/对比」同类，故进词表。
+                  # 一并补齐其余同族连词，覆盖"和/与"之外的书面与口语写法。
+                  "跟", "同", "比", "较", "比较", "对比于", "相较", "参照",
+                  "基于", "按照", "依据", "除了", "剔除", "不含"])
     return vocab
 
 
@@ -1914,7 +1962,15 @@ def render_exec_sql_metric(query: str) -> dict | None:
                               ("设备类型", "设备类型"), ("设备", "设备"),
                               ("产品", "产品"), ("日期", "日期"),
                               ("每天", "日期"), ("每日", "日期"), ("按月", "日期"),
-                              ("仓库", "仓库")):
+                              ("仓库", "仓库"),
+                              # 2026-10-06 补「工序」：注册表里已有口径在用「工序」维度键
+                              # （实测 keys = 产品/产线/仓库/工序/日期/设备/车间），
+                              # 但本词表漏了它 → 「各工序的检验良率…」这类问句
+                              # 循环一圈tpl 为空 → 又无 _default → return None →
+                              # exec_sql 完全不生效（写进注册表的人工验证SQL 白写）。
+                              # 词表落后于数据的表现：口径配了维度、却选不出模板。
+                              ("工序", "工序"), ("各工序", "工序"),
+                              ("按工序", "工序"), ("每个工序", "工序")):
             if dim_word in query and str(by_dim.get(key) or "").strip():
                 if key in ("设备", "设备类型") and not _group_sig:
                     continue
@@ -2090,8 +2146,35 @@ def resolve_metric_intent(query: str, acl=None) -> dict:
     if len(out_hits) >= 2:
         # 比较词连接两个指标（如"计划产量>实际产量"）→ 是 WHERE 过滤条件，不是多指标并列请求，
         # 应放行给普通查询链路，而非弹「歧义澄清」阻断出数。
-        if re.search(r"大于|小于|超过|高于|低于|不少于|不低于|至少|最多|[<>]=?|≠|不等于", query):
-            return {"status": "skip", "hits": [], "hints": []}
+        #
+        # 2026-10-06 修复：原实现只看「句中有没有比较词」，位置完全不看 →
+        # **排序语义被当成 WHERE 过滤**。黄金题库 Q7「各工序的检验良率是多少，跟标准良率
+        # 比哪个差得最多」实测：命中两条口径（检验良率 pos4、标准良率 pos13），句尾的
+        # 「最多」触发此分支 → 整句 skip → 两条口径全被丢弃，Q7 永远拿不到双口径对比。
+        # 同一句去掉"差得最多"即正常命中，加上就整句失效——位置敏感却从未被测到。
+        # 修正后的判据（收窄，只去掉误判、不放宽真判）：比较词必须**落在两个命中口径
+        # 名字之间**才算 WHERE 条件（"产量 > 良率"）；排在所有口径**之后**的是排序/
+        # 极值语义（"…比哪个差得最多""哪个最高"），不是过滤条件 → 不再 skip。
+        # lo/hi 用「首命中起点 / 末命中终点」：比较词位置 p 满足 lo < p < hi 才判WHERE。
+        _cmp = re.search(r"大于|小于|超过|高于|低于|不少于|不低于|至少|最多|[<>]=?|≠|不等于", query)
+        if _cmp:
+            _ql = _strip_table_names(query).lower()
+            _spans: list[tuple[int, int]] = []
+            for _h in out_hits:
+                _cands = [str(_h.get("name") or "")] + [
+                    str(a) for a in (_h.get("aliases") or [])]
+                for _c in _cands:
+                    _c = _c.lower()
+                    if not _c:
+                        continue
+                    _i = _ql.find(_c)
+                    if _i >= 0:
+                        _spans.append((_i, _i + len(_c)))
+                        break
+            _lo = min((s for s, _ in _spans), default=-1)
+            _hi = max((e for _, e in _spans), default=-1)
+            if _spans and _lo < _cmp.start() < _hi:
+                return {"status": "skip", "hits": [], "hints": []}
         # 用户显式写出列名（如"(available_qty)"）→ 是技术化精确查询，直接查列即可，
         # 不应被「可用库存 vs 总库存」这类别名重叠误判为口径歧义而阻断出数。
         if re.search(r"\([a-zA-Z_][a-zA-Z0-9_]*\)", query):
@@ -2181,9 +2264,9 @@ def create_user_metric(metric: dict) -> dict:
                       old_expr=old_expr[:200], new_expr=new_expr[:200])
             except Exception:
                 pass
-    metrics = _load_user_metrics()
-    metrics.append(metric)
-    save_user_metrics(metrics)
+    # 2026-10-08：读-改-写整段加锁，防止并发新增指标时相互覆盖
+    with user_metrics_transaction() as metrics:
+        metrics.append(metric)
     try:
         from agent.metric_memory import get_metric_memory
         get_metric_memory().rebuild()

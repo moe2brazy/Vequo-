@@ -546,10 +546,19 @@ def _agg_override(expr: str, query: str) -> str:
     #   SUM(good_qty)             → good_qty
     #   SUM(COALESCE(good_qty,0)) → good_qty
     #   SUM(DISTINCT col)         → col（AVG(DISTINCT col) 语义等价）
+    # 2026-10-08 修复（P0）：COALESCE 的正则用 `.*` 贪婪且无括号配平，`SUM(a)+SUM(b)`
+    # 这类多列算式会被 `.*` 一路吞到末尾后仍判定「匹配成功」，只取到**第一个**列名，
+    # 于是 `SUM(COALESCE(good_qty,0) + COALESCE(defect_qty,0))` 被改写成
+    # `AVG(good_qty)` —— defect_qty 整列消失，列名却仍叫「产量」。
+    # 症状：问「各产线的平均产量」，返回的是"平均良品数"而非平均产量，系统性偏低。
+    # 该症状是 2026-10-03 那次修复的**残留半边**：那次只补了单列写法
+    # `SUM(COALESCE(good_qty,0))`，多列写法被贪婪 `.*` 吃掉。
+    # 修法：多列算式一律不覆盖（AVG 逐列取均值 ≠ 多列先求和再取均值），
+    # 交回原 expr，由 ORDER BY 表达「最高/最低」，语义不会错。
     inner = (expr or "").strip()[len("SUM("):-1].strip() if (expr or "").strip().upper().startswith("SUM(") else ""
     if inner:
         _c = re.sub(r"^DISTINCT\s+", "", inner, flags=re.IGNORECASE).strip()
-        _mc = re.fullmatch(r"COALESCE\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*,.*\)", _c, re.IGNORECASE)
+        _mc = re.fullmatch(r"COALESCE\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*,[^()]*\)", _c, re.IGNORECASE)
         if _mc:
             _c = _mc.group(1)
         if re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", _c):
@@ -1093,8 +1102,12 @@ def _build_time_filter(fact_table: str, fact_col: str, query: str) -> str | None
 
     锚点语义区分：
     - 相对区间（近N天/近N个月）：锚点用 `MAX(事实列)`，静态/滞后数据集下仍能命中数据；
-    - 绝对日历周期（今年/去年/本季度/上季度）：锚点用 `CURRENT_DATE`，符合日历语义；
-    - **月级**日历周期（本月/上月）：锚点同样用 `MAX(事实列)`，不再用 `CURRENT_DATE`。
+    - 绝对日历周期（今年/去年/本季度/上季度/本月/上月）：**一律用 `MAX(事实列)`**。
+      2026-10-05 起季度/年度 4 个分支也从 `CURRENT_DATE` 改到数据驱动锚点 ——
+      实测 yans 库数据止于 2026-09-15、今天 10-05，`date_trunc('quarter', CURRENT_DATE)`
+      返回 0 行，而 `date_trunc('quarter', MAX(stat_date))` 返回 2752 行。
+    - 单日/周相对词（今天/昨天/本周/上周）仍用 `CURRENT_DATE`：它们语义上就是
+      「相对今天」，滞后数据集下本就无数据，改锚点反而会答错问题。
 
     2026-09-29 规则审计实测（34 条真实 SQL 回放）：`CURRENT_DATE` 锚点在滞后数据集上
     恒为空——库内数据最新到 2026-07-15、今天是 09-29，「本月」「上月」条件必然 0 行，
@@ -1173,13 +1186,20 @@ def _build_time_filter(fact_table: str, fact_col: str, query: str) -> str | None
     if "本月" in query or "这个月" in query:
         return f"{fact_col} >= date_trunc('month', {anchor})"
     if "本季度" in query or "本季" in query or "季初至今" in query or "本季至今" in query:
-        return f"{fact_col} >= date_trunc('quarter', CURRENT_DATE)"   # QTD：本季度至今
+        # 2026-10-05 修复：原先用 CURRENT_DATE 锚点，在滞后数据集上恒为空。
+        # 实测 yans 库数据止于 2026-09-15、今天 10-05：
+        #   date_trunc('quarter', CURRENT_DATE) → 0 行
+        #   date_trunc('quarter', MAX(stat_date)) → 2752 行
+        # 与「本月/上月」对齐，统一改用数据驱动的 anchor。
+        return f"{fact_col} >= date_trunc('quarter', {anchor})"   # QTD：本季度至今
     if "上季度" in query or "上季" in query:
-        return f"{fact_col} >= date_trunc('quarter', CURRENT_DATE) - INTERVAL '3 months' AND {fact_col} < date_trunc('quarter', CURRENT_DATE)"
+        return (f"{fact_col} >= date_trunc('quarter', {anchor}) - INTERVAL '3 months' "
+                f"AND {fact_col} < date_trunc('quarter', {anchor})")
     if "今年" in query or "本年" in query or "年初至今" in query or "今年以来" in query:
-        return f"{fact_col} >= date_trunc('year', CURRENT_DATE)"      # YTD：年初至今
+        return f"{fact_col} >= date_trunc('year', {anchor})"      # YTD：年初至今
     if "去年" in query:
-        return f"{fact_col} >= date_trunc('year', CURRENT_DATE) - INTERVAL '1 year' AND {fact_col} < date_trunc('year', CURRENT_DATE)"
+        return (f"{fact_col} >= date_trunc('year', {anchor}) - INTERVAL '1 year' "
+                f"AND {fact_col} < date_trunc('year', {anchor})")
     return None
 
 

@@ -422,8 +422,21 @@ def _fill_period(sql: str, req: ReportRequest) -> str:
 
 
 def _wrap_row_filter(sql: str, cond: str) -> str:
-    """把行级权限条件包成子查询，避免破坏原语句的 GROUP BY / JOIN。"""
-    return f"SELECT * FROM (\n{sql.strip().rstrip(';')}\n) AS _acl_wrapped WHERE {cond}"
+    """把行级权限条件注入原语句内部的 WHERE。
+
+    2026-10-05 修复（P0）：原实现是
+        SELECT * FROM (<原SQL>) AS _acl_wrapped WHERE <cond>
+    但模板 SQL 基本都是聚合查询，子查询只投影「分组列 + 聚合列」，
+    行过滤列（line_manager / shift_code 等）**不在投影里** →
+    外层 WHERE 引用它必然 42703，实测**全部章节取数失败**
+    （periodic_report 随后抛「所有章节取数均失败」）。
+
+    现在统一复用 question_report._wrap_row_filter —— 那里是 sqlglot AST
+    实现，能正确处理聚合/JOIN/CTE/条件含子查询，且带 fail-close 兜底。
+    这里不再重复实现一份（原先两份各自演化，其中一份就是坏的）。
+    """
+    from agent.question_report import _wrap_row_filter as _impl
+    return _impl(sql, cond)
 
 
 def _pick_row_filter(sql: str, row_filters: dict[str, str] | None) -> str:
@@ -499,13 +512,18 @@ def _fmt(v: float) -> str:
 
 def collect(template: Template, req: ReportRequest,
             allowed_tables: set[str] | None = None,
-            row_filters: dict[str, str] | None = None) -> dict:
+            row_filters: dict[str, str] | None = None,
+            acl=None) -> dict:
     """按模板逐章节取数。
 
     表级权限：allowed_tables 非 None 时，章节涉及的表只要有一张不在授权内，
     该章节整章跳过并记 skipped + 原因。**不静默少数据**。
+
+    2026-10-05 新增 acl：接入列级权限（脱敏/列拒绝）。此前本函数只做表级+行级，
+    报告链路的列脱敏完全失效（实测 dim_production_line.line_manager 明文外泄）。
     """
     from db.executor import execute_sql
+    from agent.question_report import _apply_column_acl, _mask_rows_by_acl
 
     allowed = {str(t).lower() for t in allowed_tables} if allowed_tables else None
     out_sections: list[dict] = []
@@ -529,10 +547,34 @@ def collect(template: Template, req: ReportRequest,
                 })
                 continue
 
-        exec_sql = raw_sql
+        # 权限改写顺序：先列级（enforcer），后行级（注入 WHERE）。
+        # 反过来的话，行级包装会把原 SQL 塞进子查询，届时 enforcer 看到的
+        # 是包装后的语句，列引用已不在投影里，脱敏会静默失效。
+        exec_sql, col_err = _apply_column_acl(raw_sql, acl)
+        if col_err:
+            out_sections.append({
+                "key": sec.key, "title": sec.title, "ok": False,
+                "sql": raw_sql, "columns": [], "rows": [],
+                "error": col_err, "skipped": True,
+                "digest": "", "chart": sec.chart,
+            })
+            skipped.append({"key": sec.key, "title": sec.title, "reason": "列级权限"})
+            continue
         rf = _pick_row_filter(raw_sql, row_filters)
         if rf:
-            exec_sql = _wrap_row_filter(raw_sql, rf)
+            wrapped = _wrap_row_filter(exec_sql, rf)
+            if wrapped:
+                exec_sql = wrapped
+            else:
+                # 条件无法安全注入 → fail-close，跳过该章节（绝不退回未过滤语句）
+                out_sections.append({
+                    "key": sec.key, "title": sec.title, "ok": False,
+                    "sql": raw_sql, "columns": [], "rows": [],
+                    "error": "行级权限条件无法安全注入，本节已跳过",
+                    "skipped": True, "digest": "", "chart": sec.chart,
+                })
+                skipped.append({"key": sec.key, "title": sec.title, "reason": "行级权限"})
+                continue
 
         res = execute_sql(exec_sql)
         acl_degraded = False
@@ -563,6 +605,9 @@ def collect(template: Template, req: ReportRequest,
         cols = res.get("columns") or []
         rows = res.get("rows") or []
         ok = bool(res.get("success"))
+        if ok and acl is not None:
+            # 兜底：SQL 层已做过 deny 拒绝/列裁剪，这里再剔一次防止漏网
+            rows = _mask_rows_by_acl(rows, cols, acl)
         out_sections.append({
             "key": sec.key, "title": sec.title, "ok": ok,
             "sql": exec_sql if ok else raw_sql,

@@ -485,7 +485,8 @@ def generate_events(query: str, rr, acl=None, user: dict | None = None):
         _align_window(rr)
         data = collect(template, rr,
                        acl.allowed_tables if acl is not None else None,
-                       (acl.row_filters or None) if acl is not None else None)
+                       (acl.row_filters or None) if acl is not None else None,
+                       acl)
         ok_n = sum(1 for s in data.get("sections", []) if s.get("ok") and not s.get("skipped"))
         if not data.get("ok"):
             raise RuntimeError("所有章节取数均失败，请确认当前库连接与表权限")
@@ -527,7 +528,8 @@ def _adhoc_report_events(query: str, acl, username: str):
         from agent import question_report as QR
         data = QR.collect_question_data(
             query, "", acl.allowed_tables if acl is not None else None,
-            (acl.row_filters or None) if acl is not None else None)
+            (acl.row_filters or None) if acl is not None else None,
+            200, acl)
         if not data.get("ok"):
             raise RuntimeError(str(data.get("error") or "未能为这个问题取到数据"))
         sections = QR.split_sections(

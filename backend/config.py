@@ -10,7 +10,7 @@ ENV_PATH = Path(__file__).with_name(".env")
 
 # ── LLM 配置 (支持 OpenAI 兼容接口, 如 DeepSeek) ──
 LLM_CONFIG = {
-    "model":       os.getenv("LLM_MODEL", "deepseek-v4-flash"),
+    "model":       os.getenv("LLM_MODEL", "deepseek-flash"),
     "api_key":     os.getenv("LLM_API_KEY", ""),
     "base_url":    os.getenv("LLM_BASE_URL", "https://api.deepseek.com/v1"),
     "temperature": float(os.getenv("LLM_TEMPERATURE", "0.2")),
@@ -24,7 +24,7 @@ LLM_CONFIG = {
 
 # ── 系统内置默认（冻结，用户在前端切换不影响此处；点“恢复默认”时回写 LLM_CONFIG）──
 LLM_DEFAULT = {
-    "model":       os.getenv("LLM_DEFAULT_MODEL", "deepseek-v4-flash"),
+    "model":       os.getenv("LLM_DEFAULT_MODEL", "deepseek-flash"),
     "api_key":     os.getenv("LLM_DEFAULT_API_KEY", ""),
     "base_url":    os.getenv("LLM_DEFAULT_BASE_URL", "https://api.deepseek.com/v1"),
     "temperature": float(os.getenv("LLM_DEFAULT_TEMPERATURE", "0.2")),

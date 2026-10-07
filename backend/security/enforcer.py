@@ -839,8 +839,14 @@ def rewrite_sql(sql: str, ctx: AclContext | None, dialect: str | None = None) ->
     if _block_cls is not None and isinstance(ast, _block_cls):
         return sql, "权限控制仅允许单条查询语句（SELECT），检测到多语句，已拒绝执行。", applied
 
+    # 【2026-10-08 补 "Into"】SELECT ... INTO newtable 在 PG 里是**建表**，
+    # 但它以 SELECT 开头、不含任何写操作关键词，AST 上是一个 exp.Into 节点，
+    # 不在原清单里 → 权限层放行。实测 db.executor 的正则也会被 INTO TEMP 绕过，
+    # 两层同时失效；且 admin 走 superuser 短路根本不进这段代码，
+    # 所以这里必须补上Into 节点作为最后一道兜底。
     _danger_names = ("Insert", "Update", "Delete", "Drop", "Alter", "Create", "Merge",
-                     "Command", "Grant", "Revoke", "Truncate", "Transaction")
+                     "Command", "Grant", "Revoke", "Truncate", "Transaction",
+                     "Into")
     _danger_types = tuple(
         t for t in (getattr(_exp, _n, None) for _n in _danger_names)
         if isinstance(t, type) and issubclass(t, _exp.Expression)
