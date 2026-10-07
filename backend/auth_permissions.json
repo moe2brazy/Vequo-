@@ -16,13 +16,6 @@
       "system": true
     },
     {
-      "key": "region_manager",
-      "name": "区域销售经理",
-      "description": "只看本区域订单与工厂；客户名称脱敏；销售口径按合同总额",
-      "priority": 50,
-      "system": false
-    },
-    {
       "key": "analyst",
       "name": "分析师",
       "description": "数据分析岗（测试期望角色）",
@@ -112,45 +105,6 @@
         "share": true,
         "download": true
       }
-    },
-    "region_manager": {
-      "datasets": [
-        "sales",
-        "prod_core"
-      ],
-      "tables": [],
-      "rows": {
-        "test_factories": {
-          "expr": "city = ${user.region}",
-          "enabled": true,
-          "note": "只看本人所属区域的工厂"
-        },
-        "test_orders": {
-          "expr": "factory_id IN (SELECT factory_id FROM test_factories WHERE city = ${user.region})",
-          "enabled": true,
-          "note": "只看本区域工厂的订单"
-        }
-      },
-      "columns": {
-        "test_orders": {
-          "customer_name": {
-            "mode": "mask",
-            "note": "客户名称脱敏",
-            "mask": "partial_1_1",
-            "agg_ok": false
-          }
-        }
-      },
-      "metrics": {
-        "产量": {
-          "mode": "override",
-          "note": "销售视角口径",
-          "sql_expression": "SUM(good_qty + defect_qty)",
-          "formula": "合格产出 + 不良产出（总产出口径）",
-          "description": "区域销售口径：产量按总产出计（含不良），用于产能承诺"
-        }
-      },
-      "actions": {}
     }
   },
   "sensitive": {
@@ -168,7 +122,7 @@
       "inventory"
     ]
   },
-  "updated_at": "2026-10-07T06:19:05.685981+00:00",
+  "updated_at": "2026-10-07T06:19:27.279352+00:00",
   "updated_by": "admin",
   "user_grants": {
     "viewer": {
