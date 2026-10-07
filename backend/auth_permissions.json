@@ -122,7 +122,7 @@
       "inventory"
     ]
   },
-  "updated_at": "2026-10-07T08:02:02.682459+00:00",
+  "updated_at": "2026-10-07T08:42:14.768305+00:00",
   "updated_by": "admin",
   "user_grants": {
     "viewer": {
@@ -290,6 +290,25 @@
         "sample_qty",
         "defect_qty",
         "inspection_result"
+      ]
+    },
+    "qc_user": {
+      "dim_equipment": [
+        "equipment_id",
+        "equipment_code",
+        "equipment_name",
+        "equipment_type",
+        "line_id",
+        "install_date",
+        "equipment_status"
+      ],
+      "dim_process": [
+        "process_id",
+        "process_code",
+        "process_name",
+        "process_seq",
+        "standard_yield_rate",
+        "is_key_process"
       ]
     }
   },
