@@ -122,7 +122,7 @@
       "inventory"
     ]
   },
-  "updated_at": "2026-10-07T07:23:08.895334+00:00",
+  "updated_at": "2026-10-07T08:02:02.682459+00:00",
   "updated_by": "admin",
   "user_grants": {
     "viewer": {
@@ -192,6 +192,104 @@
         "downtime_minutes",
         "downtime_reason",
         "is_planned"
+      ]
+    },
+    "eqp_user": {
+      "dim_equipment": [
+        "equipment_id",
+        "equipment_code",
+        "equipment_name",
+        "equipment_type",
+        "line_id",
+        "install_date",
+        "equipment_status"
+      ],
+      "dim_process": [
+        "process_id",
+        "process_code",
+        "process_name",
+        "process_seq",
+        "standard_yield_rate",
+        "is_key_process"
+      ],
+      "dim_product": [
+        "product_id",
+        "product_code",
+        "product_name",
+        "product_model",
+        "product_category",
+        "unit",
+        "is_active"
+      ],
+      "dim_production_line": [
+        "line_id",
+        "line_code",
+        "line_name",
+        "workshop_name",
+        "line_manager",
+        "line_status"
+      ],
+      "eqp_downtime_record": [
+        "downtime_id",
+        "equipment_id",
+        "line_id",
+        "start_time",
+        "end_time",
+        "downtime_minutes",
+        "downtime_reason",
+        "is_planned"
+      ],
+      "inv_inventory_snapshot": [
+        "snapshot_id",
+        "snapshot_date",
+        "product_id",
+        "warehouse_code",
+        "available_qty",
+        "frozen_qty",
+        "safety_stock_qty"
+      ],
+      "mes_process_output": [
+        "output_id",
+        "work_order_id",
+        "product_id",
+        "process_id",
+        "line_id",
+        "stat_date",
+        "input_qty",
+        "good_qty",
+        "defect_qty",
+        "rework_qty",
+        "shift_code"
+      ],
+      "mes_work_order": [
+        "work_order_id",
+        "work_order_no",
+        "product_id",
+        "line_id",
+        "plan_qty",
+        "start_date",
+        "end_date",
+        "order_status"
+      ],
+      "qms_defect_detail": [
+        "defect_id",
+        "inspection_id",
+        "defect_type",
+        "defect_code",
+        "defect_qty",
+        "severity_level",
+        "responsible_process_id"
+      ],
+      "qms_inspection": [
+        "inspection_id",
+        "inspection_no",
+        "work_order_id",
+        "product_id",
+        "process_id",
+        "inspection_date",
+        "sample_qty",
+        "defect_qty",
+        "inspection_result"
       ]
     }
   },
