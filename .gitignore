@@ -133,6 +133,12 @@ _bak_*/
 # 合并/归档产物目录（若有）
 _obsolete/
 _archive_*/
+# 本地语义模型（约 92MB，不入库）
+# 理由：单文件 model.safetensors 就占 91.4MB，接近 GitHub 100MB 单文件上限，
+# 且在弱网下推送极不稳定（实测多次在传输末端断线）。
+# 获取方式见 README「本地语义模型」一节；缺目录时自动降级为 n-gram 哈希向量，不影响启动。
+backend/models/
+
 # 测试运行产物（由脚本生成，不入库）
 backend/tests/verifier_consistency_report.txt
 backend/tests/*_report.txt

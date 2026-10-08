@@ -195,7 +195,23 @@ npm run dev
 
 浏览器打开 `http://localhost:5173`。
 
-### 4. 构建部署
+### 4. 本地语义模型（可选）
+
+语义缓存、相似问题推荐、记忆检索需要一个中文向量模型。仓库**不含**该模型（91.4MB，接近 GitHub 单文件上限）。
+
+`agent/embeddings.py` 会自动定位 `backend/models/bge-small-zh-v1.5`，目录不存在时降级为 n-gram 哈希向量——**系统照常启动**，只是同义改写命中不了语义缓存（例如「各产线的产量」与「每个产线的产量」余弦 0.9252，降级后只有字面重复能命中）。
+
+需要完整语义能力时，把模型放到：
+
+```
+backend/models/bge-small-zh-v1.5/
+```
+
+模型来源：`BAAI/bge-small-zh-v1.5`（HuggingFace）。放好后需 `pip install sentence-transformers torch`（约 2GB 依赖，首次加载 9~12 秒，已计入后端启动预热）。
+
+不想背这个体积就设 `EMBEDDING_DISABLE=1`，显式关闭并直接走 n-gram 兜底。
+
+### 5. 构建部署
 
 ```bash
 npm run build        # 产物在 dist/，含 .gz 预压缩
