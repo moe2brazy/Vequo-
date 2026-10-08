@@ -1,0 +1,4 @@
+backend/models/**/*.safetensors filter=lfs diff=lfs merge=lfs -text
+backend/models/**/*.bin filter=lfs diff=lfs merge=lfs -text
+backend/models/**/*.onnx filter=lfs diff=lfs merge=lfs -text
+backend/models/**/*.pt filter=lfs diff=lfs merge=lfs -text
