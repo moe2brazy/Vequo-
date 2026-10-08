@@ -133,3 +133,6 @@ _bak_*/
 # 合并/归档产物目录（若有）
 _obsolete/
 _archive_*/
+# 测试运行产物（由脚本生成，不入库）
+backend/tests/verifier_consistency_report.txt
+backend/tests/*_report.txt
