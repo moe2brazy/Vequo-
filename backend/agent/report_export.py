@@ -20,9 +20,115 @@ import os
 import re
 from html.parser import HTMLParser
 
-# ── 中文字体（PDF 用；Windows 黑体，跨环境时可通过 REPORT_CJK_FONT 覆盖）──
-_CJK_FONT_PATH = os.getenv("REPORT_CJK_FONT", "C:/Windows/Fonts/simhei.ttf")
+# ── 中文字体（PDF 用）──
+# 2026-10-11 修复：原先默认写死 "C:/Windows/Fonts/simhei.ttf"，Linux 上必然注册失败
+#（TTFError: Can't open file），异常被 305-309 行吞掉后静默退回 Helvetica ——
+# 表现为「PDF 导出成功，但中文全是乱码/空白」，属于最典型的静默降级坑。
+# 改为复用 chart_agent 的跨平台字体解析；确需覆盖可用 REPORT_CJK_FONT 指定字体文件。
+_FONT_CANDIDATES = [
+    "C:/Windows/Fonts/simhei.ttf",
+    "C:/Windows/Fonts/msyh.ttc",
+    "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    "/usr/share/fonts/opentype/source-han-sans/SourceHanSansSC-Regular.otf",
+    "/System/Library/Fonts/PingFang.ttc",
+]
+
+
+def _resolve_cjk_font_path():
+    """定位一个可用的中文字体文件；找不到返回 None（调用方需显式降级，不要静默）。"""
+    override = os.getenv("REPORT_CJK_FONT")
+    if override and os.path.exists(override):
+        return override
+    for p in _FONT_CANDIDATES:
+        if os.path.exists(p):
+            return p
+    # 兜底：在常见字体目录里搜一个 CJK 字体文件
+    for root in ("/usr/share/fonts", "/usr/local/share/fonts", "/System/Library/Fonts"):
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirs, files in os.walk(root):
+            for fn_ in files:
+                low = fn_.lower()
+                if low.endswith((".ttc", ".ttf", ".otf")) and (
+                    "cjk" in low or "han" in low or "wqy" in low or "hei" in low or "song" in low
+                ):
+                    return os.path.join(dirpath, fn_)
+    return None
+
+
 _CJK_FONT_NAME = "SimHei"
+_CACHE = {}
+
+
+def _font_usable_by_reportlab(path):
+    """实测该字体文件能否被 reportlab 注册。
+
+    必须真注册一次才算数：Noto CJK 全是 .ttc 且用 PostScript 轮廓，
+    reportlab 直接抛 TTFError（实测报错 'postscript outlines are not supported'）；
+    NotoSans-VF.ttf 虽能注册但不含汉字字形（中文宽度 14.4 ≈ 0）。
+    两者都"路径存在"却渲染不出中文 —— 所以只能靠实际注册 + 宽度校验来判定。
+    """
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        probe = "_probe_font"
+        pdfmetrics.registerFont(TTFont(probe, path))
+        # 汉字必须有非零且合理的宽度；无字形时宽度会退化到极小值
+        w = pdfmetrics.stringWidth("中文测试", probe, 12)
+        return w >= 24  # 4 个汉字 @12pt 至少应有 ~24 的宽度
+    except Exception:
+        return False
+
+
+def _resolve_cjk_font():
+    """惰性解析 PDF 用中文字体：返回 (路径, 注册名)。
+
+    优先 REPORT_CJK_FONT 环境变量（服务器上单独放了一份 TTF），
+    再按候选路径找，最后兜底扫描字体目录 —— 每个都要过 reportlab 可用性校验。
+    """
+    if "v" in _CACHE:
+        return _CACHE["v"]
+    # 必须在这里主动 load_dotenv：本模块可能先于 config 被导入，
+    # 那时 .env 还没加载，os.getenv("REPORT_CJK_FONT") 会拿到 None
+    #（实测踩过：.env 里明明配了路径，模块顶层却读不到）。
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except Exception:
+        pass
+    override = os.getenv("REPORT_CJK_FONT")
+    cands = []
+    if override and os.path.exists(override):
+        cands.append(override)
+    cands.extend(_FONT_CANDIDATES)
+    # 兜底：扫字体目录里像 CJK 的文件
+    for root in ("/usr/share/fonts", "/usr/local/share/fonts", "/System/Library/Fonts"):
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirs, files in os.walk(root):
+            for fn_ in files:
+                low = fn_.lower()
+                if low.endswith((".ttf", ".otf", ".ttc")) and (
+                    "cjk" in low or "hei" in low or "song" in low or "sc" in low
+                    or "han" in low or "kai" in low or "ming" in low
+                ):
+                    cands.append(os.path.join(dirpath, fn_))
+    chosen, name = None, "Helvetica"
+    for p in cands:
+        if _font_usable_by_reportlab(p):
+            chosen = p
+            try:
+                from matplotlib import font_manager as _fm
+                name = _fm.FontProperties(fname=p).get_name()
+            except Exception:
+                name = "SimHei"
+            break
+    _CACHE["v"] = (chosen, name)
+    return _CACHE["v"]
 
 # ── 配色（商务靛蓝主题）────────────────────────────────────
 _COLOR_BRAND = "#4f46e5"
@@ -302,12 +408,23 @@ def blocks_to_pdf(blocks: list[tuple[str, str]]) -> bytes:
     from reportlab.pdfbase.ttfonts import TTFont
     from reportlab.platypus import HRFlowable, Paragraph, SimpleDocTemplate, Table, TableStyle
 
-    try:
-        pdfmetrics.registerFont(TTFont(_CJK_FONT_NAME, _CJK_FONT_PATH))
-        font_ok = True
-    except Exception:
+    # 惰性解析中文字体：_resolve_cjk_font() 已用「真实注册 + 中文宽度校验」筛过，
+    # 不会像原先那样拿 .ttc 直接注册失败后静默退回 Helvetica（表现为 PDF 中文乱码）。
+    _path, _name = _resolve_cjk_font()
+    if _path:
+        try:
+            pdfmetrics.registerFont(TTFont(_name, _path))
+            font_ok = True
+        except Exception as e:
+            font_ok = False
+            logging.getLogger(__name__).warning("PDF 中文字体注册失败(%s): %s", _path, e)
+    else:
         font_ok = False
-    fn = _CJK_FONT_NAME if font_ok else "Helvetica"
+        logging.getLogger(__name__).warning(
+            "未找到 reportlab 可用的中文字体，PDF 中文将无法正常显示；"
+            "请安装 TTF 格式中文字体或设置 REPORT_CJK_FONT 环境变量"
+        )
+    fn = _name if font_ok else "Helvetica"
 
     def _hex(c: str):
         return colors.HexColor(c)

@@ -20,12 +20,9 @@ _zh_font = None
 _MODEL_STORE = {}  # 内存模型存储: {name: {model, encoder, scaler, ...}}
 
 def _get_zh_font():
-    global _zh_font
-    if _zh_font is not None: return _zh_font
-    for p in ["C:/Windows/Fonts/msyh.ttc","C:/Windows/Fonts/simhei.ttf"]:
-        import os
-        if os.path.exists(p): _zh_font = FontProperties(fname=p); return _zh_font
-    _zh_font = FontProperties(); return _zh_font
+    # 复用 chart_agent 的跨平台字体解析（原先这里只列 Windows 路径，Linux 上同样退化成方框）
+    from agent.chart_agent import _get_zh_font as _shared
+    return _shared()
 
 MODEL_TYPES = {
     "linear":       {"name": "线性回归",    "type": "regression"},

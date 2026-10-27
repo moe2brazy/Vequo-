@@ -1,6 +1,7 @@
 """Chart Agent — 根据查询结果生成多种图表"""
 
 import io
+import os
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -10,18 +11,89 @@ from matplotlib.font_manager import FontProperties
 _zh_font = None
 _COLORS = ["#3b82f6", "#ef4444", "#10b981", "#f59e0b", "#8b5cf6", "#06b6d4", "#ec4899", "#f97316", "#84cc16", "#14b8a6"]
 
+# 中文字体候选：Windows 用 msyh/simhei，Linux 发行版路径各异且包名不同
+# （实测 Alibaba Cloud Linux 装 google-noto-cjk-fonts 后在 /usr/share/fonts/google-noto-cjk/）。
+# 原先只列 Windows 路径 → Linux 上全部落空、_get_zh_font() 退化成 DejaVu Sans，
+# 表现为图表中文全是方框（matplotlib 警告 Glyph 21495 missing from font(s) DejaVu Sans）。
+_FONT_CANDIDATES = [
+    # Windows
+    "C:/Windows/Fonts/msyh.ttc",
+    "C:/Windows/Fonts/simhei.ttf",
+    "C:/Windows/Fonts/simsun.ttc",
+    # Linux：Noto CJK / 文泉驿 / 思源，全局 fontconfig 名称在下面一并兜底
+    "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    "/usr/share/fonts/opentype/source-han-sans/SourceHanSansSC-Regular.otf",
+    # macOS
+    "/System/Library/Fonts/PingFang.ttc",
+    "/Library/Fonts/Arial Unicode.ttf",
+]
+_FONT_FAMILY_NAMES = [
+    "Noto Sans CJK SC", "Noto Sans SC", "Noto Serif CJK SC",
+    "WenQuanYi Micro Hei", "WenQuanYi Zen Hei", "Source Han Sans SC", "SimHei",
+]
+
 
 def _get_zh_font():
+    """取一个能渲染中文的字体对象；找不到时退回 fontconfig 按名查找，再不行才用默认字体。"""
     global _zh_font
     if _zh_font is not None:
         return _zh_font
-    for path in ["C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simhei.ttf", "C:/Windows/Fonts/simsun.ttc"]:
-        import os
+    import os
+    for path in _FONT_CANDIDATES:
         if os.path.exists(path):
             _zh_font = FontProperties(fname=path)
             return _zh_font
+    # 路径没命中（如字体装在非标准位置）：交给 fontconfig 按家族名解析
+    from matplotlib import font_manager
+    for family in _FONT_FAMILY_NAMES:
+        try:
+            if font_manager.findfont(family, fallback_to_default=False):
+                _zh_font = FontProperties(family=family)
+                return _zh_font
+        except Exception:
+            continue
     _zh_font = FontProperties()
     return _zh_font
+
+
+def _apply_global_zh_font():
+    """把中文字体设为 matplotlib 全局默认。
+
+    必须做：图表里有些文本（如 title / annotate / 图例默认文本）没有显式传
+    fontproperties，只靠 _get_zh_font() 覆盖不全，会残留方框。
+
+    坑（2026-10-11 服务器实测）：**不能用字体家族名**。matplotlib 的 font_manager
+    在 import 时就构建了字体缓存，之后再装的字体（这里是 dnf 装 google-noto-cjk-fonts）
+    不在缓存里，findfont(家族名) 会抛 ValueError 并静默退回 DejaVu Sans —— 表现为
+    「_get_zh_font() 明明返回 Noto Sans CJK JP，但标题中文仍是方框」。
+    正确做法是重建缓存 + 直接登记字体文件路径（fname），按名查找只作为兜底。
+    """
+    font = _get_zh_font()
+    # fname 有效 = 拿到的是具体字体文件，可直接登记进 font_manager
+    fname = font.get_file()
+    if fname and os.path.exists(fname):
+        from matplotlib import font_manager
+        try:
+            font_manager.fontManager.addfont(fname)
+            name = font_manager.FontProperties(fname=fname).get_name()
+            matplotlib.rcParams["font.family"] = "sans-serif"
+            matplotlib.rcParams["font.sans-serif"] = [name] + [
+                f for f in matplotlib.rcParams.get("font.sans-serif", []) if f != name
+            ]
+            # 默认字形族（Noto CJK JP/SC 等是同一文件的多个族，取第一个即可，汉字字形相同）
+            matplotlib.rcParams["font.serif"] = [name] + list(matplotlib.rcParams.get("font.serif", []))
+        except Exception:
+            pass
+    matplotlib.rcParams["axes.unicode_minus"] = False
+    return font
+
+
+_apply_global_zh_font()
 
 
 def _fig_to_svg(fig) -> str:
