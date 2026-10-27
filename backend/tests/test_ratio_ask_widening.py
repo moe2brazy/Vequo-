@@ -3,8 +3,10 @@
 扩词表让 3 个守卫 + 1 个修复函数同时生效，影响面比单个守卫大得多，
 必须专门验证：真错仍拦得住、合法写法不误伤、修复函数能正常改。
 """
+import os as _os  # 路径基准：以本文件所在目录为准，换机器/换目录后仍有效
+_BASE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 import os, sys
-BACKEND = r"D:\vequo\vequo-viqueo\backend"
+BACKEND = _BASE
 sys.path.insert(0, BACKEND)
 os.chdir(BACKEND)
 sys.stdout.reconfigure(encoding="utf-8")

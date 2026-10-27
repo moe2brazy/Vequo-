@@ -4,13 +4,15 @@
 与 run_yans_bank_grouped.py 使用完全相同的判定逻辑，只是把每题的结果落盘。
 输出: bank_detail.json
 """
+import os as _os  # 路径基准：以本文件所在目录为准，换机器/换目录后仍有效
+_BASE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 import os
 import re
 import sys
 import json
 import time
 
-BE = r"D:\vequo\vequo-viqueo\backend"
+BE = _BASE
 sys.path.insert(0, BE)
 sys.path.insert(0, os.path.join(BE, "tests"))
 

@@ -4,8 +4,10 @@
 误伤是这类守卫最大的风险：「每个产品的产量」这类分组列举若被拦，
 会把正确 SQL逼成错的。故反向用例比正向更多。
 """
+import os as _os  # 路径基准：以本文件所在目录为准，换机器/换目录后仍有效
+_BASE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 import os, sys
-BACKEND = r"D:\vequo\vequo-viqueo\backend"
+BACKEND = _BASE
 sys.path.insert(0, BACKEND)
 os.chdir(BACKEND)
 sys.stdout.reconfigure(encoding="utf-8")

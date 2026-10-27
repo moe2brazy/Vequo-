@@ -3,8 +3,10 @@
 覆盖：零行/None/一行全None/多行全None/部分有值/空串/0值/False值/字符串数字/
      非 dict 行/生成器/空 dict 行/嵌套 None 容器。
 """
+import os as _os  # 路径基准：以本文件所在目录为准，换机器/换目录后仍有效
+_BASE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 import os, sys
-BACKEND = r"D:\vequo\vequo-viqueo\backend"
+BACKEND = _BASE
 sys.path.insert(0, BACKEND)
 os.chdir(BACKEND)
 sys.stdout.reconfigure(encoding="utf-8")

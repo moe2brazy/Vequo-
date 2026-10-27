@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """_safe_metric_expr 安全性回归：确认为 FILTER 放宽后注入面未扩大"""
+import os as _os  # 路径基准：以本文件所在目录为准，换机器/换目录后仍有效
+_BASE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 import os, sys
-sys.path.insert(0, r"D:\vequo\vequo-viqueo\backend")
-os.chdir(r"D:\vequo\vequo-viqueo\backend")
+sys.path.insert(0, _BASE)
+os.chdir(_BASE)
 from agent.metric_compiler import _safe_metric_expr as S
 
 CASES = [
@@ -46,5 +48,5 @@ for expr, want in CASES:
 L.append("")
 L.append(f"共 {len(CASES)} 例，不符 {bad} 例")
 L.append("结论: " + ("通过 —— FILTER 放宽未扩大注入面" if bad == 0 else "失败 —— 存在安全回归"))
-open(r"C:\Users\overlxrd\WorkBuddy\2026-10-03-23-31-48\sec.txt", "w", encoding="utf-8").write("\n".join(L))
+print("\n".join(L))
 sys.exit(1 if bad else 0)

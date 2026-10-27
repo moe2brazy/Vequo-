@@ -4,8 +4,10 @@
 根因是run_knowledge_template 签名缺 `request: Request`，函数体却引用了它
 ⇒ NameError。顺带修另两处同类问题（get_knowledge_health / export_knowledge）。
 """
+import os as _os  # 路径基准：以本文件所在目录为准，换机器/换目录后仍有效
+_BASE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 import os, sys, time
-BACKEND = r"D:\vequo\vequo-viqueo\backend"
+BACKEND = _BASE
 sys.path.insert(0, BACKEND)
 os.chdir(BACKEND)
 sys.stdout.reconfigure(encoding="utf-8")

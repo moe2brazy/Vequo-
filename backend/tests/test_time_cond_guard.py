@@ -9,8 +9,10 @@
 且实测「今天/最近/本月」类问句在有日期列的表上**都能正确落地**（6 条里5 条OK），
 唯一漏的就是 qms_defect_detail 这条。
 """
+import os as _os  # 路径基准：以本文件所在目录为准，换机器/换目录后仍有效
+_BASE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 import os, re, sys
-BACKEND = r"D:\vequo\vequo-viqueo\backend"
+BACKEND = _BASE
 sys.path.insert(0, BACKEND)
 os.chdir(BACKEND)
 sys.stdout.reconfigure(encoding="utf-8")

@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """验证 _unknown_identifiers 修复：别名不再误杀，真幻觉仍能抓到"""
+import os as _os  # 路径基准：以本文件所在目录为准，换机器/换目录后仍有效
+_BASE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 import os, sys
-sys.path.insert(0, r"D:\vequo\vequo-viqueo\backend")
-os.chdir(r"D:\vequo\vequo-viqueo\backend")
+sys.path.insert(0, _BASE)
+os.chdir(_BASE)
 from database import switch_database
 switch_database({"db_type": "postgresql", "host": "localhost", "port": 5432,
                  "name": "yans", "user": "postgres", "password": "123456"})
@@ -64,6 +66,5 @@ for desc, sql, expect_empty in CASES:
 L.append("")
 L.append(f"共 {len(CASES)} 例，不符 {bad} 例")
 L.append("结论: " + ("通过 —— 别名不再误杀，真幻觉仍被拦下" if bad == 0 else "失败"))
-open(r"C:\Users\overlxrd\WorkBuddy\2026-10-03-23-31-48\idfix.txt", "w", encoding="utf-8").write("\n".join(L))
 print("\n".join(L))
 sys.exit(1 if bad else 0)

@@ -2,8 +2,10 @@
 """验证 _fix_unit_conversion 产出正确：既要对（真值逐格相等），
 又不能乱动（分组列举/已有除法/不可修单位必须原样返回）。
 """
+import os as _os  # 路径基准：以本文件所在目录为准，换机器/换目录后仍有效
+_BASE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 import os, sys
-BACKEND = r"D:\vequo\vequo-viqueo\backend"
+BACKEND = _BASE
 sys.path.insert(0, BACKEND)
 os.chdir(BACKEND)
 sys.stdout.reconfigure(encoding="utf-8")

@@ -5,21 +5,24 @@
 `NameError: name 'request' is not defined` ⇒ 8 个模板 100% 报 500。
 Python **不会在定义处报错**，只在运行时炸 ⇒ 静态扫不出来，必须 AST 扫。
 """
+import os as _os  # 路径基准：以本文件所在目录为准，换机器/换目录后仍有效
+_BASE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 import ast, os, sys
 
 TARGETS = [
-    r"D:\vequo\vequo-viqueo\backend\routers\knowledge.py",
-    r"D:\vequo\vequo-viqueo\backend\main.py",
-    r"D:\vequo\vequo-viqueo\backend\routers\tables.py",
-    r"D:\vequo\vequo-viqueo\backend\routers\config.py",
-    r"D:\vequo\vequo-viqueo\backend\routers\permission.py",
+    _os.path.join(_BASE, "routers/knowledge.py"),
+    _os.path.join(_BASE, "main.py"),
+    _os.path.join(_BASE, "routers/tables.py"),
+    _os.path.join(_BASE, "routers/config.py"),
+    _os.path.join(_BASE, "routers/permission.py"),
 ]
 sys.stdout.reconfigure(encoding="utf-8")
 
 fail = 0
 for path in TARGETS:
     if not os.path.exists(path):
-        print("跳过（不存在）: %s" % path)
+        print("目标文件不存在（路径基准失效，本测试将失去意义）: %s" % path)
+        fail += 1
         continue
     src = open(path, encoding="utf-8").read()
     tree = ast.parse(src)

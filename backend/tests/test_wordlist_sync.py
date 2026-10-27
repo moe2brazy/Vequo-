@@ -3,8 +3,10 @@
 第 17 轮审计发现的 5 个问题之一就是「守卫有『每万件』、修复器没有」——
 守卫拦得住、修不出，等于只拦不修。凡新增单位词，两侧必须同步。
 """
+import os as _os  # 路径基准：以本文件所在目录为准，换机器/换目录后仍有效
+_BASE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 import os, re, sys
-BACKEND = r"D:\vequo\vequo-viqueo\backend"
+BACKEND = _BASE
 sys.path.insert(0, BACKEND)
 os.chdir(BACKEND)
 sys.stdout.reconfigure(encoding="utf-8")

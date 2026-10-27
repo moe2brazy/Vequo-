@@ -6,8 +6,10 @@
  ③ 单位词表三张表必须同步（守卫有、修复无 = 拦得住修不出）
  ④ 缺源三表必须对齐（规则/类别/源字段，错位会让守卫拿错特征比对）
 """
+import os as _os  # 路径基准：以本文件所在目录为准，换机器/换目录后仍有效
+_BASE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 import ast, os, re, sys
-BACKEND = r"D:\vequo\vequo-viqueo\backend"
+BACKEND = _BASE
 sys.path.insert(0, BACKEND)
 os.chdir(BACKEND)
 sys.stdout.reconfigure(encoding="utf-8")
