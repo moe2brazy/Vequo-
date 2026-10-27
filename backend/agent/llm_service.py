@@ -1624,6 +1624,61 @@ def _zero_row_data_range_hint(sqlexec, tables: list[str], query: str) -> str:
 _HARDCODED_DATE_RE = re.compile(r"'(\d{4}-\d{2}-\d{2})(?:[ T]\d{2}:\d{2}:\d{2})?'")
 
 
+def _shift_months(d, delta: int):
+    """日期按月平移，处理月末溢出（3-31 减一个月 → 2-28/29）。"""
+    import calendar as _cal
+    import datetime as _dt
+    total = d.year * 12 + (d.month - 1) + delta
+    y, m = total // 12, total % 12 + 1
+    return _dt.date(y, m, min(d.day, _cal.monthrange(y, m)[1]))
+
+
+def _shift_month_window(sql: str, ds: list, dmax):
+    """月级相对时间窗「部分相交」时，把整段窗口按月回退，跨度保持不变。
+
+    返回 (新SQL, 说明) 或 None。
+
+    病根（实测「本月与上月产量对比」）：LLM 写 `>= '2026-09-01' AND < '2026-10-01'
+    + INTERVAL '1 month'`（= [9/1, 11/1)），数据只到 2026-09-15 —— 上界落在未来，
+    「上月」那段永远空，结果只剩一行，`对比` 静默消失，且 success=true 不报错。
+
+    `_reanchor_hardcoded_range` 原第 ③ 条要求「字面量全部落在数据范围外」才动，
+    9/1 在范围内就被整体放过。本函数补的正是这一种。
+    """
+    try:
+        import datetime as _dt
+        lo, hi = ds[0], ds[-1]
+        # 上界后面若跟了 + INTERVAL 'N month'，真实末界要往后推
+        ext = 0
+        m_ivl = re.search(
+            r"'%s'(?:::date)?\s*\+\s*INTERVAL\s*'(\d+)\s*month'" % re.escape(hi.isoformat()),
+            sql, re.I)
+        if m_ivl:
+            ext = int(m_ivl.group(1))
+        eff_end = _shift_months(hi, ext)
+        # 目标末界 = 「数据上限所在月的下月初」，即最新有数据月的右边界
+        target_end = _shift_months(_dt.date(dmax.year, dmax.month, 1), 1)
+        delta = ((target_end.year - eff_end.year) * 12
+                 + (target_end.month - eff_end.month))
+        if delta == 0:
+            return None
+        mapping = {d: _shift_months(d, delta) for d in ds}
+        out = sql
+        for old, new in mapping.items():
+            out = out.replace("'%s'" % old.isoformat(), "'%s'" % new.isoformat())
+            out = out.replace("'%s 00:00:00'" % old.isoformat(), "'%s'" % new.isoformat())
+        if out == sql:
+            return None
+        note = ("库里最新数据只到 %s，「本月/上月」的窗口已按整月回退到 %s ~ %s 重新查询"
+                "（跨度不变，%d 个月）"
+                % (dmax.isoformat(), mapping[lo].isoformat(),
+                   _shift_months(eff_end, delta).isoformat(), len(ds)))
+        return out, note
+    except Exception:
+        return None
+
+
+
 def _reanchor_hardcoded_range(sqlexec, query: str, sql: str):
     """LLM 硬编码了错误年份的日期字面量 → 整段平移到「以最新有数据月为终点」的等长区间。
 
@@ -1682,12 +1737,21 @@ def _reanchor_hardcoded_range(sqlexec, query: str, sql: str):
     ds = sorted({_d(x) for x in lits} - {None})
     if not ds:
         return None
-    # ③ 全部落在数据范围之外才动；任何一个落在范围内 → 视为用户有意指定，不动
-    if any(dmin <= d <= dmax for d in ds):
-        return None
     today = _dt.date.today()
     if (dmax.year, dmax.month) >= (today.year, today.month):
         return None  # 数据是新鲜的，没理由怀疑硬编码日期
+
+    # ③a 月级相对词 + 窗口上界越界 → 整月回退。
+    # 专门补「部分相交」这一类：字面量有一个在范围内、上界却在数据上限之后，
+    # 原 ③ 会整体放过（实测「本月与上月产量对比」就是这样静默丢了一半对比）。
+    if _ANCHOR_MONTH_WORD_RE.search(q) and len(ds) >= 2 and max(ds) > dmax:
+        _win = _shift_month_window(s, ds, dmax)
+        if _win:
+            return _win
+
+    # ③ 全部落在数据范围之外才动；任何一个落在范围内 → 视为用户有意指定，不动
+    if any(dmin <= d <= dmax for d in ds):
+        return None
 
     y, m = dmax.year, dmax.month
     end = _dt.date(y, m, _cal.monthrange(y, m)[1])      # 最新有数据月的月末
