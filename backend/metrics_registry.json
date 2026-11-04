@@ -5,6 +5,10 @@
       "在产工单",
       "在制工单",
       "进行中工单",
+      "在建工单",
+      "在建工单数",
+      "在建工单有多少",
+      "在产工单数",
       "正在执行工单",
       "未完成工单",
       "执行中的工单"
@@ -237,6 +241,11 @@
       "待生产",
       "已下达",
       "尚未开工",
+      "还没开工的工单",
+      "还没开工",
+      "没开工的工单",
+      "尚未开工的工单",
+      "待生产工单数",
       "已下达工单",
       "已下达状态的工单",
       "已下达的工单",
@@ -2118,5 +2127,142 @@
       "工序": "SELECT dp.process_name AS \"工序名称\", ROUND((SUM(qi.sample_qty) - SUM(qi.defect_qty))::numeric / NULLIF(SUM(qi.sample_qty), 0) * 100.0, 2) AS \"检验良率(%)\", ROUND(MAX(dp.standard_yield_rate) * (CASE WHEN MAX(dp.standard_yield_rate) <= 1.5 THEN 100.0 ELSE 1.0 END), 2) AS \"标准良率(%)\", ROUND((SUM(qi.sample_qty) - SUM(qi.defect_qty))::numeric / NULLIF(SUM(qi.sample_qty), 0) * 100.0 - MAX(dp.standard_yield_rate) * (CASE WHEN MAX(dp.standard_yield_rate) <= 1.5 THEN 100.0 ELSE 1.0 END), 2) AS \"差距(百分点)\" FROM qms_inspection qi JOIN dim_process dp ON qi.process_id = dp.process_id GROUP BY dp.process_name ORDER BY \"差距(百分点)\" ASC LIMIT {limit}",
       "_default": "SELECT dp.process_name AS \"工序名称\", ROUND((SUM(qi.sample_qty) - SUM(qi.defect_qty))::numeric / NULLIF(SUM(qi.sample_qty), 0) * 100.0, 2) AS \"检验良率(%)\", ROUND(MAX(dp.standard_yield_rate) * (CASE WHEN MAX(dp.standard_yield_rate) <= 1.5 THEN 100.0 ELSE 1.0 END), 2) AS \"标准良率(%)\", ROUND((SUM(qi.sample_qty) - SUM(qi.defect_qty))::numeric / NULLIF(SUM(qi.sample_qty), 0) * 100.0 - MAX(dp.standard_yield_rate) * (CASE WHEN MAX(dp.standard_yield_rate) <= 1.5 THEN 100.0 ELSE 1.0 END), 2) AS \"差距(百分点)\" FROM qms_inspection qi JOIN dim_process dp ON qi.process_id = dp.process_id GROUP BY dp.process_name ORDER BY \"差距(百分点)\" ASC LIMIT {limit}"
     }
+  },
+  {
+    "name": "计划与非计划停机分布",
+    "aliases": [
+      "计划停机和故障停机各占多少",
+      "计划停机和非计划停机",
+      "计划停机和故障停机",
+      "计划停机与故障停机",
+      "计划内停机和计划外停机",
+      "停机的计划类型分布",
+      "计划类型停机分布"
+    ],
+    "unit": "分钟",
+    "tables": [
+      "eqp_downtime_record"
+    ],
+    "sql_expression": "",
+    "formula": "按 eqp_downtime_record.is_planned 分组：次数 = COUNT(*)，停机分钟 = SUM(downtime_minutes)，时长占比 = 该组分钟 ÷ 全部分钟",
+    "description": "计划/非计划停机的**时长与次数一起给**（确定性执行）。问句「各占多少」问的是占比，只回时长不回次数等于答了一半；只回时长也不够，因为计划停机的特征恰恰是「次数少、单次长」（152 次 7375 分钟），非计划反过来（184 次 8225 分钟）。yans 全期基准：非计划 184 次 8225 分钟 52.72%，计划 152 次 7375 分钟 47.28%，合计 15600 分钟。",
+    "dims": [
+      "计划类型",
+      "设备",
+      "产线"
+    ],
+    "valid_from": "",
+    "valid_to": "",
+    "exec_sql": "SELECT CASE WHEN is_planned THEN '计划停机' ELSE '非计划（故障）停机' END AS \"停机类型\", COUNT(*) AS \"停机次数\", SUM(downtime_minutes) AS \"停机分钟\", ROUND(SUM(downtime_minutes) * 100.0 / NULLIF(SUM(SUM(downtime_minutes)) OVER (), 0), 2) AS \"时长占比(%)\" FROM eqp_downtime_record GROUP BY 1 ORDER BY \"停机分钟\" DESC"
+  },
+  {
+    "name": "出过不良的工单状态分布",
+    "aliases": [
+      "出过不良的工单，都是什么状态的",
+      "出过不良的工单都是什么状态",
+      "出过不良的工单",
+      "有不良的工单",
+      "产生过不良的工单",
+      "出现过不良的工单",
+      "出过不良的工单状态分布",
+      "不良工单的状态",
+      "不良工单状态"
+    ],
+    "unit": "单",
+    "tables": [
+      "mes_work_order",
+      "qms_inspection"
+    ],
+    "sql_expression": "",
+    "formula": "工单的 qms_inspection 记录中存在 defect_qty > 0 的，按 mes_work_order.order_status 分组计数",
+    "description": "「出过不良的工单，都是什么状态的」= 有不良的工单按状态分组计数（确定性执行）。判据取检验记录（qms_inspection.defect_qty > 0），不用产出表 defect_qty —— 两者在本库结果一致，但检验记录是「出过不良」的直接凭证。yans 全期基准：已完成 207 / 已关闭 72 / 进行中 33 / 待生产 32（344 单全部有不良记录）。状态值需译成中文（库里是 completed/closed/in_progress/released）。",
+    "dims": [
+      "工单状态",
+      "产品",
+      "产线"
+    ],
+    "valid_from": "",
+    "valid_to": "",
+    "exec_sql": "SELECT CASE w.order_status WHEN 'completed' THEN '已完成' WHEN 'closed' THEN '已关闭' WHEN 'in_progress' THEN '进行中' WHEN 'released' THEN '待生产' ELSE w.order_status END AS \"工单状态\", COUNT(*) AS \"工单数\" FROM mes_work_order w WHERE EXISTS (SELECT 1 FROM qms_inspection i WHERE i.work_order_id = w.work_order_id AND i.defect_qty > 0) GROUP BY 1 ORDER BY \"工单数\" DESC"
+  },
+  {
+    "name": "投入量与合格量",
+    "aliases": [
+      "全厂总投入量和合格量",
+      "总投入量和合格量",
+      "投入量和合格量",
+      "投入量与合格量",
+      "投入和合格数量",
+      "总投入量和合格数量",
+      "投入量加合格量"
+    ],
+    "unit": "件",
+    "tables": [
+      "mes_process_output"
+    ],
+    "sql_expression": "",
+    "formula": "投入量 = SUM(input_qty)，合格量 = SUM(good_qty)，合格率 = 合格量 ÷ 投入量",
+    "description": "「总投入量和合格量」要的是**两个数一起给**（确定性执行）。单指标编译只会挑中「投入量」，合格量整列丢失——问了两件事只答一件，用户还得再问一遍。yans 全期基准：投入 3187009 件 / 合格 3109120 件 / 合格率 97.56%。注意投入量 ≠ 合格+不良（3187009 vs 3200857），两者不能互推。",
+    "dims": [
+      "产线",
+      "工序",
+      "产品",
+      "日期"
+    ],
+    "valid_from": "",
+    "valid_to": "",
+    "exec_sql": "SELECT SUM(input_qty) AS \"投入量\", SUM(good_qty) AS \"合格量\", ROUND(SUM(good_qty) * 100.0 / NULLIF(SUM(input_qty), 0), 2) AS \"合格率(%)\" FROM mes_process_output"
+  },
+  {
+    "name": "良率与停机时长对照",
+    "aliases": [
+      "良率最低的产线，停机时间是不是也最长",
+      "良率最低的产线停机时间是不是也最长",
+      "良率最低的产线停机情况",
+      "良率最低的产线和停机时间",
+      "良率最低的产线停机",
+      "良率和停机时长对照",
+      "良率与停机时长对照"
+    ],
+    "unit": "分钟",
+    "tables": [
+      "mes_process_output",
+      "dim_production_line",
+      "eqp_downtime_record"
+    ],
+    "sql_expression": "",
+    "formula": "按产线算良率（SUM(good_qty)/SUM(input_qty)）与停机时长（SUM(downtime_minutes)），两列分别给升序/降序排名，用于判断「良率最低是否等于停机最长」",
+    "description": "「良率最低的产线，停机时间是不是也最长」是**两个域对照**的问句（生产 vs 设备）。单指标编译只会挑「停机时长」出个排名，完全不提良率，等于没回答「是不是」；反过来只算良率同理。故用一条对照 SQL 一次给全：产线 / 良率 / 停机分钟 / 停机次数 / 良率排名 / 停机排名。yans 基准：良率最低一车间-4号线 97.05%、停机 3450 分钟排第 2；停机最长三车间-3号线 3460 分钟，良率 97.39% 排第 3 —— 两者**不是同一条线**。",
+    "dims": [
+      "产线",
+      "车间"
+    ],
+    "valid_from": "",
+    "valid_to": "",
+    "exec_sql": "WITH y AS (SELECT d.line_id, d.line_name, SUM(f.good_qty)::numeric * 100.0 / NULLIF(SUM(f.input_qty), 0) AS yld FROM mes_process_output f JOIN dim_production_line d ON f.line_id = d.line_id GROUP BY d.line_id, d.line_name), t AS (SELECT line_id, COUNT(*) AS cnt, SUM(downtime_minutes) AS mins FROM eqp_downtime_record GROUP BY line_id) SELECT y.line_name AS \"产线\", ROUND(y.yld, 2) AS \"良率(%)\", COALESCE(t.mins, 0) AS \"停机分钟\", COALESCE(t.cnt, 0) AS \"停机次数\", RANK() OVER (ORDER BY y.yld ASC) AS \"良率排名\", RANK() OVER (ORDER BY COALESCE(t.mins, 0) DESC) AS \"停机时长排名\" FROM y LEFT JOIN t ON t.line_id = y.line_id ORDER BY y.yld ASC"
+  },
+  {
+    "name": "可用库存最高的产品",
+    "aliases": [
+      "可用库存最高的产品是哪个",
+      "可用库存最高的产品",
+      "库存最高的产品",
+      "哪个产品库存最多",
+      "库存最多的产品",
+      "哪个产品可用库存最多",
+      "可用库存最多的是哪个产品"
+    ],
+    "unit": "件",
+    "tables": [
+      "inv_inventory_snapshot",
+      "dim_product"
+    ],
+    "sql_expression": "",
+    "formula": "取最新快照日（MAX(snapshot_date)），按产品汇总 available_qty，降序第一行",
+    "description": "可用库存最高的产品（确定性执行）。必须先限定最新快照日：库存表是**按日快照**，不限定日期会把 45 天快照累加，同一产品的可用库存被放大 45 倍（口径见「当前总库存量」）。yans 基准：通信模块24 4513 件（其后 通信模块28 4290、传感器18 4273）。",
+    "dims": [],
+    "valid_from": "",
+    "valid_to": "",
+    "exec_sql": "SELECT p.product_name AS \"产品\", SUM(i.available_qty) AS \"可用库存\" FROM inv_inventory_snapshot i JOIN dim_product p ON p.product_id = i.product_id WHERE i.snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) GROUP BY p.product_name ORDER BY \"可用库存\" DESC LIMIT 1"
   }
 ]

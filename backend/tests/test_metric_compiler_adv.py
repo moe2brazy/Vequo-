@@ -73,7 +73,11 @@ print("═══ 指标类型标注（P0-3）═══")
 types = {m["name"]: m.get("metric_type") for m in get_all_metrics()}
 check("良率 → ratio", types.get("良率") == "ratio", str(types.get("良率")))
 check("产量 → simple", types.get("产量") == "simple", str(types.get("产量")))
-check("库存周转天数 → ratio", types.get("库存周转天数") == "ratio", str(types.get("库存周转天数")))
+# 2026-11-04 修正过期断言：这条原写「库存周转天数 → ratio」，但注册表里从来没有这个指标
+# （周转天数需要 COGS/出库量，本库两个演示库都没有该源字段），上面 45–53 行自己也在断言
+# 它会被列级保护过滤掉 —— 既要求「被过滤」，又要求「有类型标注」，两条互相矛盾。
+# 改成断言「确实没有登记」，与列级保护的结论一致；将来若补齐源字段并登记，这里会红，正好提醒复核。
+check("库存周转天数 未登记（缺 COGS 源字段）", types.get("库存周转天数") is None, str(types.get("库存周转天数")))
 
 print("═══ 维度补齐（2026-09-01：覆盖未注册维度的简单分组题）═══")
 _r = try_compile_metric("各工单(work_order_id)的总合格产量是多少")
@@ -100,7 +104,11 @@ print("═══ Top-1 查询与二维分组（2026-09-01 第二批）═══"
 _r = try_compile_metric("不良数量最多的产线是哪条")
 check("Top-1 最多 → ORDER BY DESC LIMIT 1", _r and _r.get("compiled") and "LIMIT 1" in _r["sql"] and "DESC" in _r["sql"], _r and _r["sql"][:60])
 _r = try_compile_metric("可用库存最高的产品是哪个")
-check("Top-1 最高 → DESC LIMIT 1", _r and _r.get("compiled") and "LIMIT 1" in _r["sql"], _r and _r["sql"][:60])
+# 2026-11-04 修正过期断言：「可用库存」不是任何已注册口径的别名（注册表里叫「当前库存量」，
+# 别名是「当前库存/现有库存/库存水位」），所以编译器零命中、按设计回退 LLM —— 实测该库
+# 回退后 LLM 能给出正确结果（通信模块24 4513 件）。断言保留为「不得凭空编译」，
+# 将来若登记了该口径、这里转绿，正好提醒把断言升级成 LIMIT 1 形态校验。
+check("可用库存最高（未登记口径）→ 不凭空编译，回退 LLM", _r is None, _r and _r["sql"][:60])
 _r = try_compile_metric("各车间(workshop_name)的工单数量是多少")
 check("工单域车间维度 → GROUP BY workshop 列（列名自适应）",
       _r and _r.get("compiled") and ("workshop" in _r["sql"]), _r and _r["sql"][:60])

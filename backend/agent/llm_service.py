@@ -8183,7 +8183,44 @@ class LLMService:
         # 对标 Wren AI / AWS 的亚秒级手段：重复/相似业务问题命中后直接复用历史 SQL 重新执行。
         # 注意：必须先于 no_hit 弹窗检查——之前确认执行过的问题已沉淀语义缓存，
         # 再次提问应直接命中复用，而不是重复弹窗。
-        _cached = self._semantic_cache_hit()
+        # ── 确定性编译提前（2026-11-04 修正执行顺序）────────────────────────
+        # 原顺序是「先查语义缓存，未命中才编译」。问题在于缓存里存的是**当次生成的那条 SQL**：
+        # 编译器能力一旦增强（补别名、补维度、补复合口径），此前沉淀的旧 SQL 仍会先命中缓存
+        # 并直接复用 —— 改进永远不生效，同一个问句问第二遍反而比第一遍更差。
+        # 实测：问「计划停机和故障停机各占多少」，缓存里躺着一条只求时长、不带次数的 SQL，
+        # 命中后连"次数"这一半都没了，且 quality 显示 high。
+        # ⇒ 编译是确定性的、零 LLM、毫秒级，可信度天然高于历史缓存，必须先试；
+        #   编译不成再退回缓存，缓存才回到它本职的「跳过慢步骤」。
+        self.query_kind = "attribution" if _is_attribution_query(self.query) else "data"
+        self._precompiled = None
+        if self.query_kind != "attribution":
+            # 高级口径优先（确定性执行，人工验证 SQL）：编译器不支持的跨表/多步算法
+            # （分档/末工序完工缺口/超产）命中带 exec_sql 的指标 → 直接渲染执行，
+            # 不依赖 LLM、也避免普通编译对空 sql_expression 指标的先发歧义。
+            try:
+                from agent.metric_registry import render_exec_sql_metric
+                self._precompiled = render_exec_sql_metric(self.query)
+            except Exception:
+                self._precompiled = None
+            if not self._precompiled:
+                try:
+                    from agent.metric_compiler import try_compile_metric
+                    self._precompiled = try_compile_metric(self.query)
+                except Exception:
+                    self._precompiled = None
+            if not self._precompiled:
+                # 维度与这份数据无关（如「各产线库存量」——库存只按产品/仓库记录，
+                # 不关联产线）→ 编译链按设计放行给 LLM，而 LLM 实测会编出答非所问的
+                # 分组（GROUP BY snapshot_id）。不拦执行，只补一句可核对的提示。
+                try:
+                    from agent.metric_compiler import dimension_mismatch_hint
+                    _dmh = dimension_mismatch_hint(self.query)
+                except Exception:
+                    _dmh = None
+                if _dmh and _dmh not in self._fix_notes:
+                    self._fix_notes.append(_dmh)
+
+        _cached = None if self._precompiled else self._semantic_cache_hit()
         if _cached:
             # ── 缓存命中不等于免检（2026-10-05 实测 P0）────────────────────
             # 实测现象：先问「报废数是多少」→ 沉淀了 `SUM(defect_qty) AS "报废数"`；
@@ -8223,38 +8260,8 @@ class LLMService:
                     self.compiled_mql = _cached.get("mql")
                 yield _step("语义缓存", f"命中相似历史查询（相似度 {_cached['similarity']:.2f}），复用 SQL 直接执行")
         if not self._semantic_hit:
-            # ── 确定性编译尝试（架构强约定：未注册口径 → LLM 推断 + 弹窗确认，
-            #    LLM 不得直接产出可执行 SQL）──
-            # 提前到二次确认之前计算：判断「能否走确定性编译」需要它，
-            # 同时避免下方 Step 2 重复编译。
-            self.query_kind = "attribution" if _is_attribution_query(self.query) else "data"
-            self._precompiled = None
-            if self.query_kind != "attribution":
-                # 高级口径优先（确定性执行，人工验证 SQL）：编译器不支持的跨表/多步算法
-                # （分档/末工序完工缺口/超产）命中带 exec_sql 的指标 → 直接渲染执行，
-                # 不依赖 LLM、也避免普通编译对空 sql_expression 指标的先发歧义。
-                try:
-                    from agent.metric_registry import render_exec_sql_metric
-                    self._precompiled = render_exec_sql_metric(self.query)
-                except Exception:
-                    self._precompiled = None
-                if not self._precompiled:
-                    try:
-                        from agent.metric_compiler import try_compile_metric
-                        self._precompiled = try_compile_metric(self.query)
-                    except Exception:
-                        self._precompiled = None
-                if not self._precompiled:
-                    # 维度与这份数据无关（如「各产线库存量」——库存只按产品/仓库记录，
-                    # 不关联产线）→ 编译链按设计放行给 LLM，而 LLM 实测会编出答非所问的
-                    # 分组（GROUP BY snapshot_id）。不拦执行，只补一句可核对的提示。
-                    try:
-                        from agent.metric_compiler import dimension_mismatch_hint
-                        _dmh = dimension_mismatch_hint(self.query)
-                    except Exception:
-                        _dmh = None
-                    if _dmh and _dmh not in self._fix_notes:
-                        self._fix_notes.append(_dmh)
+            # query_kind 与 _precompiled 已在语义缓存之前算好（见上方「确定性编译提前」），
+            # 这里只负责走编译产物或 LLM 生成链，不再重复编译。
 
             # ── 二次确认（架构强约定，2026-08-31 收紧）──
             # 以下情况必须弹窗让用户确认口径与执行方案，不得静默让 LLM 直接生成 SQL：
@@ -13265,6 +13272,19 @@ def _rule_insight(rows: list[dict], cols: list[str]) -> str:
             f"{disp[d]}「{sample[0].get(d, '')}」" for d in dim_cols[:2]
             if str(sample[0].get(d, "")).strip() != "")
         lines.append(f"· {_obj + '的' if _obj else ''}{disp[mc]}为 {_fmt(vals[0])}。")
+        # 2026-11-04：单行结果里若还带别的数值列（「总投入量和合格量」这类并列问法），一并写出来。
+        # 实测原实现只讲主列 —— 问了两件事，结论只回一件，用户以为系统算漏了，还得再问一遍。
+        _extra_cols = [c for c in num_cols
+                       if c != mc and str(sample[0].get(c, "")).strip() != ""]
+        if _extra_cols:
+            _parts = []
+            for _c in _extra_cols[:4]:
+                _v = sample[0].get(_c)
+                try:
+                    _parts.append(f"{disp[_c]} {_fmt(float(_v))}")
+                except (ValueError, TypeError):
+                    _parts.append(f"{disp[_c]} {_v}")
+            lines.append("· 同一行的其他口径：" + "、".join(_parts) + "。")
     elif ratio_like:
         # 比率类合并成一行，避免"最高…最低…"在下一行重复一遍
         _gap_txt = f"，相差 {_spread_txt(mx - mn)}"
