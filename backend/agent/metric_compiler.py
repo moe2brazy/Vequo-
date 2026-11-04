@@ -3230,6 +3230,26 @@ def try_compile_metric(query: str) -> dict | None:
     else:
         sql = f'SELECT {proj} FROM {fact} f{where}{having} LIMIT 1'
 
+    # ── 状态值护栏（2026-11-04 实测发现的高危静默错答）─────────────────────
+    # 现象：问「进行中的工单有多少」→ 别名表缺「进行中的工单」（表里只有「进行中工单」），
+    #      于是最长匹配落到泛指的「工单数」→ 编译成 `SELECT COUNT(*) FROM mes_work_order`
+    #      → 返回 344（全表），而正确答案是 33。success=true、无任何提示。
+    #      对比：「已完成的工单有多少」命中「已完成工单数」→ 207 正确。
+    # 判据：问句里写了状态值，编译产物里就必须出现对应的枚举字面值；否则说明这条 SQL
+    #      把「某状态的量」答成了「总量」，属于**比零命中更危险**的一类（数字看起来合理）。
+    #      宁可退回 LLM（大概率会带上过滤），也不能把总量当成分状态量。
+    _ENUM_WORDS = {
+        "已完成": "completed", "已完工": "completed",
+        "已关闭": "closed",
+        "进行中": "in_progress", "生产中": "in_progress",
+        "待生产": "released", "已下达": "released",
+        "空闲": "idle", "运行中": "running", "维护中": "maintenance",
+    }
+    _missing = [w for w, v in _ENUM_WORDS.items()
+                if w in query and f"'{v}'" not in sql and v not in sql]
+    if _missing:
+        return None
+
     return {
         "sql": sql,
         "title": (f"{name}查询" if len(metrics_info) == 1

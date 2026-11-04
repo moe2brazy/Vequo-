@@ -5,6 +5,10 @@
       "在产工单",
       "在制工单",
       "进行中工单",
+      "进行中的工单",
+      "进行中的工单有多少",
+      "进行中的工单数",
+      "生产中的工单",
       "在建工单",
       "在建工单数",
       "在建工单有多少",
@@ -58,20 +62,24 @@
     "valid_to": ""
   },
   {
-    "name": "已取消工单数",
+    "name": "已关闭工单数",
     "aliases": [
-      "已取消工单",
-      "取消工单",
+      "已关闭工单",
+      "已关闭的工单",
+      "已关闭的工单有多少",
+      "已经关闭的工单",
+      "关闭的工单",
       "关闭工单",
-      "已关闭工单"
+      "已取消工单",
+      "取消工单"
     ],
     "unit": "单",
     "tables": [
       "mes_work_order"
     ],
     "sql_expression": "SUM(CASE WHEN order_status = 'closed' THEN 1 ELSE 0 END)",
-    "formula": "工单状态为 closed(已取消/已关闭) 的工单数",
-    "description": "已取消/已关闭的工单数量（口径：mes_work_order.order_status = 'closed'；枚举 closed 已取消 72/completed 已完成 207/in_progress 进行中 33/released 已下达 32）",
+    "formula": "工单状态为 closed（已关闭）的工单数",
+    "description": "已关闭的工单数量（口径：mes_work_order.order_status = 'closed'）。2026-11-04 更名：原叫「已关闭工单数」，但 yans 的 closed 表示已关闭、库里没有 cancelled 态，叫「已取消」会让答辩时说错话；保留「已取消工单」作别名兼容旧问法。yans 基准 72 单：closed 已关闭 72 / completed 已完成 207 / in_progress 进行中 33 / released 已下达 32，四态合计 344。",
     "dims": [
       "产线",
       "车间",
@@ -849,7 +857,7 @@
     "formula": "Σ(状态=已下达/进行中 的工单)",
     "exec_sql": "SELECT SUM(CASE WHEN order_status IN ('released','in_progress') THEN 1 ELSE 0 END) AS \"未完工工单数\" FROM mes_work_order",
     "exec_sql_by_dim": "SELECT {dim} AS \"维度\", SUM(CASE WHEN order_status IN ('released','in_progress') THEN 1 ELSE 0 END) AS \"未完工工单数\" FROM mes_work_order GROUP BY {dim} ORDER BY \"未完工工单数\" DESC",
-    "description": "未完工工单数：order_status 为 released（已下达）或 in_progress（进行中）的工单张数。yans 基准 65 单（released 32 + in_progress 33）。工单状态四态互斥且合计=总工单：completed(已完成 207) + closed(已取消/已关闭 72) + in_progress(33) + released(32) = 344。本口径 = released + in_progress，与「已完成工单数」「已取消工单数」互补，三者相加等于工单总数。",
+    "description": "未完工工单数：order_status 为 released（已下达）或 in_progress（进行中）的工单张数。yans 基准 65 单（released 32 + in_progress 33）。工单状态四态互斥且合计=总工单：completed(已完成 207) + closed(已取消/已关闭 72) + in_progress(33) + released(32) = 344。本口径 = released + in_progress，与「已完成工单数」「已关闭工单数」互补，三者相加等于工单总数。",
     "dims": [
       "产线",
       "产品"
