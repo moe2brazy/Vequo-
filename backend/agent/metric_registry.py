@@ -1678,6 +1678,27 @@ def _count_question_core(q: str) -> str:
         return ""
 
 
+# 复合评价短语归一（2026-11-04）
+# 「哪个车间的综合表现最好」这类问法没有任何一个可计算口径与之同名：
+#   find_metrics 零命中 → 确定性编译不起步 → 交给 LLM 直生，实测产出
+#     SELECT workshop_name FROM dim_production_line GROUP BY workshop_name ORDER BY COUNT(*) DESC LIMIT 1
+#   三个车间各 2 条产线 → 计数并列 → PostgreSQL 任意返回一行，答成「三车间」。
+#   而 question_examples.json 记录的期望答案是二车间 97.71 / 一车间 97.50 / 三车间 97.39（良率序），
+#   与 yans 实测一致；这条问句还挂在「跨表关联分析」页签上可以被直接点出来。
+# 现有口径里唯一能跨生产单元比较的是良率，因此：**仅在出现生产组织维度词时**把
+#   综合表现/整体表现/综合水平/综合绩效 归一成「良率」。带「设备」等非生产单元主语的问句
+#   （如「设备综合表现」）不在此列，仍走原路径。
+_COMPOSITE_EVAL_RE = re.compile(r"(综合表现|整体表现|综合水平|综合绩效|综合能力|整体水平)")
+_PROD_ORG_RE = re.compile(r"(车间|产线|生产线|工厂|全厂|基地|厂区)")
+
+
+def _normalize_composite_eval(q: str) -> str:
+    """把「X的车间综合表现最好」这类无口径问句归一为可计算口径（见上方注释）。"""
+    if _COMPOSITE_EVAL_RE.search(q) and _PROD_ORG_RE.search(q):
+        return _COMPOSITE_EVAL_RE.sub("良率", q)
+    return q
+
+
 def find_metrics(query: str, limit: int | None = 3) -> list[dict]:
     """按用户问题命中指标（最长匹配优先，避免矛盾口径同时注入）。
 
@@ -1694,7 +1715,7 @@ def find_metrics(query: str, limit: int | None = 3) -> list[dict]:
     """
     if not query:
         return []
-    q = _strip_table_names(query).lower()
+    q = _normalize_composite_eval(_strip_table_names(query).lower())
     scored: list[tuple[int, str, dict]] = []
     for m in get_effective_metrics():
         words = [m["name"]] + (m.get("aliases") or [])

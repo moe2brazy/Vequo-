@@ -432,6 +432,18 @@ def enrich_lineage_labels(lineage: dict, use_ai: bool = True) -> dict:
             if not isinstance(c, dict) or c.get("cn"):
                 continue
             f = str(c.get("field") or "")
+            agg = str(c.get("agg") or "").upper()
+            # 2026-11-04：纯聚合列（`COUNT(*) AS "cnt"`、`SUM(...)` 无源列投影）的 field 是 "*"，
+            # 原先被下面那行 `continue` 直接跳过 → cn 恒为空 → 前端表头只剩一个 "cnt"。
+            # 实测「各类型设备有多少台」的 LLM 直生产物就是 `..., COUNT(*) AS "cnt"`，
+            # 表格列头显示 cnt，answers 里也写成「数量（cnt）」，前后不一致。
+            # 这里按聚合类型给通用短名；有源列的正常列不受影响（走词典/AI）。
+            if (not f or f == "*") and agg:
+                _cn = {"COUNT": "数量", "SUM": "合计", "AVG": "均值",
+                       "MAX": "最大值", "MIN": "最小值"}.get(agg)
+                if _cn:
+                    c["cn"] = _cn
+                continue
             if not f or f == "*":
                 continue
             if has_chinese(str(c.get("output") or "")):

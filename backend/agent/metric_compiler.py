@@ -89,6 +89,12 @@ _FACT_META = {
         "time_col": None,
         "dims": {
             "设备状态": {"fact_col": "equipment_status", "join": None},
+            "状态": {"fact_col": "equipment_status", "join": None},   # 别名：口语只说「状态分布」
+            # 2026-11-04：「设备总数和状态分布」原先零维度命中（问句里只有「状态分布」，
+            # 没有「设备状态」四个字）→ 编译放弃 → LLM 直生，实测产出
+            #   SELECT '未知状态' AS "设备状态", COUNT(*) AS "设备数" FROM dim_equipment
+            # —— 一条把 48 台设备全塞进「未知状态」一行的假分布，success=true 无提示。
+            # 补「状态」别名后回归到 GROUP BY equipment_status（运行 36 / 空闲 8 / 维护 4）。
             "设备类型": {"fact_col": "equipment_type", "join": None},
             "类型": {"fact_col": "equipment_type", "join": None},   # 别名（同列，覆盖「各类型的设备数」口语问法）
             "产线": {"fact_col": "line_id", "join": ("dim_production_line", "line_id", "line_name")},
@@ -703,12 +709,20 @@ def _detect_dim(query: str, fact_table: str) -> list[str]:
         #   ① 原式 `最…的?\d+` 不允许「的」和数字之间夹「前」→「不良数量最多的**前5**道工序」漏判；
         #   ② 单位表缺 道/台/种/家/项/位/次，且原式把单位写成必选 →「前5道工序」漏判；
         #   ③ 缺「最晚/最早/最新/最旧」（时间型 Top-N，如「最晚的3条停机记录」）。
+        #   ④ 2026-11-04 补**中文数词**：原式只认 `\d+`，「产量最高的**十个**产品」漏判 →
+        #      _detect_dim 返回空 → _auto_rank_dim 补表内第一个 JOIN 维度「产线」→
+        #      问产品、答产线（实测「产量最高的十个产品」按产线分组 690403，真值应为产品维度）。
+        #      question_examples.json 里这类问法不止一条，属演示会点到的形态。
+        #   ⑤ 补「什么X/啥X」：「停机时长最长的是**什么原因**」——原因维度（downtime_reason）
+        #      问句里从不出现「原因分布/各原因」这类标准句式，只会以「是什么原因」出现，
+        #      原正则全不命中 → 同样被 _auto_rank_dim 补成「设备类型」→ 答成某类设备的停机时长。
+        _num = r"(?:\d+|[一二三四五六七八九十百]+)"
         _rank_pat = (
-            rf"最(?:大|高|多|久|长|小|低|少|短|晚|早|新|旧)\s*(?:的)?\s*(?:前)?\s*\d+\s*"
+            rf"最(?:大|高|多|久|长|小|低|少|短|晚|早|新|旧)\s*(?:的)?\s*(?:前)?\s*{_num}\s*"
             rf"(?:个|条|名|张|批|道|台|种|家|项|位|次)?\s*{cn}"
-            rf"|前\s*\d+\s*(?:个|条|名|张|批|道|台|种|家|项|位|次)?\s*{cn}"
+            rf"|前\s*{_num}\s*(?:个|条|名|张|批|道|台|种|家|项|位|次)?\s*{cn}"
         )
-        if re.search(rf"各{cn}|按{cn}|每个{cn}|每{cn}|分{cn}|TOP\s*\d+\s*{cn}|{_rank_pat}|的{cn}(?!(?:总库存|库存|库存量|总量))|{cn}的|{cn}最高|{cn}最低|最高的{cn}|最低的{cn}|最多的{cn}|最少的{cn}|最大的{cn}|最小的{cn}|{cn}分析|{cn}分布|{cn}排行|{cn}排名"
+        if re.search(rf"各{cn}|按{cn}|每个{cn}|每{cn}|分{cn}|TOP\s*\d+\s*{cn}|{_rank_pat}|什么{cn}|啥{cn}|哪种{cn}|的{cn}(?!(?:总库存|库存|库存量|总量))|{cn}的|{cn}最高|{cn}最低|最高的{cn}|最低的{cn}|最多的{cn}|最少的{cn}|最大的{cn}|最小的{cn}|{cn}分析|{cn}分布|{cn}排行|{cn}排名"
                      rf"|哪[个台条道张批家座间种类位名次笔项]{cn}|[一这那某几\d]+[个台条道张批家座间种类位名次笔项]{cn}|哪些{cn}|几台{cn}|哪几个{cn}|这几个{cn}|这些{cn}|{cn}分别|分别{cn}", query, re.IGNORECASE):
             found.append(cn)
     return found
@@ -797,6 +811,14 @@ def _drill_value(query: str) -> str | None:
     return val[:14]
 
 
+# 布尔标记列的固定词表（2026-11-04）：问句出现左列词 → 对目标表的布尔列加确定性过滤。
+# 只放语义唯一、无需猜测的项；每加一条都要能对应到库里真实存在的布尔列。
+_BOOL_FLAG_FILTERS: tuple[tuple[str, str, str], ...] = (
+    # 词组,      目标表,        目标布尔列
+    ("关键工序", "dim_process", "is_key_process"),
+)
+
+
 def _explicit_value_filters(query: str, fact: str) -> list[str]:
     """问句里**点名**了维表枚举值 → 返回 EXISTS 形式的 WHERE 子句（可为空列表）。
 
@@ -856,6 +878,26 @@ def _explicit_value_filters(query: str, fact: str) -> list[str]:
                 dim_cols.add(str(_cfg["fact_col"]).lower())
     time_col = str(meta.get("time_col") or "").lower()
     seen_vals: set[str] = set()
+
+    # ── 布尔标记列的点名过滤（2026-11-04）────────────────────────────────
+    # 下面那套值过滤靠「字面值出现在低基数文本列的倒排索引里」，而 is_key_process 是
+    # boolean 列、它的「取值」不是业务词，永远不会进索引，于是「关键工序的良率怎么样」
+    # 只加了 GROUP BY 工序、不带任何过滤 → 8 道工序全给，而 yans 里关键工序只有 3 道
+    # （功能测试/老化测试/SMT贴片，is_key_process=TRUE）。
+    # 这里按固定词表补一个确定性条件，不做任何猜测：
+    for _phrase, _btab, _bcol in _BOOL_FLAG_FILTERS:
+        if _phrase not in q:
+            continue
+        if _btab.lower() == fact:
+            if _bcol in fact_cols and _safe_ident(_bcol):
+                out.append(f"f.{_bcol}")
+        else:
+            _bbase = _btab[4:] if _btab.startswith("dim_") else _btab
+            _bjkey = f"{_bbase}_id"
+            if _bjkey in fact_cols and _safe_ident(_btab) and _safe_ident(_bcol):
+                out.append(f"EXISTS (SELECT 1 FROM {_btab} _v WHERE _v.{_bjkey} = f.{_bjkey} "
+                           f"AND _v.{_bcol})")
+
     # 本次问句里是否**显式出现分组信号**（各/每/分别/按…）。
     # 用于区分「值过滤」与「值分组」：同一列同一取值，两种语义的产物完全不同 ——
     #   「贴片机设备一共有多少台」→ WHERE equipment_type='贴片机'（过滤，答案 6）
