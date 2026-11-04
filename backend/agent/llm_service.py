@@ -10217,6 +10217,12 @@ class LLMService:
                 res = execute_sql(eff)
             except Exception as e:
                 res = {"success": False, "error": str(e)[:300], "rows": [], "row_count": 0}
+        # 显示层枚举中文化（见 _localize_enum_rows 说明）：所有执行点统一在这里过一道，
+        # 保证表格 / 图表 / 结论 / 导出拿到的是同一份中文值。
+        try:
+            res = _localize_enum_rows(res)
+        except Exception:
+            pass
         return res
 
     def _retry_sql_fix(self, error_msg: str, prev_sql: str = "", rounds: int = 0) -> str:
@@ -15303,6 +15309,62 @@ _CONN_ERR_PAT = re.compile(
     r"server closed the connection|Connection reset|connection already closed|"
     r"InvalidatePoolError|network error|远程主机强迫关闭|terminating connection|"
     r"could not connect|Connection refused)", re.I)
+
+
+# ── 枚举值显示中文化（2026-11-04）────────────────────────────────────────
+# 问题：表头、结论、图表全是中文，唯独状态值还是库里的英文原样 ——
+#   实测「各状态的工单各有多少」出来是 completed 207 / closed 72 / in_progress 33，
+#   「设备总数和状态分布」是 running 36 / idle 8 / maintenance 4。
+#   答辩现场念不出、跟中文结论混在一起也不像一个完成品。
+# 做法：只改**显示值**，在唯一的执行出口（_exec_sql）返回前就地翻译，不动 SQL、不动入库数据。
+#   这样图表、结论、导出看到的是同一份中文，不会出现「表里英文、结论中文」的分裂。
+# 保守边界：① 只翻这一小撮确定的枚举，其余值原样；② 班次只在列名含 shift/班次 时翻，
+#   避免把别处单字母取值误伤；③ 不改列名（列名映射另有 field_semantics 负责）。
+_ENUM_VALUE_CN = {
+    "completed": "已完成", "closed": "已关闭", "in_progress": "进行中",
+    "released": "待生产", "pending": "待处理",
+    "running": "运行", "idle": "空闲", "maintenance": "维护",
+    "offline": "离线", "fault": "故障",
+}
+_SHIFT_VALUE_CN = {"D": "白班", "N": "夜班", "DAY": "白班", "NIGHT": "夜班", "白": "白班", "夜": "夜班"}
+
+
+def _localize_enum_rows(res: dict) -> dict:
+    """把结果里的枚举值翻成中文（纯显示层，幂等）。"""
+    if not isinstance(res, dict) or not res.get("success"):
+        return res
+    rows = res.get("rows") or []
+    cols = res.get("columns") or []
+    if not rows or not cols:
+        return res
+    col_maps = {}
+    for c in cols:
+        low = str(c).lower()
+        if "shift" in low or "班次" in str(c):
+            col_maps[c] = _SHIFT_VALUE_CN
+        else:
+            col_maps[c] = _ENUM_VALUE_CN
+    changed = False
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            out.append(r)
+            continue
+        nr, hit = r, False
+        for c, m in col_maps.items():
+            v = nr.get(c)
+            if isinstance(v, str) and v in m:
+                if not hit:
+                    nr, hit = dict(nr), True
+                nr[c] = m[v]
+        changed = changed or hit
+        out.append(nr)
+    if not changed:
+        return res
+    res = dict(res)
+    res["rows"] = out
+    return res
+
 
 
 def _is_conn_error(msg: str) -> bool:

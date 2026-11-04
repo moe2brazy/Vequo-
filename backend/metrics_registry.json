@@ -2272,5 +2272,29 @@
     "valid_from": "",
     "valid_to": "",
     "exec_sql": "SELECT p.product_name AS \"产品\", SUM(i.available_qty) AS \"可用库存\" FROM inv_inventory_snapshot i JOIN dim_product p ON p.product_id = i.product_id WHERE i.snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) GROUP BY p.product_name ORDER BY \"可用库存\" DESC LIMIT 1"
+  },
+  {
+    "name": "白班与夜班良率对比",
+    "aliases": [
+      "白班和夜班良率有差别吗",
+      "白班和夜班良率",
+      "白班夜班良率对比",
+      "白班和夜班的良率",
+      "白夜班良率对比",
+      "白班夜班良率差别"
+    ],
+    "unit": "%",
+    "tables": [
+      "mes_process_output"
+    ],
+    "sql_expression": "",
+    "formula": "按 mes_process_output.shift_code 分组：良率 = SUM(good_qty) / SUM(input_qty) × 100%",
+    "description": "白班/夜班良率对比（确定性执行）。班次在库里是 shift_code = D/N，直接出表读不懂，故在 SQL 里译成白班/夜班。yans 全期基准：白班 97.55%、夜班 97.56%，差 0.01 个百分点 —— 班次对良率几乎没有影响，答辩时别把这点差异说成「夜班质量差」。",
+    "dims": [
+      "班次"
+    ],
+    "valid_from": "",
+    "valid_to": "",
+    "exec_sql": "SELECT CASE shift_code WHEN 'D' THEN '白班' WHEN 'N' THEN '夜班' ELSE shift_code END AS \"班次\", ROUND(SUM(good_qty) * 100.0 / NULLIF(SUM(input_qty), 0), 2) AS \"良率(%)\" FROM mes_process_output GROUP BY shift_code ORDER BY 1"
   }
 ]
