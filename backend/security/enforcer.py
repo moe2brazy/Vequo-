@@ -1000,8 +1000,26 @@ def rewrite_sql(sql: str, ctx: AclContext | None, dialect: str | None = None) ->
             all_owners = [t for t in bare_tables
                           if col.name.lower() in {c.lower() for c in _table_columns(t)}]
             if not all_owners:
-                # 连列结构都查不到 → 判断不了 → fail-close（10-03 的安全语义，保留）
-                return _AMBIGUOUS_OWNER
+                # 2026-11-04 修（真 bug，实测复现）：「列不属于任何在范围表」≠「判断不了」。
+                # 旧实现把两者折叠成 _AMBIGUOUS_OWNER，结果同层**输出别名**被一律拒绝：
+                #   SELECT l.line_name AS 产线,
+                #          ROUND(SUM(o.good_qty)*100.0/SUM(o.input_qty),2) AS 良率
+                #   FROM mes_process_output o JOIN dim_production_line l ON …
+                #   GROUP BY l.line_name ORDER BY 良率 DESC
+                # `良率` 是本层 SELECT 刚定义的别名，PG 允许 ORDER BY/GROUP BY 直接引用。
+                # 它既不在 cands 也不在 all_owners → 判「归属歧义」→ 整条 SQL 被拒。
+                # admin 走 superuser 短路碰不到，所以只有普通员工会中招；上层兜底再生成
+                # 一条更差的 SQL，最终静默给出错的数（实测：良率排名变成按 output_id 求和）。
+                #
+                # 判据：真实表必有列，_table_columns 只在**查询失败 / 表不存在**时返回空。
+                #   · 有表结构拿不到 → 确实判断不了 → 维持 fail-close；
+                #   · 全部表结构都拿到了，却没有任何一张含此列名 ⇒ 它不可能是基表列，
+                #     只能是输出别名或派生列，任何 deny/mask 规则都命不中它 → 放行。
+                # 放行是安全的：规则要命中，前提是该列名存在于某张在范围表，
+                # 而那种情况在上面的 all_owners 里就已经被收集到了，根本不会走到这里。
+                if any(not _table_columns(t) for t in bare_tables):
+                    return _AMBIGUOUS_OWNER
+                return None
             # 拥有该列的表里，只要**有任何一张**配了 deny/mask → 归属不明，fail-close
             for t in all_owners:
                 if (col.name.lower() in ctx.column_denies.get(t, set())

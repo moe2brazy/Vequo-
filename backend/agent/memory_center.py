@@ -172,8 +172,31 @@ def memory_hint(query: str, role: str = "", username: str = "", k: int = 3) -> s
                 if dims and not any(d in query for d in dims):
                     lines.append(f"· 经营记忆：指标「{name}」历史上常与维度「{'、'.join(dims[:3])}」一起分析（累计 {p['count']} 次），可参考该分析角度")
     # 备注：按角色可见性过滤后注入
+    # 2026-11-04 修（实测复现）：原判据是 `n["metric"] in hit_names` 的**精确相等**，
+    #   于是挂在泛口径「良率」下的人工备注，在问「各工序的良率是多少」时完全失效 ——
+    #   该问句命中的是更精确的「工序良率」，note.metric="良率" ≠ "工序良率"。
+    #   备注是写给**口径**的补充说明，用户在「良率」下写「按合格/投入口径」，
+    #   意思就是这个口径的所有细分问法都适用；精确相等等于让它只对一种问法生效。
+    # 判据改为「备注口径是该命中名的后缀」，但**排除否定前缀**：
+    #   「良率」⊂「工序良率」→ 适用（工序是维度限定）；
+    #   「良率」⊂「不良率」→ 不适用（前缀是「不」，这是**相反**的口径）。
+    #   否定词表与 metric_registry 里 _NEG / _NEG_HEAD 同一口径，避免两套语义漂移。
+    _NEG_HEAD = ("不", "非", "无", "未", "欠")
+
+    def _note_applies(note_metric: str) -> bool:
+        if not note_metric:
+            return False
+        for _h in hit_names:
+            if note_metric == _h:
+                return True
+            if _h.endswith(note_metric):
+                _pfx = _h[: len(_h) - len(note_metric)]
+                if _pfx and _pfx[0] not in _NEG_HEAD:
+                    return True
+        return False
+
     for n in notes:
-        if n.get("metric") in hit_names:
+        if _note_applies(str(n.get("metric") or "")):
             if role not in ("admin",) and n.get("created_by") != username:
                 continue
             lines.append(f"· 口径备注（{n.get('created_by') or '管理员'}）：{n.get('note')}")

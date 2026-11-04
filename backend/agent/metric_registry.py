@@ -1570,7 +1570,24 @@ def _left_guard_vocab() -> set[str]:
                   # 「一次」→ 照常拦截），与「同比/环比」「分析/对比」同类，故进词表。
                   # 一并补齐其余同族连词，覆盖"和/与"之外的书面与口语写法。
                   "跟", "同", "比", "较", "比较", "对比于", "相较", "参照",
-                  "基于", "按照", "依据", "除了", "剔除", "不含"])
+                  "基于", "按照", "依据", "除了", "剔除", "不含",
+                  # 2026-11-04：**数量问句的脚手架词**（同族问题第五次复发）。
+                  # 实测「一共有多少台设备」：别名「有多少台设备」本来是命中的，
+                  #   但左侧 run="一共" 不在词表 → suspect=True → 该命中作废 →
+                  #   find_metrics 零命中 → 回退 LLM 直生 → 实测生成
+                  #     COUNT(eqp_downtime_record.equipment_id) JOIN dim_equipment
+                  #   → 返回 336（停机记录条数），而设备只有 48 台。
+                  # 这一族全是句法功能词/时间上下文，不改变口径语义：
+                  #   剥掉「一共」后仍是「多少台设备」，口径没动；真正的修饰语
+                  #   （出货/来料/一次/标准）照旧不在词表，防偷换能力不受影响。
+                  # 一并补齐同族写法，避免下次换个说法又漏。
+                  "一共", "共有", "总共", "总计", "合计", "现有", "现在",
+                  "目前", "当前", "如今", "咱们", "我们", "厂里", "工厂里",
+                  "系统里", "请问", "想问", "想知道", "具体", "大约", "大概",
+                  # 组织范围的代称：实测「咱们厂有多少设备」左侧 run="咱们厂"，
+                  # 剥掉「咱们」还剩「厂」→ 仍被判 suspect。「厂/全厂/公司」指的是
+                  # **数据范围**，不是口径修饰语（「全厂良率」就是良率，口径没变）。
+                  "全厂", "厂", "公司"])
     return vocab
 
 
@@ -1635,6 +1652,32 @@ def _left_modifier_suspect(q: str, pos: int) -> bool:
     return bool(run)
 
 
+# 数量问句识别（2026-11-04）：只为 find_metrics 的「语序无关兜底」服务。
+#   · _COUNT_ASK_RE 确认这确实是在问数量（多少/几），避免「设备」两个字的闲聊也被匹配；
+#   · _COUNT_NOISE_RE / _COUNT_UNIT_RE 剥掉脚手架词与量词，留下实体核。
+_COUNT_ASK_RE = re.compile(r"(多少|几)")
+_COUNT_NOISE_RE = re.compile(
+    r"(一共有|一共|总共|共有|总计|合计|现有|现在|目前|当前|咱们|我们|厂里|工厂里|"
+    r"系统里|库里|里面|有|是|的|了|呢|吗|请|帮我|麻烦|查一下|查|看一下|看|"
+    r"告诉我|统计|一下|多少|几)")
+_COUNT_UNIT_RE = re.compile(r"(台|个|条|道|张|件|名|种|套|批|次|只|家|位)")
+
+
+def _count_question_core(q: str) -> str:
+    """把「一共有多少台设备」剥成「设备」这种实体核；剥不出东西就返回空串。
+
+    刻意保守：剥完长度 < 2 一律当没剥出来 —— 单字核（如「数」）拿去比对，
+    会把一堆指标误拉进来。
+    """
+    try:
+        s = _COUNT_NOISE_RE.sub("", str(q or "").lower())
+        s = _COUNT_UNIT_RE.sub("", s)
+        s = re.sub(r"[^\u4e00-\u9fa5a-z0-9]+", "", s)
+        return s if len(s) >= 2 else ""
+    except Exception:
+        return ""
+
+
 def find_metrics(query: str, limit: int | None = 3) -> list[dict]:
     """按用户问题命中指标（最长匹配优先，避免矛盾口径同时注入）。
 
@@ -1665,6 +1708,63 @@ def find_metrics(query: str, limit: int | None = 3) -> list[dict]:
                 best = w.lower()
         if best:
             scored.append((len(best), best, m, q.find(best)))
+    def _count_fallback() -> list:
+        """数量问句的「语序无关」兜底（只在原匹配全空时调用）。
+
+        问题（实测驱动）：上面是对指标名/别名做**子串**匹配，语序一变就全漏。
+          「有多少台设备」是别名，命中；「一共有多少台设备」只是把「一共」放到了
+          前面，就一条都匹配不到 → 落到 LLM 直生 → 实测生成
+            SELECT COUNT(eqp_downtime_record.equipment_id) FROM eqp_downtime_record
+              JOIN dim_equipment … → 返回 336
+          336 是**停机记录条数**，而设备只有 48 台。答案错得很干脆，success=true，
+          页面上没有任何声明 —— 「问数量、被 JOIN 放大」这类错答最难被发现。
+        实测同一批常见问法里 9 条全部 MISS：「一共有多少台设备 / 一共有多少个工单 /
+          总共有多少产品 / 一共有多少道工序 / 有多少条缺陷记录 / 一共有多少条停机记录 /
+          有多少个仓库 / 一共多少台设备 / 咱们厂有多少设备」。
+
+        修法：把问句里的数量脚手架（一共/总共/现有/有/多少/几）与量词
+          （台/个/条/道/张/件/名/种）剥掉，剩下的「实体核」再与**计数类指标**
+          的名字核比对。只认名字以 数/数量/总数/台数 结尾的指标，所以「设备」
+          只会命中「设备数」，不会牵出「设备可用率」「设备故障停机占比」。
+
+        调用位置放在 ③④ 两道防偷换守卫**之后**：那两道判的是「命中词左侧是否残留
+          未注册口径的修饰语」，而本函数的前提已经换成「剥壳后实体核相等」，
+          再拿原句位置过一遍只是重复判定（实测「咱们厂有多少设备」就因此被二次杀掉）。
+        """
+        if not _COUNT_ASK_RE.search(q):
+            return []
+        _core = _count_question_core(q)
+        if not _core:
+            return []
+        _out: list[tuple[int, str, dict, int]] = []
+        for m in get_effective_metrics():
+            _nm = re.sub(r"\(.*?\)", "", m["name"]).strip()
+            if not _nm.endswith(("数量", "总数", "台数", "数")):
+                continue
+            _b = re.sub(r"(总数量|数量|总数|台数|数)$", "", _nm).strip()
+            if len(_b) < 2:
+                continue
+            # 必须**以实体核结尾**，不能是「包含」。
+            #   实测反例（重要）：「设备综合效率oee是多少」剥壳后 core="设备综合效率oee"，
+            #   用 `in` 判会把「设备」算命中 → 答「设备数=48」，而 OEE 根本没注册、
+            #   这题应该老实回退 LLM。这类「问 A 却命中 B 的实体名」的误命中比漏匹配更糟：
+            #   漏匹配只是答不出，误匹配是**答错还给得很肯定**。
+            if not _core.endswith(_b.lower()):
+                continue
+            # 实体名前面只允许挂「范围/组织」限定（咱们厂/我司/系统里/本厂），最多 2 字。
+            _pfx = _core[: len(_core) - len(_b)]
+            if len(_pfx) > 2 or any(ch not in "厂里司公我咱们系统本全集" for ch in _pfx):
+                continue
+            # pos 传 -1：兜底命中不参与③「左侧修饰语」判定。
+            #   那道守卫问的是「命中词左边是不是还挂着别的口径词」，而这里的前提
+            #   已经换成「剥掉脚手架后实体核相等」——左侧残留的必然是「多少/一共/
+            #   咱们厂」这类被刻意剥掉的脚手架，再判一次等于自相矛盾。
+            #   （_left_modifier_suspect 对 pos<=0 直接返回 False，不需要改守卫本身。）
+            _out.append((len(_b), _b.lower(), m, -1))
+        return _out
+    if not scored:
+        # 原匹配（含别名子串）全空 → 试数量问句兜底（2026-11-04，见 _count_fallback）
+        scored = _count_fallback()
     if not scored:
         return []
     # ③ 后缀式别名防偷换（2026-09-11 批测发现）：「一次合格率」「出货合格率」这类
@@ -1689,6 +1789,11 @@ def find_metrics(query: str, limit: int | None = 3) -> list[dict]:
             continue
         _kept.append((_ln, _w, _m))
     scored = _kept
+    if not scored:
+        # 两道防偷换守卫跑完仍全空 → 再试一次「数量问句」兜底（2026-11-04）。
+        # 放在这里而不是更早，是因为兜底的前提已经换成「剥壳后实体核相等」，
+        # 与③④判的是两件事；提前跑会被③再杀一遍（实测「咱们厂有多少设备」）。
+        scored = _count_fallback()
     if not scored:
         return []
     # ① 前缀状态口径最优先（全量命中里 query 以该词开头）：query 以精确口径词开头时

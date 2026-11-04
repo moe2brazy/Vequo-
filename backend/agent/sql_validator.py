@@ -67,6 +67,25 @@ def validate_sql_safety(sql: str, dialect: str = "postgres") -> tuple[bool, str,
         if re.search(rf'\b{kw}\b', upper_sql):
             return False, f"SQL 包含禁止关键词: {kw}", original
 
+    # 1-b. 危险函数（2026-11-02 补，与 db/executor._check_sql_safety 的能力对齐）
+    #   `SELECT pg_sleep(30)` 是纯 SELECT：既能过「必须以 SELECT 开头」，
+    #   也能过下方 sqlglot 的语句类型检查，但它会占住一个连接 30 秒 ——
+    #   低成本 DoS 面。执行层早已拦截，本校验器此前没拦，形成
+    #   「校验说安全、到执行层才被拒」的能力落差；investigator / insight_scan
+    #   都是「先 validate_sql_safety 再执行」的路径，落差不该留在这里。
+    #   ⚠ 只收**确定不该出现在查询里**的函数；current_setting / set_config 之类
+    #     行级过滤表达式里可能合法使用，故意不收，免得误伤既有租户配置。
+    dangerous_funcs = (
+        "PG_SLEEP", "PG_SLEEP_FOR", "PG_SLEEP_UNTIL", "SLEEP", "BENCHMARK",
+        "DBLINK", "DBLINK_EXEC", "PG_READ_FILE", "PG_READ_BINARY_FILE",
+        "PG_LS_DIR", "PG_STAT_FILE", "PG_WRITE_FILE",
+        "PG_TERMINATE_BACKEND", "PG_CANCEL_BACKEND", "PG_RELOAD_CONF",
+        "LO_IMPORT", "LO_EXPORT", "LOAD_FILE", "XP_CMDSHELL", "SP_EXECUTESQL",
+    )
+    for fn in dangerous_funcs:
+        if re.search(rf'\b{fn}\s*\(', upper_sql):
+            return False, f"SQL 包含禁止函数: {fn.lower()}", original
+
     # 2. 必须以 SELECT 或 WITH 开头
     cleaned = original.strip()
     if not (cleaned.upper().startswith("SELECT") or cleaned.upper().startswith("WITH")):

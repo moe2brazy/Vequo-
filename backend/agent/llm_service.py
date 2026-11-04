@@ -5048,6 +5048,84 @@ def _time_intent_exceeds_data(query: str, matched_tables: list):
         return None
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 问句语义分类（2026-11-02，896 条题库误伤复盘驱动）
+# ══════════════════════════════════════════════════════════════════════
+# 为什么单独拎出来：②.5「必须做除法」与 ②.5-b「必须做单位换算」两条守卫，
+#   判据都是「问句里出现了哪个词 → 所以它要的是比值」。但**词的表面形态
+#   不等于问句的语义**，实测有两类硬误伤（各在题库里被拒，实跑却是正解）：
+#     · v2#346「各设备的每次停多久」：`每次` 命中 `_RATIO_ASK_RE` → 判成率，
+#       要求除法。正确 SQL 就是 `AVG(downtime_minutes)`（实测 88 分钟/次），
+#       除法在这里**物理上无意义**（时长÷次数仍是时长，不是比率）。
+#     · v3#4「7月份的产量比6月份好还是差」：`产量比` 命中同一正则里的
+#       `[\u4e00-\u9fa5]{2,}比` 分支 → 判成比值。实际问的是两个时段的**优劣
+#       比较**，不是 A÷B。
+#   ⇒ 判定顺序改成：先问「这是不是时长问 / 比较问」，是就直接不进换算守卫。
+#   ⚠ 三道豁免都必须**同时**排除问句含明确比值词的情形 ——
+#     「本月不良率比上月高多少」既含「比」又是真比值，一豁免就漏拦。
+
+# 明确要求「比值」的词：出现即说明用户要的是 A÷B，任何豁免都不成立。
+_RATIO_WORD_RE = re.compile(r"率|占比|比例|比重|份额")
+
+# 问「一次持续多久」。**只认事件时长语义**：「多久 / 多长时间 / 时长」。
+#   刻意**不**收「每小时」「多少分钟」——「每条产线每小时投入多少件」里的
+#   「每小时」是**分母**（要除以小时数），若把它算进时长豁免，
+#   ②.5-b 整条守卫会当场失效。
+_DUR_LEN_RE = re.compile(r"多久|多长时间|时长|持续多长")
+
+# SQL 侧确认：投影里确实在对**时长列**做聚合（AVG(downtime_minutes) 之类）。
+#   与 ① 同时成立，才说明「这条 SQL 交出的答案本身就是一个时长」。
+_DUR_AGG_SQL_RE = re.compile(
+    r"\b(?:avg|sum|min|max|round|percentile_cont|percentile_disc)\s*\(\s*[\w\.\"]*"
+    r"(?:minute|hour|second|day|duration|downtime|lead_time|cycle_time|elapsed)"
+    r"[\w\"]*", re.I)
+
+# 比较型问法：「A 比 B 好/差/高/低/多/少」——要的是两个值的**差**或**优劣**。
+#   两个约束缺一不可：
+#     ① 「比」后面必须跟**比较对象**（名词/数字/时段），不能紧跟 是/为/有/多少——
+#        否则「投入产出比**是多少**」会被误判成比较句（「是多少」里的「多」
+#        被当成了评价词），实测就是这样把「投入产出比」这条真比值放行的。
+#     ② 比较对象之后必须出现评价词（好/差/高/低/多/少/快/慢/强/弱/大/小）。
+_CMP_ASK_RE = re.compile(
+    r"比(?!是|为|有|多少|例|重|值|率|数)[\u4e00-\u9fa5A-Za-z0-9]{1,6}"
+    r"(?:好|差|高|低|多|少|快|慢|强|弱|大|小)")
+
+
+def _is_duration_event_ask(query: str, sql: str) -> bool:
+    """问句是「一次持续多久」且 SQL 确实在聚合时长列 → True。
+
+    两条同时成立才为真（缺一不可，宁可漏豁免也不误放）：
+      ① 问句要时长（多久/多长时间/时长），且**不含**明确的比值词；
+      ② 投影区里对时长列做了聚合。
+    ② 的作用：若 SQL 根本没在算时长，那它压根没在答这道题，
+    该交给别的守卫处理，这里不能替它开脱。
+    """
+    try:
+        q = str(query or "")
+        s = str(sql or "")
+        if not q or not s:
+            return False
+        if _RATIO_WORD_RE.search(q):
+            return False
+        if not _DUR_LEN_RE.search(q):
+            return False
+        proj = re.split(r"\bfrom\b", s, maxsplit=1, flags=re.I)[0]
+        return bool(_DUR_AGG_SQL_RE.search(proj))
+    except Exception:
+        return False
+
+
+def _is_comparison_ask(query: str) -> bool:
+    """问句是「A 比 B 好/差」这种**比较**（要差/要优劣），而不是要 A÷B。"""
+    try:
+        q = str(query or "")
+        if not q or _RATIO_WORD_RE.search(q):
+            return False
+        return bool(_CMP_ASK_RE.search(q))
+    except Exception:
+        return False
+
+
 # 「每X」单位词 → 必须除以的那个量（仅用于提示文案，不参与拦截判据）
 _UNIT_PER = (
     ("每小时", "小时数（或明确声明按 24 小时/班次折算）"),
@@ -5105,6 +5183,12 @@ def _unit_conversion_reason(query: str, sql: str) -> str:
         q = str(query or "")
         s = str(sql or "")
         if not q or not s:
+            return ""
+        # ★ 2026-11-02：时长问不是换算问。
+        #   「每台设备的平均停机时长」问的是**时长本身**，正确 SQL 是
+        #   AVG(downtime_minutes)。旧实现要求「时长 ÷ 设备台数」——
+        #   这个量物理上没有意义（分/台不是任何业务指标），属硬误伤。
+        if _is_duration_event_ask(q, s):
             return ""
         units = [(w, d) for w, d in _UNIT_PER if w in q]
         if not units:
@@ -5244,12 +5328,19 @@ def _all_output_quality_reasons(query: str, sql: str) -> list:
 _JOIN_KEY_VALUES: dict = {}          # "表.列" -> [样本值...]
 _JOIN_KEY_CACHE_DONE = [False]
 
+# 采样条数（2026-11-02：3 → 20）。
+#   样本只当「便宜的预筛」用：预筛说有交集就一定真有（样本交集 ⊆ 真实交集，
+#   这条推断是**可靠**的）；预筛说没交集则**不可靠**，必须再实测。
+#   3 条对 8 个值的域都会错开，20 条能覆盖本库绝大多数维度列，
+#   把昂贵的实测查询压到极少数情况下。改它不影响正确性，只影响开销。
+_JOIN_SAMPLE_LIMIT = 20
 
-def _sample_column_values(col: str, limit: int = 3):
+
+def _sample_column_values(col: str, limit: int = _JOIN_SAMPLE_LIMIT):
     """取某列的样本值（去重、非空）。
 
     一次缓存、全批复用 —— 每条 SQL 最多十几个 JOIN 条件，
-    每个列采一次 3 行，全走 `SELECT DISTINCT col FROM t LIMIT 3`，很轻。
+    每个列采一次 20 行，全走 `SELECT DISTINCT col FROM t LIMIT 20`，很轻。
     """
     global _JOIN_KEY_VALUES
     if col in _JOIN_KEY_VALUES:
@@ -5291,15 +5382,64 @@ def _resolve_table_of_column(sql: str, alias: str, col: str):
     return None
 
 
+_JOIN_PROBE_CACHE: dict = {}   # (ta,ca,tb,cb) -> True=确认连不上 / False=有行或测不了
+
+
+def _probe_join_empty(ta: str, ca: str, tb: str, cb: str) -> bool:
+    """**实测**这两列能不能连上：`SELECT 1 FROM ta JOIN tb ON ta.ca = tb.cb LIMIT 1`。
+
+    为什么必须有这一层（2026-11-02 实测驱动）：
+      旧实现只靠「各取几个样本值，看集合有没有交集」推断"跨域"。
+      但样本是**抽样**，交集为空只说明"没抽到"，不等于"不存在"。实测反例：
+        qms_defect_detail.responsible_process_id ∈ {PR03, PR06, PR07, PR08}
+        dim_process.process_id                    ∈ {PR01 … PR08}
+        各取 3 个恰好错开 → 判「两者永不相等，必定返回 0 行」，
+        而真实 JOIN 返回 **2115 行**。于是「各工序的缺陷数」被拦，
+        实测正确答案：老化测试 701 / 功能测试 695 / AOI检测 369。
+      这种"时对时错、还说得斩钉截铁"的判定比全错更糟——
+      管理员会当真，把正确答案当成错误去改。
+
+    ⇒ 架构改成**快筛 + 实测**：采样无交集后再跑一次 `LIMIT 1` 的实测，
+      只有真的一行都连不上才判拦。于是"必定返回 0 行"这句话**永远是真的**。
+
+    返回：True = 确认连不上（可据此判拦）；
+          False = 有行 / 查询失败 / 标识符非法（一律放行，fail-open）。
+    """
+    key = (ta.lower(), ca.lower(), tb.lower(), cb.lower())
+    if key in _JOIN_PROBE_CACHE:
+        return _JOIN_PROBE_CACHE[key]
+    _JOIN_PROBE_CACHE[key] = False        # 先占位，防递归
+    empty = False
+    try:
+        for _ident in (ta, ca, tb, cb):
+            if not re.match(r"^[A-Za-z_]\w*$", _ident or ""):
+                return False
+        # 两侧都套上别名 a/b：两表有同名列时，裸列名会报"列引用有歧义"。
+        _q = ('SELECT 1 AS hit FROM "%s" a JOIN "%s" b '
+              'ON a."%s" = b."%s" LIMIT 1' % (ta, tb, ca, cb))
+        _r = execute_sql(_q)
+        if isinstance(_r, dict) and _r.get("success"):
+            empty = not (_r.get("rows") or [])
+    except Exception:
+        empty = False
+    _JOIN_PROBE_CACHE[key] = empty
+    return empty
+
+
 _JOIN_CROSS_DOMAIN_RE = re.compile(
     r'([\w"]+)\.\"?(\w+)\"?\s*=\s*([\w"]+)\.\"?(\w+)\"?')
 
 
 def _join_cross_domain_reason(query: str, sql: str) -> str:
-    """JOIN 两端的键**值域不相交**→ 返回可读原因；否则 ""（通过）。
+    """JOIN 两端**实测**连不上任何一行 → 返回可读原因；否则 ""（通过）。
 
-    只在「等值 JOIN 的两侧列都能采到样本，且样本值集合无交集」时才判拦。
-    采不到值（表不存在/列不存在/全是NULL）一律放行 —— 宁可漏过也不误伤。
+    判定分两步，缺一不可（2026-11-02 重构，见 `_probe_join_empty` 的注释）：
+      ① 采样快筛：两侧各取 20 个样本，**有交集就直接放行**
+         （样本交集 ⊆ 真实交集，这一步的推断是可靠的，且几乎零成本）；
+      ② 实测确认：快筛无交集时再跑 `... JOIN ... LIMIT 1`，
+         真的连不上一行才判拦。
+    采不到值（表不存在 / 列不存在 / 全是 NULL / 查询失败）一律放行 ——
+    宁可漏过，也不拿一个没验证过的结论去否掉正确答案。
     """
     try:
         s = re.sub(r"\s+", " ", str(sql or ""))
@@ -5320,16 +5460,20 @@ def _join_cross_domain_reason(query: str, sql: str) -> str:
             if not _va or not _vb:
                 continue
             _sa, _sb = set(_va), set(_vb)
-            # 有交集 → 同域，正常 JOIN，放行
+            # 有交集 → 同域，正常 JOIN，放行（样本交集必然是真实交集的子集）
             if _sa & _sb:
                 continue
-            # 无交集 → 两列取值形态都摆出来了，仍然不相交 ⇒ 跨域
-            return ("JOIN 两侧的键值域完全不相交：`%s.%s` 的取值形如 %s，"
-                    "`%s.%s` 的取值形如 %s，两者永不相等，这条 JOIN 必定返回 0 行。"
-                    "请换成真正对应的主键/外键（缺陷要归到产线，"
-                    "需经 qms_inspection.work_order_id → mes_work_order.line_id，"
-                    "qms_defect_detail 自身没有产线字段）。"
-                    % (_ta, _ca, "/".join(sorted(_sa)[:2]), _tb, _cb, "/".join(sorted(_sb)[:2])))
+            # 样本无交集只是"没抽到"，不构成证据 ⇒ 再做实测确认
+            if not _probe_join_empty(_ta, _ca, _tb, _cb):
+                continue
+            # 实测真的连不上一行 ⇒ 这条 JOIN 恒定返回 0 行，判拦（结论有事实支撑）
+            return ("JOIN 两侧的键连不上：实测执行 `%s.%s = %s.%s` 的等值关联，"
+                    "一行都匹配不到（`%s.%s` 取值形如 %s，`%s.%s` 取值形如 %s），"
+                    "这条 JOIN 会恒定返回 0 行，得到的空结果不是「没数据」而是写错了关联。"
+                    "请换成真正对应的主键/外键。"
+                    % (_ta, _ca, _tb, _cb,
+                       _ta, _ca, "/".join(sorted(_sa)[:2]),
+                       _tb, _cb, "/".join(sorted(_sb)[:2])))
     except Exception:
         return ""
     return ""
@@ -5536,6 +5680,12 @@ def _ratio_without_division_reason(query: str, sql: str) -> str:
         q = str(query or "")
         s = str(sql or "")
         if not q or not s:
+            return ""
+        # ★ 2026-11-02：两类问法被「每X / X比」的表面词误判成「要比值」。
+        #   · 时长问（「每次停多久」）→ 答案本身就是时长，除法无意义；
+        #   · 比较问（「7月份比6月份好还是差」）→ 要的是优劣/差值，不是 A÷B。
+        #   实测共 3 条误伤（v2#346、v2#347、v3#4），全部在此放行。
+        if _is_duration_event_ask(q, s) or _is_comparison_ask(q):
             return ""
         if _RATIO_EXEMPT_RE.search(q):
             return ""
@@ -7534,6 +7684,14 @@ class LLMService:
         self.ontology_hint = ""
         # 语义缓存：本轮是否命中（命中则执行成功后不再重复沉淀）
         self._semantic_hit = False
+        # 2026-11-04 修（真 bug，实测复现）：`_expr_rule_hit` 与 `_fallback_accepted`
+        #   原先只在 run() 中段才被赋值，但**语义缓存命中路径**在它之前就跳到了执行段，
+        #   执行失败后进入修复链时会读 `self._expr_rule_hit` → AttributeError。
+        #   实测触发：命中缓存的 SQL 执行报错（列不存在/连接抖动）→ 请求不是走修复重试，
+        #   而是直接抛异常，前端只看到「分析失败」，且原因与真实故障无关。
+        #   在 __init__ 里给默认值：未跑到赋值点 = 不是表达式规则命中，语义上就是 False。
+        self._expr_rule_hit = False
+        self._fallback_accepted = False
         # 步骤事件记录：run() 实际产生的步骤（供 _build_response 返回，避免硬编码不一致）
         self._steps: list[dict] = []
         # 评价 Agent（白泽式四 Agent 闭环第四环）：结果质量分 / 评价明细 / 是否交叉比对过
@@ -8416,6 +8574,10 @@ class LLMService:
                     _sql = ""
                     _rejected_fallback = ""      # 闸门打标后被弃用的 SQL（保底用，见下）
                     _why_q = ""                  # 被质量闸门拒绝的原因（透传给兜底重生成）
+                    # 2026-11-02：兜底放行标记。为 True 表示当前 self.sql 来自直生兜底，
+                    # 质量闸门对它只记录不否决（详见下方 8513 起的说明）。
+                    # 每轮生成开始时必须重置，否则上一轮（或上一个问题）的放行状态会漏到本轮。
+                    self._fallback_accepted = False
                     # ── 2026-10-06：确定性表达式规则链（**最先一步，零 LLM**）──
                     # 位置很关键。原先 `_try_expr_rules` 只挂在
                     # `_infer_analysis_confirm()` → `infer_query_analysis` 里，
@@ -8513,45 +8675,39 @@ class LLMService:
                         if _sql:
                             _why_dg = _output_quality_reason(self.query, _sql)
                             if _why_dg:
-                                # 同上：兜底产出也先试确定性修复，再判是否弃用。
+                                # 兜底产出先试确定性修复：能零成本改好就改好
                                 _dg_fired: list = []
                                 _dg_repaired = apply_output_fixes(
                                     self.query, _sql, _dg_fired)
-                                _dg_why2 = ""
                                 if _dg_repaired and _dg_repaired != _sql:
-                                    try:
-                                        _dg_why2 = _output_quality_reason(
-                                            self.query, _dg_repaired)
-                                    except Exception:
-                                        _dg_why2 = "unknown"
-                                if _dg_repaired and _dg_repaired != _sql \
-                                        and not _dg_why2:
                                     for _nm in _dg_fired:
                                         yield _step("SQL校验",
                                                     _FIX_STEP_MSG.get(_nm, _nm))
                                     _sql = _dg_repaired
-                                else:
-                                    _dg_all = []
-                                    try:
-                                        _dg_all = _all_output_quality_reasons(
-                                            self.query, _sql)
-                                    except Exception:
-                                        _dg_all = []
-                                    yield _step(
-                                        "SQL校验",
-                                        "直生兜底产出同样未通过质量检查（%s）→ 弃用，"
-                                        "不拿错口径去执行" % _why_dg[:40])
-                                    # 记下原因：供错误出口判断该不该说"区间无数据"，
-                                    # 以及让后续修复链知道上一版错在哪。
-                                    self._rejected_sql_reason = _why_dg
-                                    self._rejected_sql_reasons_all = _dg_all
-                                    _sql = ""
-                                    # ⚠ 不恢复 _sql：它同样没过守卫。
-                                    #   本项目是 fail-close 取向 —— 宁可如实说明，
-                                    #   也不拿一个已知口径错的查询去出数。
-                                    #   首生那条是否恢复，由下面的
-                                    #   `if not _sql and _rejected_fallback` 分支
-                                    #   重新过守卫后自行决定。
+                                # 2026-11-02 策略变更：**兜底不再二次否决**。
+                                # 旧行为：兜底产出仍过同一把质量闸门，不过就置空 →
+                                #   用户看到「未能产出可用的查询 SQL」，提示换模型也没用。
+                                #   实测「库存里哪个设备最少」：两轮兜底分别写
+                                #   ON product_id = equipment_id / equipment_code，
+                                #   都被「JOIN 两侧键值域不相交」拒，5.0s 返回 None。
+                                # 新行为：首生仍然过闸门（上面那段一行没动），但走到兜底
+                                #   说明模型已经拿过两次机会；此时「没有答案」比「不完美的
+                                #   答案」更伤，所以照常执行，只把原因记下来供下游使用。
+                                # 已知代价（明确接受）：口径错但能跑的 SQL 会出数。
+                                #   安全类校验不受影响 —— 只读语句、列名存在性、逗号连接、
+                                #   截断判定仍在 _run_escape_sql_v2._valid 里拦，
+                                #   那些是会执行报错或不安全的，不能放。
+                                self._rejected_sql_reason = _why_dg
+                                try:
+                                    self._rejected_sql_reasons_all = \
+                                        _all_output_quality_reasons(self.query, _sql)
+                                except Exception:
+                                    self._rejected_sql_reasons_all = []
+                                self._fallback_accepted = True
+                                yield _step(
+                                    "SQL校验",
+                                    "兜底产出未完全通过口径检查（%s），按兜底策略照常执行"
+                                    % _why_dg[:40])
                     if not _sql and _rejected_fallback:
                             # ⚠ 2026-10-06 修（实测 P0）：这条「保底回退」原本
                             # **无条件**把被守卫拒绝的 SQL 捞回来，等于给守卫开了个后门。
@@ -9149,7 +9305,10 @@ class LLMService:
                     # 退化候选直接跳过（2026-09-15）：多候选择优是**免费**的拒绝点——换一个候选即可，
                     # 不额外调用 LLM。实测 v4 #6「既在7月生产过又出现过停机的产线」的
                     # `SELECT * FROM dim_production_line LIMIT 20` 就是从这个循环被采纳的。
-                    if _output_quality_reason(self.query, cand):
+                    # 2026-11-02：兜底放行的 SQL 不再被质量闸门挑掉
+                    #（否则刚放行的兜底会在候选循环里再次被弃，改了等于没改）
+                    if (not getattr(self, "_fallback_accepted", False)
+                            and _output_quality_reason(self.query, cand)):
                         continue
                     yield {"type": "sql", "sql": self.sql}
                     self.sql_result = self._exec_sql(self.sql)
@@ -9280,7 +9439,9 @@ class LLMService:
                     # 位置很重要：放在**择优/重试**环节是安全的（换候选或再修一轮即可）；
                     # 放在"唯一产出后直接拒绝"会因思考型模型耗尽预算把 WRONG 变成 GEN_FAIL
                     # （实测 4/6 → 3/6，已回退过）。
-                    if ok:
+                    # 2026-11-02：兜底放行的 SQL 执行后不再按质量判"答非所问"回炉，
+                    # 否则会在这里 continue 进修复循环，绕一圈又回到「未能产出」。
+                    if ok and not getattr(self, "_fallback_accepted", False):
                         _qwhy = _output_quality_reason(self.query, self.sql)
                         if _qwhy:
                             self.sql_result = {"success": False,
@@ -15260,7 +15421,8 @@ def _direct_gen_sql(query: str, matched_tables: list, budget_s: float = 45.0,
         if _rr:
             _extra = (f"【上一版 SQL 已被质量检查拒绝，以下问题必须在本次生成中修正】\n"
                       f"{_rr[:300]}\n\n") + _extra
-        return _run_escape_sql_v2(query, _tables_desc, _slim_schema, _extra, limit_s=budget_s)
+        return _run_escape_sql_v2(query, _tables_desc, _slim_schema, _extra,
+                                  limit_s=budget_s, quality_gate=False)
     except Exception:
         return None
 
@@ -15268,7 +15430,8 @@ def _direct_gen_sql(query: str, matched_tables: list, budget_s: float = 45.0,
 def _run_escape_sql_v2(query: str, tables_desc: str, slim_schema: str,
                          enum_block: str, limit_s: float = 20.0,
                          model: str | None = None, api_key: str | None = None,
-                         base_url: str | None = None) -> str | None:
+                         base_url: str | None = None,
+                         quality_gate: bool = True) -> str | None:
     """逃生直生 v2：首次生成若因 `FROM a, b` 逗号连接被语义拦截，
     带纠错提示（强制 JOIN ... ON）重试一轮 —— 复杂多表题实测常栽在这条，
     旧版直接弃用导致「AI 未能生成 SQL」。
@@ -15407,9 +15570,13 @@ def _run_escape_sql_v2(query: str, tables_desc: str, slim_schema: str,
             pass
         # 输出质量闸门（2026-09-15 高价值题库实测驱动）：拦「能跑通但答非所问」的退化输出。
         # 判据集中在模块级 _output_quality_reason，主链 run() 调用同一份，避免两套逻辑漂移。
-        _why_quality = _output_quality_reason(query, s_sql)
-        if _why_quality:
-            return _why_quality
+        # 2026-11-02：quality_gate=False 时跳过这一道（直生兜底路径），
+        #   理由见主链 8513 起的注释 —— 兜底是最后一次机会，宁可出数不出白卷。
+        #   注意只跳质量判定；上面的只读安全、逗号连接、截断、列名存在性照常拦。
+        if quality_gate:
+            _why_quality = _output_quality_reason(query, s_sql)
+            if _why_quality:
+                return _why_quality
         try:
             _bad_cols = _validate_sql_columns(s_sql)
             if _bad_cols:
@@ -16909,6 +17076,19 @@ def clear_cache() -> int:
         _build_schema_fast_impl.cache_clear()
     except Exception:
         pass
+    # schema/数据派生的「事实缓存」（2026-11-02 补）。
+    #   这几份缓存记的是「某库某列长什么样」「某两个键能不能连上」，切库后全部失效。
+    #   此前只在进程重启时自然清空，切库后仍拿旧库的结论用 ——
+    #   尤其 `_JOIN_PROBE_CACHE` 存的是**实测结论**：一旦残留，就会用旧库的
+    #   「连不上」去否定新库里本来能连的 JOIN，直接从"漏拦"升级成"误拦"。
+    for _cache_name in ("_JOIN_KEY_VALUES", "_JOIN_PROBE_CACHE",
+                        "_COL_UNIQUE_CACHE", "_ALL_PK_CACHE"):
+        _c = globals().get(_cache_name)
+        if _c is not None:
+            try:
+                _c.clear()
+            except Exception:
+                pass
     return n
 
 

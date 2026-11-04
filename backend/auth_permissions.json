@@ -14,13 +14,6 @@
       "description": "只读查询，受数据权限约束",
       "priority": 20,
       "system": true
-    },
-    {
-      "key": "analyst",
-      "name": "分析师",
-      "description": "数据分析岗（测试期望角色）",
-      "priority": 40,
-      "system": false
     }
   ],
   "datasets": [
@@ -61,20 +54,9 @@
       "key": "inventory",
       "name": "库存域",
       "tables": [
-        "inv_inventory_snapshot",
-        "test_materials"
+        "inv_inventory_snapshot"
       ],
       "description": "库存快照与物料（含成本价，敏感）",
-      "sensitive": true
-    },
-    {
-      "key": "sales",
-      "name": "销售域",
-      "tables": [
-        "test_orders",
-        "test_factories"
-      ],
-      "description": "订单与工厂（含客户、单价，敏感）",
       "sensitive": true
     }
   ],
@@ -91,12 +73,6 @@
             "mask": "partial_1_1",
             "agg_ok": false
           }
-        },
-        "test_materials": {
-          "unit_cost": {
-            "mode": "deny",
-            "note": "成本价对普通员工不可见"
-          }
         }
       },
       "metrics": {},
@@ -109,16 +85,10 @@
   },
   "sensitive": {
     "columns": [
-      "test_materials.unit_cost",
-      "test_orders.unit_price",
-      "test_orders.customer_name",
       "dim_production_line.line_manager"
     ],
-    "metrics": [
-      "产量"
-    ],
+    "metrics": [],
     "datasets": [
-      "sales",
       "inventory"
     ]
   },

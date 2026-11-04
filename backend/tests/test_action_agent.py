@@ -22,36 +22,36 @@ check("A2 动作含参数 schema", all("params" in a for a in acts), "")
 check("A3 不泄漏目标表白名单外字段", all("target_table" not in a for a in acts), "")
 
 print("═══ B. 确定性编译（SQL 由注册表生成，LLM 不碰）═══")
-r = A.compile_action("update_safety_stock", {"product_id": "P001", "safety_stock": 100})
+r = A.compile_action("update_safety_stock", {"product_id": "P001", "safety_stock_qty": 100})
 check("B1 编译成功", r["success"], r.get("error", ""))
 check("B2 SQL 是 UPDATE", r["sql"].upper().startswith("UPDATE"), r["sql"])
 check("B3 参数化绑定（无值拼接）", ":" in r["sql"] and "100" not in r["sql"] and "P001" not in r["sql"],
       r["sql"])
-check("B4 绑定参数正确", r["bind_params"].get("s_safety_stock") == 100
+check("B4 绑定参数正确", r["bind_params"].get("s_safety_stock_qty") == 100
       and r["bind_params"].get("w_product_id") == "P001", str(r["bind_params"]))
 
 r = A.compile_action("update_order_status", {"order_id": 5, "status": "已完成"})
 check("B5 int 参数转换", r["bind_params"].get("w_order_id") == 5, str(r["bind_params"].get("w_order_id")))
-check("B6 number 参数 int 化", A.compile_action("update_safety_stock", {"product_id": "P1", "safety_stock": 50})["bind_params"]["s_safety_stock"] == 50, "")
+check("B6 number 参数 int 化", A.compile_action("update_safety_stock", {"product_id": "P1", "safety_stock_qty": 50})["bind_params"]["s_safety_stock_qty"] == 50, "")
 
 print("═══ C. 编译校验（防错 / 防越权）═══")
 check("C1 未知动作拒绝", not A.compile_action("drop_table", {})["success"], "")
 check("C2 缺必填参数拒绝", not A.compile_action("update_safety_stock", {"product_id": "P1"})["success"],
       A.compile_action("update_safety_stock", {"product_id": "P1"})["error"])
-check("C3 缺定位条件拒绝", not A.compile_action("update_safety_stock", {"safety_stock": 1})["success"], "")
-check("C4 非法数值拒绝", not A.compile_action("update_safety_stock", {"product_id": "P1", "safety_stock": "abc"})["success"], "")
-check("C5 空字符串值拒绝", not A.compile_action("update_safety_stock", {"product_id": "  ", "safety_stock": 1})["success"], "")
+check("C3 缺定位条件拒绝", not A.compile_action("update_safety_stock", {"safety_stock_qty": 1})["success"], "")
+check("C4 非法数值拒绝", not A.compile_action("update_safety_stock", {"product_id": "P1", "safety_stock_qty": "abc"})["success"], "")
+check("C5 空字符串值拒绝", not A.compile_action("update_safety_stock", {"product_id": "  ", "safety_stock_qty": 1})["success"], "")
 # 注入尝试：字符串参数走绑定，不会被当 SQL 执行
 r = A.compile_action("update_order_status", {"order_id": 1, "status": "x'; DROP TABLE t; --"})
 check("C6 注入串不破坏 SQL 结构", r["success"] and "DROP" not in r["sql"], r.get("sql", ""))
 
 print("═══ D. 执行闸门 ═══")
 check("D1 总开关关闭时拒绝执行", not A.execute_action("update_safety_stock",
-      {"product_id": "P1", "safety_stock": 1}, confirmed=True)["success"],
-      A.execute_action("update_safety_stock", {"product_id": "P1", "safety_stock": 1}, confirmed=True)["error"][:40])
+      {"product_id": "P1", "safety_stock_qty": 1}, confirmed=True)["success"],
+      A.execute_action("update_safety_stock", {"product_id": "P1", "safety_stock_qty": 1}, confirmed=True)["error"][:40])
 A._WRITE_ENABLED = True
 try:
-    r = A.execute_action("update_safety_stock", {"product_id": "P1", "safety_stock": 1}, confirmed=False)
+    r = A.execute_action("update_safety_stock", {"product_id": "P1", "safety_stock_qty": 1}, confirmed=False)
     check("D2 未二次确认拒绝", not r["success"] and r.get("needs_confirm") is True, str(r)[:80])
     check("D3 未知动作执行拒绝", not A.execute_action("nope", {}, confirmed=True)["success"], "")
 finally:
