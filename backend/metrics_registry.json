@@ -838,6 +838,34 @@
     "valid_to": ""
   },
   {
+    "name": "库存最多的仓库",
+    "aliases": [
+      "库存最多的仓库",
+      "库存量最大的仓库",
+      "哪个仓库库存最多",
+      "哪个仓库库存量最大",
+      "库存最高的是哪个仓库",
+      "仓库库存最多的是哪个",
+      "库存最多的仓"
+    ],
+    "unit": "件",
+    "tables": [
+      "inv_inventory_snapshot"
+    ],
+    "sql_expression": "SUM(available_qty + frozen_qty) FILTER (WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot))",
+    "formula": "Σ(可用数量 + 冻结数量)，按仓库分组取最大",
+    "exec_sql": "SELECT warehouse_code AS \"仓库\", SUM(available_qty + frozen_qty) AS \"库存量\" FROM inv_inventory_snapshot WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) GROUP BY warehouse_code ORDER BY \"库存量\" DESC LIMIT 1",
+    "exec_sql_by_dim": {
+      "仓库": "SELECT warehouse_code AS \"仓库\", SUM(available_qty + frozen_qty) AS \"库存量\" FROM inv_inventory_snapshot WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM inv_inventory_snapshot) GROUP BY warehouse_code ORDER BY \"库存量\" DESC LIMIT 1"
+    },
+    "description": "库存量最大的仓库（最新快照日）。yans 基准：WH-A 43187 件。⚠ 口径必须是「最新快照日」，inv_inventory_snapshot 是每日快照，不加快照过滤直接 SUM 会把 45 天累加成 119 万（差 27 倍）——2026-11-05 实测「库存最多的仓库是哪个」零命中走 LLM 时就是这个错数字，而同一库的「各仓库的库存量」走编译器给 43187，两个问法自相矛盾。",
+    "dims": [
+      "仓库"
+    ],
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
     "name": "未完工工单数",
     "aliases": [
       "在制单",

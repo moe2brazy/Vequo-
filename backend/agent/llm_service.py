@@ -13274,8 +13274,18 @@ def _rule_insight(rows: list[dict], cols: list[str]) -> str:
         # 单行结果（TOP1/单值聚合）：点出对象与取值，不复述合计/平均/中位数这种同义反复。
         # 2026-10-02（用户反馈）：原「inactive_count为 1」太干瘪——把维度对象的取值带上，
         # 直接回应"哪个 X 最多"式问法（如「产品名称「传感器30」的 未启用数量为 1」）。
+        # 关联键列（xxx_id）是分组用的辅助列，不是业务对象：
+        # `_fix_group_key_superset` 会为下钻补一列 `d.line_id`，原实现直接取 dim_cols[:2]，
+        # 于是「不良率最高的产线」的结论被写成
+        #   「产线「一车间-4号线」、产线ID（line_id）「L04」的不良率为 3.50」
+        # ——把关联键当成第二个业务对象念出来，读数像两个东西并列。
+        # 优先取非 _id 列；若整张结果只有 _id 一种维度（用户就问 ID），才退回用它。
+        _obj_dims = [d for d in dim_cols
+                     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*_id", str(d))]
+        if not _obj_dims:
+            _obj_dims = dim_cols[:1]
         _obj = "、".join(
-            f"{disp[d]}「{sample[0].get(d, '')}」" for d in dim_cols[:2]
+            f"{disp[d]}「{sample[0].get(d, '')}」" for d in _obj_dims[:2]
             if str(sample[0].get(d, "")).strip() != "")
         lines.append(f"· {_obj + '的' if _obj else ''}{disp[mc]}为 {_fmt(vals[0])}。")
         # 2026-11-04：单行结果里若还带别的数值列（「总投入量和合格量」这类并列问法），一并写出来。
@@ -13303,7 +13313,11 @@ def _rule_insight(rows: list[dict], cols: list[str]) -> str:
     # 3) 排名 / 时间对比（有维度列 + 至少 2 行可比时才给，单行聚合给排名没意义）
     ranked: list[tuple] = []
     ordered: list[tuple] = []
-    dcol = dim_cols[0] if dim_cols else ""
+    # 同一处理用在排名维度上：SQL 的列顺序不能决定"按哪个维度讲"——
+    # 结果里同时有 line_id 和 line_name 时，要按 line_name 讲业务排名。
+    _dim_cands = [d for d in dim_cols
+                  if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*_id", str(d))]
+    dcol = ((_dim_cands or dim_cols)[0] if dim_cols else "")
     # 时间维度（月/日/周/年）讲趋势：比"排名"更重要的是变化方向，故换标题与结论口径
     is_time_dim = any(k in str(dcol) for k in ("月", "日", "年", "周", "季", "date", "time"))
     if dcol:

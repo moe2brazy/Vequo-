@@ -938,16 +938,33 @@ def _explicit_value_filters(query: str, fact: str) -> list[str]:
                     if cond not in out:
                         out.append(cond)
                         seen_vals.add(val)
-                break
+                    break
+                continue   # 2026-11-05：本表没这列 → 换下一个来源试，别直接放弃
             base = tab[4:] if tab.startswith("dim_") else tab
             jkey = f"{base}_id"
+            # 2026-11-05 修复：`dim_production_line` 去前缀得 `production_line`，
+            # 机械拼出 `production_line_id` —— 而事实表里的关联键一直叫 `line_id`
+            # （mes_process_output.line_id / eqp_downtime_record.line_id）。
+            # 只在推导键确实不存在时才回退，不影响 dim_product/dim_equipment/dim_process。
+            if jkey not in fact_cols:
+                _alt = base.split("_")[-1] + "_id"
+                if _alt in fact_cols:
+                    jkey = _alt
             if jkey in fact_cols and _safe_ident(col) and _safe_ident(tab) and _safe_ident(jkey):
                 cond = (f"EXISTS (SELECT 1 FROM {tab} _v WHERE _v.{jkey} = f.{jkey} "
                         f"AND _v.{col} = '{_esc_sql_literal(val)}')")
                 if cond not in out:
                     out.append(cond)
                     seen_vals.add(val)
-            break
+                break
+            # 2026-11-05（关键）：这里原先是**无条件 break** —— 也就是「只试第一个来源表」。
+            # 而倒排索引里同一个值往往出现在多张表的同名列上，第一个来源未必能 JOIN 到本次
+            # 事实表：`L04` 的第一来源是 dim_equipment.line_id（mes_process_output 没有
+            # equipment_id），一步就 break，后面的 dim_production_line.line_id 根本没机会试。
+            # 实测代价：「L04产线的产量是多少」编译成「各产线的产量」，返回全部 5 条产线
+            # ——问一条答五条，compiled/success 全 True，看不出异常。
+            # 改为「这个来源用不上就换下一个」，命中即止。
+            continue
         if len(out) >= 2:   # 最多两个点名值，避免 prompt/SQL 膨胀
             break
     return out
@@ -956,6 +973,47 @@ def _explicit_value_filters(query: str, fact: str) -> list[str]:
 def _esc_sql_literal(v: str) -> str:
     """SQL 字符串字面量转义（单引号翻倍）。值来自库内真实枚举，此处只做防御。"""
     return str(v or "").replace("'", "''")
+
+
+# ── 点名了「不存在的产线编码」─────────────────────────────────────────────
+# 病根（2026-11-05 实测）：「L99产线的产量是多少」→ 返回**全部 5 条产线**的产量排名。
+#   `_explicit_value_filters` 只认「库里逐字存在的值」，L99 查不到 → 一个过滤条件都不加
+#   → 退化成「各产线的产量」，compiled=True、success=true、数字全对得上、毫无提示。
+#   用户问一条产线，系统答了五条；若问的是不存在的实体，还等于凭空给了个总数。
+# 判据刻意做窄（宁可不判，不可误判）：
+#   ① 只认 L\d{1,3} / LINE-\d{1,3} 这种**编码型**产线号（自然语言里的"三号线"不碰）；
+#   ② 问句里必须同时出现「产线/线」，确认这个编码是在说产线；
+#   ③ 只有倒排索引里**确实收录了 line_id 列**时才敢判「不存在」——
+#      索引不可用/未收录（如设备编码 equipment_id 就没进索引）一律放过，
+#      否则会把真实实体判成不存在，把有数据的题全答成 0 行。
+_LINE_CODE_RE = re.compile(r"(?<![A-Za-z0-9])(L\d{1,3}|LINE-\d{1,3})(?![A-Za-z0-9])", re.I)
+
+
+def _nonexistent_line_code(query: str) -> str | None:
+    """问句点名了库里不存在的产线编码 → 返回该编码；无法判定时返回 None。"""
+    q = str(query or "")
+    if not q:
+        return None
+    if "产线" not in q and "线" not in q:
+        return None
+    m = _LINE_CODE_RE.search(q)
+    if not m:
+        return None
+    try:
+        from agent.llm_service import _literal_table_index
+        idx = _literal_table_index() or {}
+    except Exception:
+        return None
+    if not idx:
+        return None
+    has_line_col = any(str(e[1]).lower() == "line_id"
+                       for ents in idx.values() for e in (ents or []))
+    if not has_line_col:
+        return None
+    tok = m.group(1).strip().upper()
+    if any(str(k).strip().upper() == tok for k in idx.keys()):
+        return None
+    return m.group(1).strip()
 
 
 def _drill_value_exists(val: str) -> bool:
@@ -1205,6 +1263,23 @@ def _build_time_filter(fact_table: str, fact_col: str, query: str) -> str | None
         n = _cn_num(m.group(1))
         if n:
             return f"{fact_col} >= {anchor} - INTERVAL '{max(0, n - 1)} days'"
+    # ── 「周」与「年」两档（2026-11-05 补，同类遗漏）────────────────────────
+    # 病根：词表有「天」「个月」「半年」，唯独没有「周」，也没有「N年」。
+    # 实测「最近一周的产量」→ 全部分支落空 → 返回 None → SQL 无 WHERE
+    # → 返回全期总量 3200857（9/9~9/15 真值只有其中一小块），
+    # compiled=True、success=true、格式完全正常，用户看不出任何异常。
+    # 与 2026-10-01 修「最近三个月」是同一类漏洞，只是这一档当时没铺到。
+    m = re.search(r"(?:近|最近|过去|前)\s*([0-9]+|[一二两三四五六七八九十]+)\s*(?:个)?\s*(?:周|星期)", query)
+    if m:
+        n = _cn_num(m.group(1))
+        if n:
+            # 与「近N天」同口径：锚点日 + 过去 (7N-1) 天，共 7N 个日历日
+            return f"{fact_col} >= {anchor} - INTERVAL '{max(0, n * 7 - 1)} days'"
+    m = re.search(r"(?:近|最近|过去)\s*([0-9]+|[一二两三四五六七八九十]+)\s*(?:个)?\s*年", query)
+    if m:
+        n = _cn_num(m.group(1))
+        if n:
+            return f"{fact_col} >= {anchor} - INTERVAL '{n} years'"
     if re.search(r"(?:近|最近|过去|前|这)\s*半年|半年(?:以|之)?内", query):
         return f"{fact_col} >= {anchor} - INTERVAL '6 months'"
     # ── 裸月份「9月份 / 9月」（2026-10-01 黄金题库批测修复，P0）─────────────
@@ -3249,6 +3324,12 @@ def try_compile_metric(query: str) -> dict | None:
                 if w in query and f"'{v}'" not in sql and v not in sql]
     if _missing:
         return None
+
+    # 点名了库里不存在的产线编码（L99）→ 强制 0 行，别退化成「各产线」的总览。
+    # 用外层包一层 WHERE 1=0 而不是判编译失败：退回 LLM 大概率又编出一条答全量的 SQL；
+    # 包一层能保证「问哪条就只答哪条」——不存在就是 0 行，空结果文案会如实说明无匹配记录。
+    if _nonexistent_line_code(query):
+        sql = f"SELECT * FROM ({sql}) _no_such_entity WHERE 1 = 0"
 
     return {
         "sql": sql,
