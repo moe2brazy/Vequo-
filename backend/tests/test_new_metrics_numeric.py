@@ -24,7 +24,11 @@ try:
     import psycopg2
 except Exception as e:
     print("SKIP: 无 psycopg2 (%s)" % e)
-    sys.exit(0)
+    print("=" * 60)
+    print("[SKIP] 本测试未执行任何断言 —— 原因: 无 psycopg2 模块")
+    print("[SKIP] 这不代表通过。启用严格模式: STRICT=1 会以 exit 2 报出")
+    print("=" * 60)
+    sys.exit(2 if os.getenv("STRICT") == "1" else 0)
 
 try:
     from agent.metric_registry import render_exec_sql_metric
@@ -69,7 +73,11 @@ try:
     con = psycopg2.connect(DSN)
 except Exception as e:
     print("SKIP: 连不上库 (%s)" % e)
-    sys.exit(0)
+    print("=" * 60)
+    print("[SKIP] 本测试未执行任何断言 —— 原因: 数据库连不上")
+    print("[SKIP] 这不代表通过。启用严格模式: STRICT=1 会以 exit 2 报出")
+    print("=" * 60)
+    sys.exit(2 if os.getenv("STRICT") == "1" else 0)
 cu = con.cursor()
 
 for metric, q in QUESTIONS.items():

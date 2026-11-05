@@ -221,7 +221,7 @@ def get_llm_providers_api():
     return {"success": True, "providers": list_providers()}
 
 
-@app.get("/api/llm/config")
+@app.get("/api/llm/config", dependencies=[Depends(require_login())])
 def get_llm_config_api():
     """返回当前 LLM 配置与系统内置默认配置"""
     from config import get_llm_config, get_llm_default
