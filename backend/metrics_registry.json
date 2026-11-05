@@ -2351,5 +2351,107 @@
     "valid_from": "",
     "valid_to": "",
     "exec_sql": "SELECT CASE shift_code WHEN 'D' THEN '白班' WHEN 'N' THEN '夜班' ELSE shift_code END AS \"班次\", ROUND(SUM(good_qty) * 100.0 / NULLIF(SUM(input_qty), 0), 2) AS \"良率(%)\" FROM mes_process_output GROUP BY shift_code ORDER BY 1"
+  },
+  {
+    "name": "产量环比增长产线",
+    "aliases": [
+      "产量比上月增长的产线",
+      "哪些产线产量增长了",
+      "产量环比增长的产线",
+      "产量环比增长",
+      "比上月产量高的产线",
+      "产量增长最快的产线",
+      "哪条产线产量涨了",
+      "产量上涨的产线"
+    ],
+    "unit": "件",
+    "tables": [
+      "mes_process_output",
+      "dim_production_line"
+    ],
+    "sql_expression": "本月产量 - 上月同期产量 > 0，按月对齐到同一日序",
+    "formula": "本月产量 > 上月同期产量，按环比增幅降序",
+    "valid_from": "",
+    "valid_to": "",
+    "exec_sql": "WITH b AS (SELECT MAX(stat_date) AS mx FROM mes_process_output),\nm AS (\n  SELECT d.line_name AS \"产线\", to_char(f.stat_date, 'YYYY-MM') AS ym,\n         SUM(f.good_qty + f.defect_qty) AS qty\n  FROM mes_process_output f\n  JOIN dim_production_line d ON f.line_id = d.line_id, b\n  WHERE f.stat_date >= date_trunc('month', b.mx) - INTERVAL '1 month'\n    AND extract(day FROM f.stat_date) <= extract(day FROM b.mx)\n  GROUP BY 1, 2\n),\np AS (\n  SELECT \"产线\",\n         MAX(CASE WHEN ym = (SELECT to_char(MAX(stat_date), 'YYYY-MM') FROM mes_process_output) THEN qty END) AS cur,\n         MAX(CASE WHEN ym <> (SELECT to_char(MAX(stat_date), 'YYYY-MM') FROM mes_process_output) THEN qty END) AS prev\n  FROM m GROUP BY 1\n)\nSELECT \"产线\", prev AS \"上月同期产量\", cur AS \"本月产量\",\n       ROUND((cur - prev)::numeric * 100.0 / NULLIF(prev, 0), 2) AS \"环比增长(%)\"\nFROM p\nWHERE prev IS NOT NULL AND cur IS NOT NULL AND cur > prev\nORDER BY \"环比增长(%)\" DESC",
+    "description": "2026-11-05 新增。修前「产量比上月增长的产线」零命中走 LLM，生成的 SQL 只按上月区间求了一个合计、既没有两个月对照也没有增长判定，5 条产线全部返回——问「谁增长了」答「大家各是多少」。口径要点：yans 最新月是 9 月且只到 15 号，直接拿 9 月整段和 8 月整月比会得出「全线下滑」的假结论，所以两边都按日序裁剪到 1~15 号（上月同期），只比可比区间。",
+    "dims": [
+      "产线"
+    ]
+  },
+  {
+    "name": "良率极差",
+    "aliases": [
+      "良率最高的产线和最低的差多少",
+      "良率最高和最低差多少",
+      "良率差距有多大",
+      "产线良率极差",
+      "良率极差是多少",
+      "最高良率和最低良率差多少",
+      "良率最大差距",
+      "产线之间良率差多少"
+    ],
+    "unit": "百分点",
+    "tables": [
+      "mes_process_output",
+      "dim_production_line"
+    ],
+    "sql_expression": "MAX(产线良率) - MIN(产线良率)",
+    "formula": "各产线良率的极差（最高 - 最低）",
+    "valid_from": "",
+    "valid_to": "",
+    "exec_sql": "WITH y AS (\n  SELECT d.line_name AS \"产线\",\n         SUM(f.good_qty)::numeric * 100.0 / NULLIF(SUM(f.input_qty), 0) AS yld\n  FROM mes_process_output f\n  JOIN dim_production_line d ON f.line_id = d.line_id\n  GROUP BY 1\n)\nSELECT\n  (SELECT \"产线\" FROM y ORDER BY yld DESC LIMIT 1) AS \"良率最高产线\",\n  ROUND((SELECT MAX(yld) FROM y), 2) AS \"最高良率(%)\",\n  (SELECT \"产线\" FROM y ORDER BY yld ASC LIMIT 1) AS \"良率最低产线\",\n  ROUND((SELECT MIN(yld) FROM y), 2) AS \"最低良率(%)\",\n  ROUND((SELECT MAX(yld) - MIN(yld) FROM y), 2) AS \"极差(百分点)\",\n  (SELECT COUNT(*) FROM y) AS \"产线数\"",
+    "description": "2026-11-05 新增。修前「良率最高的产线和最低的差多少」走编译器只认「良率」+「排名」意图，返回 5 条产线的排序清单——用户问一个差值，拿到一张排行榜，还得自己减。现按注册口径一次给出最高/最低两端与极差，yans 基准：一车间-1号线 97.95 / 一车间-4号线 97.05 / 极差 0.90 个百分点。",
+    "dims": []
+  },
+  {
+    "name": "每台设备平均产出",
+    "aliases": [
+      "每台设备平均产出多少",
+      "每台设备平均产出",
+      "设备平均产出",
+      "单台设备产出",
+      "一台设备平均产出多少",
+      "设备人均产出",
+      "每台设备产能",
+      "单台设备平均产量"
+    ],
+    "unit": "件",
+    "tables": [
+      "mes_process_output",
+      "dim_equipment"
+    ],
+    "sql_expression": "SUM(产量) / COUNT(设备)",
+    "formula": "总产量 ÷ 设备总数",
+    "valid_from": "",
+    "valid_to": "",
+    "exec_sql": "SELECT\n  ROUND(SUM(f.good_qty + f.defect_qty)::numeric\n        / NULLIF((SELECT COUNT(*) FROM dim_equipment), 0), 0) AS \"每台设备平均产出(件)\",\n  (SELECT COUNT(*) FROM dim_equipment) AS \"设备数\",\n  SUM(f.good_qty + f.defect_qty) AS \"总产量(件)\"\nFROM mes_process_output f",
+    "description": "2026-11-05 新增。修前「每台设备平均产出多少」零命中走 LLM，生成 SQL 把 dim_equipment 按 line_id 关联到 mes_process_output 再 GROUP BY equipment_id —— 同一条产线上的设备共享同一批产出，48 台设备全都得到同一个数（1078.92），表头还是英文 avg_output_per_record，耗时 18 秒。口径：总产量 ÷ 设备台数，yans 基准 3187009 / 48 = 66396 件/台。",
+    "dims": []
+  },
+  {
+    "name": "设备可动率",
+    "aliases": [
+      "设备可动率",
+      "设备开动率",
+      "设备利用率",
+      "设备稼动率",
+      "各产线设备可动率"
+    ],
+    "unit": "%",
+    "tables": [
+      "eqp_downtime_record",
+      "dim_equipment",
+      "dim_production_line"
+    ],
+    "sql_expression": "100 × (1 - 停机分钟 / (设备数 × 数据天数 × 1440))",
+    "formula": "1 - 停机时长占比（仅时间维度）",
+    "valid_from": "",
+    "valid_to": "",
+    "exec_sql": "WITH t AS (\n  SELECT line_id, COUNT(*) AS eq_cnt FROM dim_equipment GROUP BY line_id\n),\nu AS (\n  SELECT line_id, SUM(downtime_minutes) AS mins FROM eqp_downtime_record GROUP BY line_id\n),\ndays AS (\n  SELECT COUNT(DISTINCT stat_date) AS d FROM mes_process_output\n)\nSELECT d.line_name AS \"产线\",\n       ROUND(100.0 * (1 - COALESCE(u.mins, 0)::numeric\n             / NULLIF(t.eq_cnt * (SELECT d FROM days) * 1440, 0)), 2) AS \"设备可动率(%)\"\nFROM t\nJOIN dim_production_line d ON d.line_id = t.line_id\nJOIN u ON u.line_id = t.line_id\nORDER BY \"设备可动率(%)\" DESC",
+    "description": "2026-11-05 新增。⚠ 刻意**不含 OEE 别名**：项目 2026-09-04 的口径重构已把 OEE 下线（与良率同公式、且缺性能与质量因子，属误导性口径），tests/test_confirm_chain.py C2 与 tests/test_rules.py B1b 专门守着不许加回。本条只回答**时间维度**那一个因子：1 - 停机分钟 / (该产线设备数 × 数据天数 × 1440)。yans 基准：二车间-5号线 99.47% 最高、三车间-3号线 99.33% 最低，5 条产线极差 0.14 个百分点。范围限于「有停机记录的产线」：dim_production_line 有 6 条而只有 5 条有停机记录，左连接会把没有停机记录的那条算成 100%，凭空多出一条「完美产线」。标准 OEE 需要理论节拍、计划工时、实际运行时长，本库都没有，算不出来也不该编。",
+    "dims": [
+      "产线"
+    ]
   }
 ]

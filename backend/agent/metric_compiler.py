@@ -735,7 +735,7 @@ def _trend_grain_fmt(query: str) -> str:
     —— 即使句中带月份限定（「2026年6月每天的产量」= 6月内按天，不能因裸"月"字退化成月粒度）；
     显式月词→月；季度词→季；年词→年；兜底裸月字/年字 → 月/年；无 → 日。
     """
-    if re.search(r"按\s*(?:周|星期)|每周|每星期|周度|各周|按星期", query):
+    if re.search(r"按\s*(?:周|星期)|每周|每星期|周度|各周|按星期|周产量|周产出|周趋势|周维度|周粒度|周内", query):
         return "IYYY-IW"
     if re.search(r"每天|每日|逐日|逐天|按\s*(?:日|天)|各天|各日|日粒度|哪一天|最高的一天|最多的一天|哪天", query):
         return "YYYY-MM-DD"
@@ -1342,6 +1342,21 @@ def _build_time_filter(fact_table: str, fact_col: str, query: str) -> str | None
     # 负向断言排除「9月15日」这类日级表达（日级时间目前交 LLM，避免静默降级成整月）；
     # 「近N个月/过去N月」已在前面的分支优先处理，不会走到这里。
     _bm = re.search(r"(?<!\d)(\d{1,2})\s*月(?!份?\s*[0-9一二两三四五六七八九十]{1,2}\s*[日号])", query)
+    if not _bm:
+        # 中文数字月份（2026-11-05 补）：「九月的周产量趋势」里的「九月」不是阿拉伯数字，
+        # 上面那条 `\d{1,2}` 匹配不到 → 整句时间过滤被静默丢弃，SQL 里一条 WHERE 都没有，
+        # 返回的是 8 月 + 9 月的全期数据（题目问九月，结果里还混进八月）。
+        # 负向后顾排除「近三个月 / 上个月 / 这个月 / 每个月 / 隔两个月」里的数字词
+        # （那些是相对窗口，交给下方的上/本月、近N月分支）；负向前瞻排除「9月15日」这类日级表达。
+        _bm2 = re.search(
+            r"(?<![近最过前几上本这每个0-9])([一二三四五六七八九十]{1,3})\s*月"
+            r"(?!份?\s*[0-9一二两三四五六七八九十]{1,2}\s*[日号])", query)
+        if _bm2:
+            _mo2 = _cn_num(_bm2.group(1))
+            if _mo2 and 1 <= _mo2 <= 12:
+                _y2 = f"(SELECT date_trunc('year', MAX({fact_col})) FROM {fact_table})"
+                return (f"{fact_col} >= {_y2} + INTERVAL '{_mo2 - 1} months' "
+                        f"AND {fact_col} < {_y2} + INTERVAL '{_mo2} months'")
     if _bm:
         _mo = int(_bm.group(1))
         if 1 <= _mo <= 12:

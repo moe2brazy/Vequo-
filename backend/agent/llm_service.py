@@ -3150,6 +3150,14 @@ _COMPILED_FIX_SKIP = frozenset({
     "_fix_degenerate_self_compare",
     "_align_period_compare_length",
     "_align_period_compare_trunc",
+    # 2026-11-05：编译产物的相对窗口锚点**刻意**用 `MAX(事实列)` 而不是 CURRENT_DATE
+    #   （见 metric_compiler._build_time_filter 开头那段论证：静态/滞后数据集上
+    #   CURRENT_DATE 条件恒为假）。这条改写方向正好相反，会把锚点换回 CURRENT_DATE。
+    #   实测代价：「最近一周的产量」编译出 `>= MAX(stat_date) - 6 days`（有数据），
+    #   被本规则改成 `>= CURRENT_DATE - 6 days`（今天 11-05、数据止于 09-15）→ 恒 0 行、返回 null；
+    #   而同样语义的「近两周的产量」因为 `_REL_WINDOW_RE` 不认「近两周」反而没被改，照常有数 ——
+    #   同一个能力下两条问法一个有一个没有，用户只会当系统飘忽。
+    "_fix_relative_date_anchor",
 })
 
 # 2026-10-06：表达式规则链产物专用的跳过集。
@@ -3368,6 +3376,15 @@ def _fix_ratio_molecule_output_only(query: str, sql: str) -> str:
     if not _RATIO_ASK_RE.search(q):
         return sql
     if not _expr_is_good_plus_defect(s):
+        return sql
+    # 2026-11-05 补：只对「分母是投入量」的比值动手。
+    #   这条规则的理由是「不良已流出产线，用 good+defect 当分子会让比值 >1」——
+    #   该理由只在分母是 input_qty（投入）时成立。而触发它的 _RATIO_ASK_RE 里还含
+    #   「每台/每件/每天/人均」这类**量纲换算**词，于是「每台设备平均产出多少」被当成
+    #   比值来看：分子被从 (合格+不良) 砍成只剩合格，48 台设备平均产出算出 64,773，
+    #   而口径上的总产量是 3,200,857 ⇒ 应为 66,685。偏差不大但口径自相矛盾
+    #   （同一屏里「总产量(件)」写着 3,200,857，除下来却对不上）。
+    if not re.search(r"(?i)input_qty|投入|\binp", s):
         return sql
 
     _drop_bad_term = (lambda raw: re.sub(
@@ -13222,7 +13239,14 @@ def _rule_insight(rows: list[dict], cols: list[str]) -> str:
         lines += ["", "【建议关注】", "· 如需看汇总口径，可继续追问「按 XX 统计数量」做聚合。"]
         return "\n".join(lines)
 
-    mc = next((c for c in num_cols if _is_measure_col(c)), num_cols[0])
+    # 2026-11-05：变化类列优先当主列。
+    #   实测「产量比上月增长的产线」结果有 [上月同期产量, 本月产量, 环比增长(%)] 三列，
+    #   原逻辑取第一个度量列 → 通篇在讲「上月产量合计…排名」，用户问的是"谁涨了"，
+    #   结论却完全不提增长。「良率最高的和最低的差多少」同理（讲了最高值不讲极差）。
+    _CHANGE_COL_RE = re.compile(r"增长|增幅|环比|同比|变化|差异|差值|极差|差额|提升")
+    mc = next((c for c in num_cols if _CHANGE_COL_RE.search(str(c))), None)
+    if mc is None:
+        mc = next((c for c in num_cols if _is_measure_col(c)), num_cols[0])
     ratio_like = _is_ratio_like(mc)
 
     vals = []
@@ -13261,6 +13285,28 @@ def _rule_insight(rows: list[dict], cols: list[str]) -> str:
         if already_pct:
             return f"{float(v):.2f}%"
         return _fmt_num_cn(v)
+
+    def _fmt_other(col, v) -> str:
+        """按**该列自己的单位**格式化，不沿用主列的百分比口径。
+
+        2026-11-05：此前附加列一律套 `_fmt`（跟着主列走），实测「良率极差」一行
+        输出成「极差(百分点) 0.90%、产线数 5.00%」——百分点被加了 %，整数被写成
+        两位小数，四个值全带 % 却只有两个真是百分数。
+        """
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            return str(v)
+        name = str(col)
+        if re.search(r"[%％]", name):
+            return f"{fv:.2f}%"
+        if "百分点" in name:
+            return f"{fv:g}"
+        if re.search(r"率|占比|比例|比重", name):
+            return f"{fv:.2f}%"
+        if abs(fv - round(fv)) < 1e-9:
+            return _fmt_num_cn(fv)
+        return f"{fv:.2f}"
 
     def _spread_txt(d) -> str:
         """比率列的极差文本（百分点），分母口径随 pct_mode / already_pct 走。"""
@@ -13301,10 +13347,7 @@ def _rule_insight(rows: list[dict], cols: list[str]) -> str:
             _parts = []
             for _c in _extra_cols[:4]:
                 _v = sample[0].get(_c)
-                try:
-                    _parts.append(f"{disp[_c]} {_fmt(float(_v))}")
-                except (ValueError, TypeError):
-                    _parts.append(f"{disp[_c]} {_v}")
+                _parts.append(f"{disp[_c]} {_fmt_other(_c, _v)}")
             lines.append("· 同一行的其他口径：" + "、".join(_parts) + "。")
     elif ratio_like:
         # 比率类合并成一行，避免"最高…最低…"在下一行重复一遍
