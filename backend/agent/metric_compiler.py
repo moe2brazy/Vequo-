@@ -915,6 +915,25 @@ def _explicit_value_filters(query: str, fact: str) -> list[str]:
         _left = q[max(0, _i - 2):_i]
         return any(_left.endswith(_g) for _g in _GROUP_SIG)
 
+    def _is_exclusion_context(val: str) -> bool:
+        """该取值是否处于**排除**语义（「除了 L04 以外」/「不含 L04」/「L04 除外」）。
+
+        病根（2026-11-05 实测）：「除了L04以外各产线的良率」被当成**点名包含**，
+        生成 `WHERE EXISTS (... line_name = 'L04')` —— 问"除 A 以外"，答的就是 A，
+        语义整个反过来。结果集只有 1 行、数字正确、compiled=True，肉眼完全看不出错。
+        判据只认紧邻的前后文，不做模糊推断：
+          左侧 6 字内以「除了/除/不含/不包括/排除/去掉/不要」结尾；
+          右侧紧跟「以外/之外/除外」。
+        """
+        _i = q.find(val)
+        if _i < 0:
+            return False
+        _left = q[max(0, _i - 6):_i]
+        if re.search(r"(?:除了?|不含|不包括|排除|去掉|不要|剔除)\s*$", _left):
+            return True
+        _right = q[_i + len(val): _i + len(val) + 4]
+        return bool(re.match(r"\s*(?:以|之)?外|^\s*除\s*外|^\s*不算", _right))
+
     for val, ents in sorted(idx.items(), key=lambda x: -len(str(x[0]))):
         if len(val) < 2 or val in seen_vals:
             continue
@@ -932,9 +951,13 @@ def _explicit_value_filters(query: str, fact: str) -> list[str]:
                 continue
             # ② 事实表要能 JOIN 到该表：同名 X_id（表名去掉 dim_ 前缀后 + _id）
             if tab == fact:
-                # 同表列：直接等值
+                # 同表列：直接等值（排除语义下改为不等；NULL 不算"等于该值"，故显式放行）
                 if col in fact_cols and _safe_ident(col):
-                    cond = f"f.{col} = '{_esc_sql_literal(val)}'"
+                    if _is_exclusion_context(val):
+                        cond = (f"(f.{col} IS NULL OR f.{col} <> "
+                                f"'{_esc_sql_literal(val)}')")
+                    else:
+                        cond = f"f.{col} = '{_esc_sql_literal(val)}'"
                     if cond not in out:
                         out.append(cond)
                         seen_vals.add(val)
@@ -951,7 +974,8 @@ def _explicit_value_filters(query: str, fact: str) -> list[str]:
                 if _alt in fact_cols:
                     jkey = _alt
             if jkey in fact_cols and _safe_ident(col) and _safe_ident(tab) and _safe_ident(jkey):
-                cond = (f"EXISTS (SELECT 1 FROM {tab} _v WHERE _v.{jkey} = f.{jkey} "
+                cond = (f"{'NOT ' if _is_exclusion_context(val) else ''}"
+                        f"EXISTS (SELECT 1 FROM {tab} _v WHERE _v.{jkey} = f.{jkey} "
                         f"AND _v.{col} = '{_esc_sql_literal(val)}')")
                 if cond not in out:
                     out.append(cond)
@@ -1011,6 +1035,15 @@ def _nonexistent_line_code(query: str) -> str | None:
     if not has_line_col:
         return None
     tok = m.group(1).strip().upper()
+    # 排除语义不算「点名查这一条」：「除了 L99 以外各产线」问的是其余产线，
+    # 即便 L99 不存在也应该照常返回全部，不能判成 0 行。
+    _i = q.upper().find(tok)
+    if _i >= 0:
+        _left = q[max(0, _i - 6):_i]
+        _right = q[_i + len(tok): _i + len(tok) + 4]
+        if (re.search(r"(?:除了?|不含|不包括|排除|去掉|不要|剔除)\s*$", _left)
+                or re.match(r"\s*(?:以|之)?外|^\s*除\s*外", _right)):
+            return None
     if any(str(k).strip().upper() == tok for k in idx.keys()):
         return None
     return m.group(1).strip()

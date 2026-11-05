@@ -866,6 +866,33 @@
     "valid_to": ""
   },
   {
+    "name": "各产线不良占比",
+    "aliases": [
+      "各产线不良占比",
+      "各产线不良数占全厂的比例",
+      "各产线不良占全厂比例",
+      "不良数的产线分布",
+      "各产线不良数占比",
+      "哪条产线不良最多",
+      "不良数最多的产线",
+      "各条产线的不良占比"
+    ],
+    "unit": "%",
+    "tables": [
+      "mes_process_output",
+      "dim_production_line"
+    ],
+    "sql_expression": "SUM(defect_qty)",
+    "formula": "各产线不良数 ÷ 全厂不良数",
+    "exec_sql": "SELECT d.line_name AS \"产线\", SUM(f.defect_qty) AS \"不良数\", ROUND(SUM(f.defect_qty) * 100.0 / NULLIF(SUM(SUM(f.defect_qty)) OVER (), 0), 2) AS \"占全厂不良比(%)\" FROM mes_process_output f JOIN dim_production_line d ON f.line_id = d.line_id GROUP BY d.line_name ORDER BY \"不良数\" DESC",
+    "description": "各产线不良数及其占全厂不良的比重。yans 基准：不良总数 91737，一车间-4号线占比最高（约 24.7%）。列名与百分比在 SQL 里就译好并四舍五入，避免走 LLM 时出现 line_name / defect_ratio 这类英文表头和 0.2473 这种未格式化的原始比值。",
+    "dims": [
+      "产线"
+    ],
+    "valid_from": "",
+    "valid_to": ""
+  },
+  {
     "name": "未完工工单数",
     "aliases": [
       "在制单",
