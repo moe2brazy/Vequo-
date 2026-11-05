@@ -999,6 +999,24 @@ def _esc_sql_literal(v: str) -> str:
     return str(v or "").replace("'", "''")
 
 
+# ── 同一列被点名了两个不同取值 ───────────────────────────────────────────
+# 病根（2026-11-05 实测）：「L01比L04的良率高多少」编译成
+#   WHERE EXISTS (… _v.line_id = 'L04') AND EXISTS (… _v.line_id = 'L01')
+# 同一行不可能既是 L01 又是 L04 ⇒ 两个等值条件 AND 起来恒为空 ⇒ 返回 null，
+# 界面上是一行「产量/良率为空值」。用户问"高多少"，得到"没有数据"。
+# 判据只看编译产物本身：同一列上出现 >=2 个不同字面值即认为冲突。
+# 编译链没有「同列多值对比」这种形态，交回 LLM 生成对比 SQL 更靠谱。
+_CONTRADICT_PAIR_RE = re.compile(r"\b(?:_v|f)\.(\w+)\s*=\s*'([^']*)'")
+
+
+def _contradictory_value_filters(sql: str) -> bool:
+    """SQL 里同一列被约束成两个及以上不同取值 → True。"""
+    by_col: dict[str, set] = {}
+    for col, val in _CONTRADICT_PAIR_RE.findall(str(sql or "")):
+        by_col.setdefault(col.lower(), set()).add(val)
+    return any(len(vs) >= 2 for vs in by_col.values())
+
+
 # ── 点名了「不存在的产线编码」─────────────────────────────────────────────
 # 病根（2026-11-05 实测）：「L99产线的产量是多少」→ 返回**全部 5 条产线**的产量排名。
 #   `_explicit_value_filters` 只认「库里逐字存在的值」，L99 查不到 → 一个过滤条件都不加
@@ -3356,6 +3374,10 @@ def try_compile_metric(query: str) -> dict | None:
     _missing = [w for w, v in _ENUM_WORDS.items()
                 if w in query and f"'{v}'" not in sql and v not in sql]
     if _missing:
+        return None
+
+    # 同一列点了两个不同取值（「L01比L04」）→ 等值条件 AND 起来恒为空，交 LLM 做对比。
+    if _contradictory_value_filters(sql):
         return None
 
     # 点名了库里不存在的产线编码（L99）→ 强制 0 行，别退化成「各产线」的总览。

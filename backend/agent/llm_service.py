@@ -13247,7 +13247,12 @@ def _rule_insight(rows: list[dict], cols: list[str]) -> str:
     # 比率类且值域落在 0~1（如合格率 0.972）→ 按百分比展示，业务用户读 97.2% 才懂，0.97 读不懂
     # 2026-10-04 修复：新增 `already_pct` 分支——注册表显式声明 value_scale=percent 的指标
     # （停机率/稼动率）返回的就是百分数，**不再 ×100**（实测 0.50% 曾被写成 50.0%，差 100 倍）。
-    already_pct = ratio_like and _metric_value_scale_is_percent(mc)
+    # 2026-11-05 补：列名自己写了「(%)」或「百分点」的，值就**已经是百分数**，不能再 ×100。
+    # 实测「L01比L04的良率高多少」：SQL 算出良率差 0.9024 个百分点，列名 `良率差值(%)`，
+    # 值恰好落在 0~1 区间 → 被 pct_mode 判成"0.9024 这个比率" → 显示「90.2%」。
+    # 用户看到的数比真值大 100 倍，而 0.9024 本身是对的。
+    _name_says_pct = bool(re.search(r"[（(]\s*%|百分比|百分点|percent", str(mc), re.I))
+    already_pct = ratio_like and (_metric_value_scale_is_percent(mc) or _name_says_pct)
     pct_mode = ratio_like and 0 <= mn and mx <= 1 and not already_pct
 
     def _fmt(v) -> str:
