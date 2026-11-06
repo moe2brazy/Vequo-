@@ -125,7 +125,23 @@ def _pick_dim(fields: list[dict], exclude: set[str]) -> dict | None:
     return cands[0]
 
 
-def find_blind_spots(limit: int = 5, min_rows: int = 1) -> dict:
+def _finalize(spots: list[dict], limit: int, allowed_tables=None) -> dict:
+    """按 ACL 裁剪后截断返回。
+
+    2026-11-06 修复（越权泄露）：原实现直接拿全库表清单生成盲点并返回，
+    该端点既没有鉴权依赖、函数体也没做 ACL —— 任何能访问它的人（含匿名）
+    都能拿到**未授权表**的表名、中文名、列名和行数量级。
+    同族的 /api/insights/scan 早就注入了 ACL，这里是漏项。
+    裁剪放在返回前（缓存里存全量），不同权限的请求各裁各的。
+    """
+    out = spots
+    if allowed_tables is not None:
+        out = [s for s in spots
+               if str(s.get("table") or "").split(".")[-1].lower() in allowed_tables]
+    return {"success": True, "spots": out[:limit], "error": ""}
+
+
+def find_blind_spots(limit: int = 5, min_rows: int = 1, allowed_tables=None) -> dict:
     """找出数据盲点。返回 {success, spots, error}。
 
     spot: {type, table, label, detail, suggestion, severity}
@@ -139,7 +155,7 @@ def find_blind_spots(limit: int = 5, min_rows: int = 1) -> dict:
         now = time.time()
         cached = _cache.get("data")
         if cached and now - cached["time"] < _CACHE_TTL:
-            return cached["data"]
+            return _finalize(cached["data"], limit, allowed_tables)
 
         try:
             from db.tools import get_all_tables
@@ -237,9 +253,9 @@ def find_blind_spots(limit: int = 5, min_rows: int = 1) -> dict:
                 })
 
         spots.sort(key=lambda x: x["severity"], reverse=True)
-        data = {"success": True, "spots": spots[:limit], "error": ""}
-        _cache["data"] = {"time": now, "data": data}
-        return data
+        # 缓存全量排序结果（不按 limit / 权限截断），让各请求按自己的可见范围裁剪
+        _cache["data"] = {"time": now, "data": spots}
+        return _finalize(spots, limit, allowed_tables)
     except Exception as e:
         _logger.warning("盲点发现失败: %s", e)
         return {"success": False, "spots": [], "error": str(e)[:160]}

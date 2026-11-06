@@ -159,6 +159,14 @@ class _BlockParser(HTMLParser):
         self._buf: list[str] = []
         self._type: str | None = None
         self._skip = 0
+        # 表格状态（2026-11-06 新增）：
+        # 报告正文的明细数据是 `<table class="dt">`，而本解析器原来只认
+        # h1/h3/p/li/div —— 表格整块被丢弃，导出的 Word/PDF 里没有「明细数据」，
+        # 而网页预览是有的。用户拿到的交付件与看到的不一致，且看起来"正常"。
+        self._in_table = False
+        self._rows: list[list[str]] = []
+        self._row: list[str] = []
+        self._cell: list[str] = []
 
     def _flush(self):
         if self._type and "".join(self._buf).strip():
@@ -174,14 +182,29 @@ class _BlockParser(HTMLParser):
         if tag in self._SKIP_TAGS:
             self._skip += 1
             return
+        if tag == "table":
+            self._flush()
+            self._in_table = True
+            self._rows, self._row, self._cell = [], [], []
+            return
+        if self._in_table:
+            if tag == "tr":
+                if self._row:
+                    self._rows.append(self._row)
+                self._row = []
+            elif tag in ("td", "th"):
+                if self._cell:
+                    self._row.append(re.sub(r"\s+", " ", "".join(self._cell)).strip())
+                self._cell = []
+            return
         if tag == "br":
             self._buf.append(" ")
             return
-        if tag in ("h1", "h3", "p", "li"):
+        if tag in ("h1", "h2", "h3", "p", "li", "figcaption"):
             self._flush()
             if tag == "h1":
                 self._type = "title"
-            elif tag == "h3":
+            elif tag in ("h2", "h3"):
                 self._type = "heading"
             elif "sum-risk" in cls:
                 self._type = "risk"
@@ -216,11 +239,44 @@ class _BlockParser(HTMLParser):
         if tag in self._SKIP_TAGS:
             self._skip = max(0, self._skip - 1)
             return
-        if tag in ("h1", "h3", "p", "li", "div"):
+        if self._in_table:
+            if tag == "table":
+                if self._cell:
+                    self._row.append(re.sub(r"\s+", " ", "".join(self._cell)).strip())
+                    self._cell = []
+                if self._row:
+                    self._rows.append(self._row)
+                    self._row = []
+                self._in_table = False
+                rows = [r for r in self._rows if any(c for c in r)]
+                if rows:
+                    # 单元格用 \t、行用 \n：两项都是 (type, text) 二元组能承载的，
+                    # 不破坏既有 blocks 结构，两个渲染器各自按需拆分。
+                    self.blocks.append(("table", "\n".join("\t".join(r) for r in rows)))
+                self._rows = []
+                return
+            if tag == "tr":
+                if self._cell:
+                    self._row.append(re.sub(r"\s+", " ", "".join(self._cell)).strip())
+                    self._cell = []
+                if self._row:
+                    self._rows.append(self._row)
+                self._row = []
+                return
+            if tag in ("td", "th"):
+                self._row.append(re.sub(r"\s+", " ", "".join(self._cell)).strip())
+                self._cell = []
+                return
+            return
+        if tag in ("h1", "h2", "h3", "p", "li", "div", "figcaption"):
             self._flush()
 
     def handle_data(self, data):
         if self._skip:
+            return
+        if self._in_table:
+            if data.strip():
+                self._cell.append(data)
             return
         if data.strip():
             self._buf.append(data)
@@ -373,6 +429,22 @@ def blocks_to_docx(blocks: list[tuple[str, str]]) -> bytes:
             p = _para(before=4, after=6, line=1.5, indent_cm=0.3)
             _shade_left(p, _COLOR_GOOD_BG, _COLOR_GOOD)
             _add_runs(p, clean, 10.5, color=_COLOR_GOOD)
+        elif typ == "table":
+            # 明细表：转成真正的 Word 表格（首行加粗作表头），而不是一行文本。
+            rows = [r.split("\t") for r in text.split("\n") if r]
+            if rows:
+                ncol = max(len(r) for r in rows)
+                tbl = doc.add_table(rows=len(rows), cols=ncol)
+                try:
+                    tbl.style = "Table Grid"
+                except Exception:
+                    pass
+                for i, r in enumerate(rows):
+                    for j in range(ncol):
+                        cell = tbl.cell(i, j)
+                        _add_runs(cell.paragraphs[0], (r[j] if j < len(r) else ""),
+                                  8.5, bold=(i == 0), highlight_nums=(i > 0))
+                _para(before=0, after=6, line=1.0)
         else:
             p = _para(before=2, after=6, line=1.6, indent_cm=0.74)  # 首行缩进 2 字符
             _add_runs(p, clean, 11)
@@ -406,7 +478,8 @@ def blocks_to_pdf(blocks: list[tuple[str, str]]) -> bytes:
     from reportlab.lib.units import mm
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
-    from reportlab.platypus import HRFlowable, Paragraph, SimpleDocTemplate, Table, TableStyle
+    from reportlab.platypus import (HRFlowable, Paragraph, SimpleDocTemplate, Spacer,
+                                    Table, TableStyle)
 
     # 惰性解析中文字体：_resolve_cjk_font() 已用「真实注册 + 中文宽度校验」筛过，
     # 不会像原先那样拿 .ttc 直接注册失败后静默退回 Helvetica（表现为 PDF 中文乱码）。
@@ -453,6 +526,9 @@ def blocks_to_pdf(blocks: list[tuple[str, str]]) -> bytes:
                        back=_COLOR_GOOD_BG, border=_COLOR_GOOD_BD),
         "para": _style("p", 11, 18, color=_COLOR_BODY, before=2, after=6),
         "meta": _style("m", 9, 13, color=_COLOR_GRAY, before=4, after=16),
+        # 明细表单元格（2026-11-06：导出的表格化）
+        "table_head": _style("th", 8.5, 12, bold=True, color=_COLOR_TITLE, before=0, after=0),
+        "table_cell": _style("td", 8.5, 12, color=_COLOR_BODY, before=0, after=0),
     }
 
     def _rich(text: str, highlight_nums=True) -> str:
@@ -505,6 +581,32 @@ def blocks_to_pdf(blocks: list[tuple[str, str]]) -> bytes:
             continue
         if typ in ("risk", "good", "para", "meta"):
             flow.append(Paragraph(_rich(text), S[typ]))
+            continue
+        if typ == "table":
+            # 明细表 → reportlab Table（首行作表头，跨页重复）
+            rows = [r.split("\t") for r in text.split("\n") if r]
+            if rows:
+                ncol = max(len(r) for r in rows)
+                data = []
+                for i, r in enumerate(rows):
+                    cells = [(r[j] if j < len(r) else "") for j in range(ncol)]
+                    data.append([
+                        Paragraph(_rich(c, highlight_nums=(i > 0)),
+                                  S["table_head"] if i == 0 else S["table_cell"])
+                        for c in cells
+                    ])
+                t = Table(data, colWidths=[content_w / ncol] * ncol, repeatRows=1)
+                t.setStyle(TableStyle([
+                    ("GRID", (0, 0), (-1, -1), 0.4, _hex("#e5e7eb")),
+                    ("BACKGROUND", (0, 0), (-1, 0), _hex("#f3f4f6")),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                    ("TOPPADDING", (0, 0), (-1, -1), 3),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ]))
+                flow.append(t)
+                flow.append(Spacer(1, 6))
             continue
         flow.append(Paragraph(_rich(text), S["para"]))
 

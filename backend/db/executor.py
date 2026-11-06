@@ -209,6 +209,14 @@ _BLOCKED_SELECT_INTO = re.compile(
 )
 # 分号拼接多条语句：分号后还有非空白内容（允许结尾分号）
 _MULTI_STMT = re.compile(r";\s*\S")
+# 行锁子句：`SELECT ... FOR UPDATE / FOR SHARE / FOR NO KEY UPDATE / FOR KEY SHARE`。
+# 2026-11-06 补：这类语句以 SELECT 开头、不含任何黑名单关键词或危险函数，
+# 能完整通过"仅允许 SELECT"闸门，然后在库上持有行锁直到 10s 超时回滚。
+# 黑名单里本来就有 LOCK / pg_advisory_lock，唯独漏了 FOR UPDATE 这一族。
+_BLOCKED_ROW_LOCK = re.compile(
+    r"\bFOR\s+(?:NO\s+KEY\s+|KEY\s+)?(?:UPDATE|SHARE)\b",
+    re.IGNORECASE,
+)
 
 
 def _sanitize_sql(sql: str) -> str:
@@ -271,6 +279,9 @@ def _check_sql_safety(sql: str) -> str | None:
         return "SQL 包含被禁止的写操作/管理语句"
     if _BLOCKED_FUNCS.search(s_stripped):
         return "SQL 包含被禁止的危险函数"
+    # 行锁子句（2026-11-06）：SELECT ... FOR UPDATE 会持锁阻塞业务写入，只读场景没有理由使用
+    if _BLOCKED_ROW_LOCK.search(s_stripped):
+        return "禁止使用 FOR UPDATE / FOR SHARE 等行锁子句（只读查询不应持锁）"
     # 2026-10-03 补三条（原先均可绕过）：
     # ① INTO OUTFILE/DUMPFILE 任意文件写 —— 旧正则整条 alternation 末尾带 `\s*\(`，
     #    而 OUTFILE 后接的是字符串字面量（已被替换为 'x'）而非左括号 → 匹配不到。

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import datetime
 import html as html_mod
+import math
 from dataclasses import dataclass, field
 
 from agent.report_intent import ReportRequest
@@ -505,9 +506,15 @@ def _digest(section: Section, cols: list[str], rows: list[dict]) -> str:
 
 
 def _fmt(v: float) -> str:
-    if v == int(v) and abs(v) < 1e15:
-        return f"{int(v):,}"
-    return f"{v:,.2f}"
+    # NaN / Infinity → "—"（int() 会抛 ValueError / OverflowError，把报告打成 500）
+    try:
+        if not math.isfinite(float(v)):
+            return "—"
+    except (TypeError, ValueError):
+        return "—"
+    if float(v) == int(float(v)) and abs(float(v)) < 1e15:
+        return f"{int(float(v)):,}"
+    return f"{float(v):,.2f}"
 
 
 def collect(template: Template, req: ReportRequest,

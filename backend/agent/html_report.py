@@ -369,6 +369,16 @@ def build_html_report(db: Session, allowed_tables: set[str] | None = None,
             # 显式列清单：优先用 tables_info 里已有的 columns，退化才回退 SELECT *
             raw_cols = [c.get("name") for c in (t.get("columns") or []) if c.get("name")]
             if not raw_cols:
+                # 2026-11-06 修复（样例区恒空）：tables_info 从来没有 columns 键，
+                # 于是 raw_cols 每张表都是空 → 下面直接 continue → samples 恒为空，
+                # 报告里的「样例数据」整块不存在，LLM 摘要也拿不到任何数据摘要。
+                # 这里用 _get_columns 真正反射列名（该函数带按库+表的 memo）。
+                try:
+                    raw_cols = [c.get("name") for c in (_get_columns(db, name) or [])
+                                if c.get("name")]
+                except Exception:
+                    raw_cols = []
+            if not raw_cols:
                 continue
             # 列过多时只取前 12 列，避免 prompt 爆炸
             sel_cols = raw_cols[:12]
@@ -410,7 +420,15 @@ def build_html_report(db: Session, allowed_tables: set[str] | None = None,
                         valid, _err, _clean = validate_sql_safety(f"SELECT 1 WHERE {_rf}")
                         if valid:
                             row_cond = f" WHERE {_rf}"
-                r = execute_sql(f"SELECT * FROM {qname}{row_cond} LIMIT 3")
+                # 2026-11-06 修复（P0·脱敏绕过）：这段「关键数据摘要」原来直接
+                # `SELECT *` 不过 enforcer，而结果会被拼进 LLM prompt、可能写进总结正文 ——
+                # 配了 mask/deny 的角色等于把敏感列明文送出境。
+                # 上面 380 行那批样例行早已走 _apply_column_acl，这里是漏改的一处。
+                _brief_sql = f"SELECT * FROM {qname}{row_cond} LIMIT 3"
+                _brief_sql, _brief_err = _apply_column_acl(_brief_sql, acl)
+                if _brief_err:
+                    continue
+                r = execute_sql(_brief_sql)
                 if r["success"] and r["rows"]:
                     data_brief.append(f"【{t['alias']}】" + "; ".join(str(row) for row in r["rows"][:2]))
             except Exception:
@@ -487,6 +505,31 @@ def build_html_report(db: Session, allowed_tables: set[str] | None = None,
             f'<table><thead><tr>{thead}</tr></thead><tbody>{tbody}</tbody></table></div>'
         )
 
+    # 2026-11-06：card_html / sample_html / rels 三块原来算完就丢，返回的 HTML 里
+    # 只有一张「AI 分析总结」卡 —— 报告标题承诺的「数据表 / 表间关系 / 样例数据」
+    # 三个区块整块消失，下载的 Word/PDF 同样没有，而页面看起来"是完整的"。
+    # 下面把三块真正拼进正文。
+    table_section = (
+        '<div class="card" style="margin-top:18px">'
+        f'<div class="card-h"><h3>🗂 数据表（{len(tables_info)}）</h3></div>'
+        f'<div class="tgrid">{"".join(card_html)}</div></div>'
+    ) if card_html else ""
+    rel_section = ""
+    if rels:
+        _labels = {t["name"]: t["alias"] for t in tables_info}
+        rel_section = (
+            '<div class="card" style="margin-top:18px">'
+            f'<div class="card-h"><h3>🔗 表间关系（{len(rels)} 条）</h3></div>'
+            f'<div class="rel-wrap">{_build_flow_svg(rels, _labels)}</div></div>'
+        )
+    sample_section = ""
+    if sample_html:
+        sample_section = (
+            '<div class="card" style="margin-top:18px">'
+            '<div class="card-h"><h3>📄 样例数据</h3></div>'
+            + "".join(sample_html) + "</div>"
+        )
+
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -516,6 +559,19 @@ body {{ font-family:"Microsoft YaHei","PingFang SC",sans-serif; background:#f3f4
 .risk-i {{ color:#b91c1c; background:#fef2f2; border-radius:4px; padding:0 3px; }}
 .good-i {{ color:#047857; background:#ecfdf5; border-radius:4px; padding:0 3px; }}
 .footer {{ text-align:center; color:#9ca3af; font-size:12px; margin-top:20px; }}
+.tgrid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); gap:10px; }}
+.tcard {{ border:1px solid #eef0f3; border-radius:10px; padding:12px 14px; background:#fafbfd; }}
+.tcard.hot {{ border-color:#c7d2fe; background:#eef2ff; }}
+.tname {{ font-weight:700; font-size:13.5px; color:#111827; }}
+.tmeta {{ font-size:11px; color:#6b7280; margin:4px 0 6px; }}
+.tstat {{ display:flex; gap:12px; font-size:12px; }}
+.sample {{ margin-bottom:16px; }}
+.sample-h {{ font-size:13px; font-weight:700; margin-bottom:6px; }}
+.sample table {{ width:100%; border-collapse:collapse; font-size:12px; }}
+.sample th, .sample td {{ border:1px solid #eef0f3; padding:5px 8px; text-align:left; }}
+.sample th {{ background:#f9fafb; color:#4b5563; font-weight:600; }}
+.rel-wrap {{ overflow-x:auto; }}
+.mono {{ font-family:ui-monospace,Consolas,monospace; }}
 </style>
 </head>
 <body>
@@ -531,6 +587,9 @@ body {{ font-family:"Microsoft YaHei","PingFang SC",sans-serif; background:#f3f4
     </div>
     <div class="summary-body" id="summaryBody">{summary_html}</div>
   </div>
+  {table_section}
+  {rel_section}
+  {sample_section}
   <div class="footer">Vequo 智能问析 · 数据总览报告 · {now}</div>
 </div>
 <script>

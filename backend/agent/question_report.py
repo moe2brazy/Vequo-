@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import html as html_mod
+import math
 import re
 from typing import Any, AsyncIterator
 
@@ -46,7 +47,13 @@ PALETTE = [C_BLUE, "#4D9EFF", "#8FC5FF", C_INK, "#1F66D6", "#B9DCFF", "#5FAEFF",
 # ════════════════════════════════════════════════════════════
 
 def _fmt_num(v: Any) -> str:
-    """数字格式化：整数带千分位，小数保留两位（去尾零）。"""
+    """数字格式化：整数带千分位，小数保留两位（去尾零）。
+
+    2026-11-06：NaN / Infinity 会让 `int(v)` 抛 ValueError / OverflowError，
+    直接把整份报告打成 500。PG 的 numeric/float8 允许存入 'NaN'/'Infinity'
+    （0.0/0.0、超大浮点乘法都能产出），只要有一格是它就生成不出来。
+    这里统一显示为 "—"，与 None 同口径。
+    """
     if v is None:
         return "—"
     if isinstance(v, bool):
@@ -54,6 +61,8 @@ def _fmt_num(v: Any) -> str:
     if isinstance(v, int):
         return f"{v:,}"
     if isinstance(v, float):
+        if not math.isfinite(v):
+            return "—"
         if v == int(v) and abs(v) < 1e15:
             return f"{int(v):,}"
         return f"{v:,.2f}".rstrip("0").rstrip(".")
@@ -439,7 +448,23 @@ def collect_question_data(question: str, sql: str | None = None,
         if not retry_sql or retry_sql == sql:
             continue
         sql = retry_sql
-        exec_sql = _wrap_row_filter(sql, rf) if rf else sql
+        # 2026-11-06 修复（P0·脱敏绕过）：重试路径原来只包了行级过滤，**没有再过列级 ACL**。
+        # 「首条 SQL 把列名写错 → 报 42703 → 重试成功」在真实使用里很常见（LLM 凭常识编列名），
+        # 于是这条路径上 mask/deny 列以明文写进报告的 HTML/Word，而首条路径是正常脱敏的，
+        # 从输出上完全看不出来。行级条件也必须按新 SQL 重算 —— 重试可能换了表。
+        exec_sql, col_err = _apply_column_acl(sql, acl)
+        if col_err:
+            result = {"success": False, "columns": [], "rows": [], "error": col_err}
+            break
+        rf = _pick_row_filter(sql, row_filters)
+        if rf:
+            wrapped = _wrap_row_filter(exec_sql, rf)
+            if not wrapped:
+                acl_degraded = True
+                result = {"success": False, "columns": [], "rows": [],
+                          "error": "行级权限条件无法安全注入（已拒绝返回未收敛数据）"}
+                break
+            exec_sql = wrapped
         result = execute_sql(exec_sql)
         # 同上：重试路径也不得退回未过滤语句
         if not result.get("success") and rf:
@@ -1320,7 +1345,7 @@ def _bar_chart_svg(items: list[tuple[str, float]], unit: str = "",
         blen = max(2.0, bar_max * abs(val) / vmax)
         is_top = highlight_max and name == mx_name
         color = C_BLUE if is_top else C_BLUE_LT
-        label = html_mod.escape(str(name))[:12]
+        label = html_mod.escape(str(name)[:12])  # 先截断再转义，避免切在 &amp; 中间
         p.append(f'<text x="{pad_left - 10}" y="{y + 15}" text-anchor="end" '
                  f'font-size="12" fill="{C_GRAY}">{label}</text>')
         p.append(f'<rect x="{pad_left}" y="{y + 4}" width="{blen:.1f}" height="17" rx="4" '
@@ -1376,7 +1401,7 @@ def _line_chart_svg(items: list[tuple[str, float]], unit: str = "") -> str:
                  f'stroke="{C_BLUE}" stroke-width="2"/>')
         if i % every == 0 or i == n - 1:
             p.append(f'<text x="{X(i):.1f}" y="{h - pad_b + 18}" text-anchor="middle" '
-                     f'font-size="10.5" fill="{C_MUTE}">{html_mod.escape(str(name))[:10]}</text>')
+                     f'font-size="10.5" fill="{C_MUTE}">{html_mod.escape(str(name)[:10])}</text>')
     # 最高点标注
     mi = max(range(n), key=lambda i: items[i][1])
     p.append(f'<text x="{X(mi):.1f}" y="{Y(items[mi][1]) - 10:.1f}" text-anchor="middle" '
@@ -1657,9 +1682,15 @@ def _sections_html(sections: list[tuple[str, str]]) -> str:
         paras = [x.strip() for x in re.split(r"\n{1,}", body) if x.strip()]
         ps = []
         for t in paras:
-            txt = html_mod.escape(t)
-            # 数字高亮（含千分位与百分号）
-            txt = re.sub(r"(\d[\d,]*(?:\.\d+)?\s*%?)", r'<b class="n">\1</b>', txt)
+            # 2026-11-06 修复（排版错乱）：原顺序是「先 html.escape → 再用正则给数字套 <b>」，
+            # 于是文本里的 HTML 实体被二次加工：`don't` 转义成 `&#x27;` 后，
+            # 正则把其中的 `27` 当成数字包起来，变成 `&#x<b class="n">27</b>;`，
+            # 浏览器原样显示 `&#x27;`（LLM 点评里 don't / line's 很常见）。
+            # 改为：先给数字打占位符 → 整体转义 → 占位符换成 <b>，实体不会被拆开。
+            marked = re.sub(r"(\d[\d,]*(?:\.\d+)?(?:\s*%)?)",
+                            lambda m: "\x01" + m.group(1) + "\x02", t)
+            txt = html_mod.escape(marked)
+            txt = txt.replace("\x01", '<b class="n">').replace("\x02", "</b>")
             if t.startswith("⚠️") or t.startswith("⚠"):
                 ps.append(f'<p class="warn">{txt}</p>')
             elif t.startswith("✅"):

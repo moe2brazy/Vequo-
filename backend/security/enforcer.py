@@ -305,12 +305,19 @@ def build_acl_context(user: dict) -> AclContext:
     # 否则 per-user 授权会绕过角色对同一张表配的行/列防线。
     user_grants = perm_model.get_user_grants(username)
     if user_grants:
-        grant_tables = {str(t).split(".")[-1].strip().lower() for t in user_grants.keys()}
-        ctx.allowed_tables = grant_tables if role_allowed is None else (role_allowed | grant_tables)
+        grant_tables: set[str] = set()
         for t, cols in user_grants.items():
             bare = str(t).split(".")[-1].strip().lower()
-            if cols:
-                ctx.column_whitelist[bare] = {str(c).strip().lower() for c in cols}
+            # 2026-11-06 修复（P0·授权语义反转，实测复现）：
+            # 原实现是 `if cols:` 才建白名单，于是 {"表": []} 既不建白名单、
+            # 又把表放进 allowed_tables → 该表**全部字段可见**（只受角色级 mask/deny 约束）。
+            # 于是一张「一个字段都没勾」的申请单反而是最大权限，管理员点通过即造成越权。
+            # 改为 fail-close：空列表 = 一个字段都没授 = 这张表不授予。
+            if not cols:
+                continue
+            grant_tables.add(bare)
+            ctx.column_whitelist[bare] = {str(c).strip().lower() for c in cols}
+        ctx.allowed_tables = grant_tables if role_allowed is None else (role_allowed | grant_tables)
         ctx.has_user_grants = True
     else:
         ctx.allowed_tables = role_allowed
@@ -885,12 +892,42 @@ def rewrite_sql(sql: str, ctx: AclContext | None, dialect: str | None = None) ->
         alias_map: dict[str, str] = {}
         bare_tables: set[str] = set()
 
+        def _bind_alias(key: str, target: str) -> None:
+            """绑定「别名 → 裸表名」；同一别名指向不同表时记为歧义（调用方 fail-close）。
+
+            2026-11-06 修复（P0·脱敏绕过，实测复现）：
+              alias_map 是**全 AST 单张表**，而 SQL 的别名作用域是分层的，内外层
+              合法地重名时后写会无条件覆盖前写。实测：
+                SELECT l.line_manager FROM dim_production_line l
+                WHERE l.line_id IN (SELECT l.line_id
+                                    FROM (SELECT line_id FROM dim_equipment) l)
+              内层派生表别名 l 把 alias_map['l'] 指到 dim_equipment，于是外层
+              `l.line_manager` 被判定为「不属于任何受管表」→ 整段 deny/mask 跳过
+              → line_manager 明文返回，且 rewrite_sql 不报任何错。
+              对照：同样的列换成 `SELECT l.*` 反而被正确脱敏（走星号分支，
+              不经过 alias_map）—— 说明不是策略问题，纯粹是归属判定。
+
+            为什么不按作用域精确解析：这需要给每个 Column 找到它所在的最内层
+            SELECT 并逐层回溯别名，sqlglot 的 parent 链在改写后会失效，改动面
+            太大。安全优先：判不了就不放行 —— 重名到不同表即 _AMBIGUOUS_OWNER，
+            由 _owner_of 的既有 fail-close 路径拒绝，提示用户显式限定表名。
+            """
+            if not key or not target:
+                return
+            prev = alias_map.get(key)
+            if prev is None:
+                alias_map[key] = target
+            elif prev == target or prev == _AMBIGUOUS_OWNER:
+                pass
+            else:
+                alias_map[key] = _AMBIGUOUS_OWNER
+
         def _register(tobj) -> None:
             bare = (tobj.name or "").split(".")[-1].lower()
             if not bare or bare in cte_names:
                 return
             bare_tables.add(bare)
-            alias_map[(tobj.alias or tobj.name).split(".")[-1].lower()] = bare
+            _bind_alias((tobj.alias or tobj.name).split(".")[-1].lower(), bare)
             alias_map.setdefault(bare, bare)
 
         def _map_subquery(node, alias: str) -> None:
@@ -904,7 +941,7 @@ def rewrite_sql(sql: str, ctx: AclContext | None, dialect: str | None = None) ->
                 if b and b not in cte_names:
                     inner.add(b)
             if len(inner) == 1:
-                alias_map[key] = next(iter(inner))
+                _bind_alias(key, next(iter(inner)))
             elif len(inner) > 1:
                 alias_map[key] = _AMBIGUOUS_OWNER
 
@@ -936,7 +973,7 @@ def rewrite_sql(sql: str, ctx: AclContext | None, dialect: str | None = None) ->
                     if b and b not in cte_names:
                         inner.add(b)
                 if len(inner) == 1:
-                    alias_map[key] = next(iter(inner))
+                    _bind_alias(key, next(iter(inner)))
                 elif len(inner) > 1:
                     alias_map[key] = _AMBIGUOUS_OWNER
         except Exception:
@@ -1107,7 +1144,12 @@ def rewrite_sql(sql: str, ctx: AclContext | None, dialect: str | None = None) ->
                 mask_targets.append((col, owner, col.name, mask))
 
         # ── 列级：星号展开（受管表，覆盖 WITH/UNION 各顶层分支）+ 投影脱敏替换 ──
-        if top_selects and managed:
+        # 2026-11-06：星号裁剪的"受管表"要同时包含**只配了字段白名单**的表。
+        # 原来只认 column_denies / column_masks，于是 `SELECT * FROM a JOIN b`
+        # 在"只有 user_grants 字段白名单、没有 deny/mask"的账号下整段跳过，
+        # 白名单外的列随星号一起返回（与单表行为不一致，属越权）。
+        _star_managed = set(managed) | {t for t, wl in (ctx.column_whitelist or {}).items() if wl}
+        if top_selects and _star_managed:
             for outer_select in top_selects:
                 # 只统计该 SELECT 层「直接 FROM/JOIN」的表（P2 修复）：
                 # 此前用全 AST 的 bare_tables（含子查询/CTE 内表）判断，
@@ -1160,13 +1202,27 @@ def rewrite_sql(sql: str, ctx: AclContext | None, dialect: str | None = None) ->
                 for _j in outer_select.args.get("joins") or []:
                     _jt = getattr(_j, "this", None)
                     if isinstance(_jt, exp.Table):
-                        layer_tables.append(_jt.name.split(".")[-1].lower())
+                        # 2026-11-06 修复（P0·数据泄露，实测复现）：JOIN 侧没有穿透 CTE 名。
+                        # FROM 侧早已穿透（见上方 _frm.this 分支），JOIN 侧却把 CTE 名
+                        # 原样当表名入列，于是：
+                        #   WITH x AS (SELECT * FROM dim_production_line)
+                        #   SELECT * FROM dim_equipment e JOIN x ON e.line_id = x.line_id
+                        # layer_tables = ['dim_equipment', 'x'] → x 不在 managed
+                        # → star_tables 为空 → `if not star_tables: continue` 整段放行
+                        # → 配了 deny/mask 的列随 x 一起明文返回，且不报错。
+                        # 两侧必须同一口径：能穿透就穿透，穿不透让 layer_tables 为空走 fail-close。
+                        _jn = _jt.name.split(".")[-1].lower()
+                        if _jn in cte_names:
+                            layer_tables.extend(_resolve_star_base_tables(
+                                _jt, cte_names, ast) or [])
+                        else:
+                            layer_tables.append(_jn)
                     elif _jt is not None:
                         layer_tables.extend(_resolve_star_base_tables(
                             _jt, cte_names, ast))
                 # 去重且保持顺序
                 layer_tables = list(dict.fromkeys(t for t in layer_tables if t))
-                star_tables = [t for t in layer_tables if t in managed]
+                star_tables = [t for t in layer_tables if t in _star_managed]
                 new_projections = []
                 changed = False
                 for p in outer_select.expressions:
@@ -1210,8 +1266,14 @@ def rewrite_sql(sql: str, ctx: AclContext | None, dialect: str | None = None) ->
                             return sql, f"列级权限：无法获取表 {table} 的列结构，已拒绝执行。", applied
                         denies = ctx.column_denies.get(table, set())
                         masks = ctx.column_masks.get(table, {})
+                        # 字段白名单（user_grants）同样要在星号展开时生效，
+                        # 否则「只授了两个字段」的账号 SELECT * 拿到全部字段。
+                        _wl_s = {c.lower() for c in (ctx.column_whitelist.get(table) or [])}
                         for c in cols:
                             cl = c.lower()
+                            if _wl_s and cl not in _wl_s:
+                                applied["hidden"].append({"table": table, "column": c})
+                                continue
                             if cl in denies:
                                 applied["hidden"].append({"table": table, "column": c})
                                 continue
@@ -1248,12 +1310,19 @@ def rewrite_sql(sql: str, ctx: AclContext | None, dialect: str | None = None) ->
                     node.replace(exp.alias_(replacement, col_name, quoted=True))
                 applied["masked"].append({"table": table, "column": col_name, "mask": mask})
 
-        # ── v1 白名单兼容：单表最外层投影裁剪 ──
-        if ctx.column_whitelist and outer_select is not None and len(bare_tables) == 1:
-            table = next(iter(bare_tables))
-            wl = ctx.column_whitelist.get(table)
-            if wl:
-                wl_lower = {w.lower() for w in wl}
+        # ── v1 白名单兼容：最外层投影裁剪 ──
+        # 2026-11-06 修复（P0·授权绕过，实测复现）：原条件带 `len(bare_tables) == 1`，
+        # 只要 SQL 里出现第二张表（JOIN 或逗号连接都算，bare_tables 统计的是**全 AST**
+        # 的表，连子查询里的表也算），整段白名单裁剪就被跳过：
+        #   SELECT * FROM t_order o JOIN t_factory f ON …     → 全列（应只留 order_id）
+        #   SELECT o.unit_price FROM t_order o JOIN t_factory f → 该列本不在白名单却放行
+        # 而 build_acl_context 把 user_grants 当「可见字段的权威来源」，所以这是越权。
+        # 现在按「列的归属表」逐列判：带前缀的走 alias_map，裸列只在归属唯一时判定；
+        # 归属歧义（_AMBIGUOUS_OWNER）不猜，直接拒绝。
+        if ctx.column_whitelist and outer_select is not None:
+            _wl = {t: {c.lower() for c in wl}
+                   for t, wl in ctx.column_whitelist.items() if wl}
+            if _wl:
                 keep: set[str] = set()
                 try:
                     for og in outer_select.find_all(exp.Order, exp.Group):
@@ -1263,14 +1332,34 @@ def rewrite_sql(sql: str, ctx: AclContext | None, dialect: str | None = None) ->
                             keep.add(c.name.lower())
                 except Exception:
                     pass
+
+                def _wl_owner(p) -> str | None:
+                    """推断投影列归属的裸表名；判不了返回 None / _AMBIGUOUS_OWNER。"""
+                    if p.table:
+                        return alias_map.get(p.table.lower())
+                    cands = [t for t in bare_tables
+                             if p.name.lower() in {c.lower() for c in _table_columns(t)}]
+                    if len(cands) == 1:
+                        return cands[0]
+                    return _AMBIGUOUS_OWNER if len(cands) > 1 else None
+
                 projs = []
                 for p in outer_select.expressions:
                     if isinstance(p, exp.Star):
+                        # 多表 SELECT * 在星号分支已按敏感列拒绝；单表到这里才展开。
+                        if len(bare_tables) != 1:
+                            projs.append(p)
+                            continue
+                        table = next(iter(bare_tables))
+                        wl_set = _wl.get(table)
+                        if not wl_set:
+                            projs.append(p)
+                            continue
                         cols = _table_columns(table)
                         if not cols:
                             return sql, f"列级权限：无法获取表 {table} 的列结构，已拒绝执行。", applied
                         for c in cols:
-                            if c.lower() in wl_lower:
+                            if c.lower() in wl_set:
                                 projs.append(exp.column(c))
                             else:
                                 applied["hidden"].append({"table": table, "column": c})
@@ -1279,12 +1368,19 @@ def rewrite_sql(sql: str, ctx: AclContext | None, dialect: str | None = None) ->
                         # 关键：按 p.name 与白名单比对，而非 `not p.table`——
                         # 否则 SELECT e.name, e.salary 这类带表别名前缀的列直接落到 projs，
                         # 白名单形同虚设（越权读白名单外列）。
-                        if p.name.lower() not in wl_lower and p.name.lower() not in keep:
-                            applied["hidden"].append({"table": table, "column": p.name})
+                        owner = _wl_owner(p)
+                        if owner == _AMBIGUOUS_OWNER and _wl:
+                            return sql, ("列级权限：查询涉及字段白名单的多表关联，"
+                                         "字段归属无法唯一确定，已拒绝执行。"
+                                         "请使用「表名.列名」限定后重试。"), applied
+                        if owner in _wl and p.name.lower() not in _wl[owner] \
+                                and p.name.lower() not in keep:
+                            applied["hidden"].append({"table": owner, "column": p.name})
                             continue
                     projs.append(p)
                 if not projs:
-                    return sql, f"列级权限：表 {table} 无任何可访问字段，已拒绝执行。", applied
+                    _t0 = next(iter(_wl))
+                    return sql, f"列级权限：表 {_t0} 无任何可访问字段，已拒绝执行。", applied
                 outer_select.set("expressions", projs)
 
         return ast.sql(dialect=dialect), "", applied
