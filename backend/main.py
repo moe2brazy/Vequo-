@@ -568,13 +568,18 @@ def switch_database_connection(config: DatabaseConfig):
         # 切换成功后持久化到 .env（与「保存配置」行为一致，避免重启后回退旧库）。
         # 注意 DatabaseConfig 字段是 database 而非 name，save_db_config_to_env 需要 name，
         # 必须补上，否则 KeyError 被吞掉导致持久化静默失败（切库不保存、重启回退）。
+        # 2026-11-06：持久化失败不再静默忽略 —— 内存已切到新库但磁盘仍是旧配置，
+        # 重启会悄悄回退，用户完全无感。改为在响应里如实带出 persisted/warning。
+        _persisted = True
+        _persist_err = ""
         try:
             from database import save_db_config_to_env
             save_cfg = dict(cfg)
             save_cfg.setdefault("name", save_cfg.get("database"))
             save_db_config_to_env(save_cfg)
-        except Exception:
-            pass
+        except Exception as _pe:
+            _persisted = False
+            _persist_err = str(_pe)[:200]
         # 同步 agent 的连接池（psycopg2 体系）
         try:
             from db.connection_manager import clear_active_cache
@@ -599,7 +604,16 @@ def switch_database_connection(config: DatabaseConfig):
         except Exception:
             pass
         audit("database_switch", database=config.database, db_type=config.db_type)
-        return {"success": True, "message": "数据库已切换", "config": get_database_config()}
+        _resp = {"success": True, "message": "数据库已切换", "config": get_database_config()}
+        if not _persisted:
+            _resp["persisted"] = False
+            _resp["warning"] = (
+                "已连接到新库，但配置未能写入 .env，重启后会回到旧库。"
+                f"原因：{_persist_err}"
+            )
+        else:
+            _resp["persisted"] = True
+        return _resp
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"数据库切换失败：{exc}") from exc
 
@@ -715,9 +729,16 @@ def list_metrics():
 
 
 @app.get("/api/metrics/search")
-def search_metrics(q: str = ""):
+def search_metrics(q: str = "", limit: int = 5):
     """按问题命中指标（用于前端展示/调试）。同时返回关键词命中与指标向量/BM25 检索结果，
-    便于核对「同义/换说法查询」是否被第三层检索正确召回。"""
+    便于核对「同义/换说法查询」是否被第三层检索正确召回。
+
+    2026-11-06 修复（前后端字段对不上）：前端 MetricsPage 与 CommandPalette 读的是
+    `res.metrics`，而这里一直返回 `keyword` —— 于是指标管理页点「试匹配」恒显示
+    「命中指标：0 个」（但 hint 又正常显示，界面自相矛盾），Ctrl+K 面板搜指标永远为空。
+    补齐 `metrics` 字段并保留 `keyword` 兼容旧调用；`limit` 也接上了
+    （CommandPalette 一直在传 limit=5，之前被静默忽略）。
+    """
     from agent.metric_registry import find_metrics, get_metric_hint
     from agent.metric_memory import get_metric_memory
     rag = []
@@ -725,7 +746,8 @@ def search_metrics(q: str = ""):
         rag = get_metric_memory().retrieve(q, top_k=5, with_scores=True)
     except Exception:
         rag = []
-    return {"keyword": find_metrics(q, limit=5), "rag": rag, "hint": get_metric_hint(q)}
+    _hits = find_metrics(q, limit=max(1, min(int(limit or 5), 20)))
+    return {"metrics": _hits, "keyword": _hits, "rag": rag, "hint": get_metric_hint(q)}
 
 
 @app.get("/api/metrics/lineage")
@@ -1982,10 +2004,21 @@ def attribution_tree_api(req: AnalysisRequest, authorization: str = Header(None)
 
 
 @app.get("/api/insights/blind-spots")
-def blind_spots_api(limit: int = 5):
-    """盲点发现（P1-2，对标 FineBI）：提示"有数据但从没被问过"的表与维度。"""
+def blind_spots_api(limit: int = 5, authorization: str = Header(None)):
+    """盲点发现（P1-2，对标 FineBI）：提示"有数据但从没被问过"的表与维度。
+
+    2026-11-06：注入 ACL。原实现既不鉴权也不裁剪，返回全库表名/列名/行数量级。
+    这里不改鉴权行为（开放模式下仍可访问），但只返回当前身份可见的表。
+    """
     from agent.blind_spot import find_blind_spots
-    return find_blind_spots(limit=max(1, min(limit, 12)))
+    _allowed = None
+    try:
+        from security.enforcer import build_acl_context
+        _u = get_current_user(authorization)
+        _allowed = build_acl_context(_u).allowed_tables
+    except Exception:
+        _allowed = None
+    return find_blind_spots(limit=max(1, min(limit, 12)), allowed_tables=_allowed)
 
 
 @app.post("/api/insights/scan")

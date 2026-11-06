@@ -299,11 +299,20 @@ def get_database_sources() -> list[dict]:
 
 
 def _save_sources(sources: list[dict]) -> None:
-    try:
-        with open(DATABASE_SOURCES_PATH, "w", encoding="utf-8") as f:
-            json.dump(sources, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    """保存数据源注册表（原子写 + 失败抛错）。
+
+    2026-11-06：原来是 `open(..., "w") + json.dump` + `except: pass`，三个问题：
+      ① 非原子：写到一半失败/进程被杀 → 半截 JSON；读侧 JSONDecodeError 后回落成
+         "只有默认源"，所有已注册源（含密码）看起来全没了；
+      ② 并发读-改-写无锁，后写覆盖先写，会丢数据源或丢 is_active；
+      ③ 异常被吞，接口照样返回 success: true。
+    本文件已有 `_write_text_atomic`（.env / profiles 都在用），这里改用它并让异常上抛，
+    由调用方决定是否中止操作。
+    """
+    _write_text_atomic(
+        DATABASE_SOURCES_PATH,
+        json.dumps(sources, ensure_ascii=False, indent=2),
+    )
 
 
 def add_database_source(config: dict) -> dict:
@@ -656,23 +665,48 @@ def save_db_config_to_env(config: Dict[str, Any]) -> None:
         if key not in existing_keys:
             new_lines.append(f"{key}={value}\n")
 
+    # 2026-11-06 修复（切库半状态）：原实现「先落盘 .env → 再改全局变量 → 最后切引擎」，
+    # 切引擎抛异常时前两步已经生效且无法回滚，于是形成三分裂：
+    #   _current_config / engine 还是旧库，DB_NAME/DB_PASSWORD 已是新库，
+    #   .env 也已是新库。之后 /api/config/db 会回显「旧 host + 新密码」这种组合，
+    #   用户再点一次保存就把错误配置永久写进 .env。
+    # 现在先备份 .env 与全局变量，切库失败时整体回滚，保证「要么全切成功、要么完全不变」。
+    global DB_TYPE, DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
+    _orig_env: str | None = None
+    try:
+        if os.path.exists(ENV_PATH):
+            with open(ENV_PATH, "r", encoding="utf-8") as _f:
+                _orig_env = _f.read()
+    except Exception:
+        _orig_env = None
+    _orig_globals = (DB_TYPE, DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD)
+
     _write_text_atomic(ENV_PATH, "".join(new_lines))
 
     # 重载环境变量并切换连接（取原始值，不带引号）
     raw_password = str(config.get("password", ""))
-    global DB_TYPE, DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
     DB_TYPE, DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD = (
         db_type, str(config["host"]), str(config["port"]), str(config["name"]),
         str(config["user"]), raw_password,
     )
-    switch_database({
-        "db_type": db_type,
-        "host": str(config["host"]),
-        "port": int(config["port"]),
-        "name": str(config["name"]),
-        "user": str(config["user"]),
-        "password": raw_password,
-    })
+    try:
+        switch_database({
+            "db_type": db_type,
+            "host": str(config["host"]),
+            "port": int(config["port"]),
+            "name": str(config["name"]),
+            "user": str(config["user"]),
+            "password": raw_password,
+        })
+    except Exception:
+        # 回滚到切换前（.env + 全局变量），并把一致性错误如实抛给调用方
+        try:
+            if _orig_env is not None:
+                _write_text_atomic(ENV_PATH, _orig_env)
+        except Exception:
+            pass
+        DB_TYPE, DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD = _orig_globals
+        raise
     remember_database_profile(str(config["name"]))
 
 

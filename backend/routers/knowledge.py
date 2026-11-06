@@ -33,6 +33,12 @@ _cache_lock = threading.Lock()
 # 消除缓存过期/冷启动时首个请求同步阻塞（topics 实测 12s）的痛点。
 _REBUILD_GRACE = int(_CACHE_TTL * 0.5)  # 过期后额外 0.5×TTL 宽限，总旧值窗口 = 1.5×TTL
 _refreshing: Dict[str, bool] = {}  # key -> 是否正在后台重建（互斥，避免并发重复刷新）
+# 2026-11-06 修复（切库串库）：缓存代次。每次 clear_knowledge_cache 自增，
+# 后台刷新线程在**启动时**记下当时的代次，写回前比对；不一致说明期间发生过
+# 切库/清缓存，这份结果来自旧库，必须丢弃。
+# 原实现只清 _refreshing 标记，挡不住已经在跑的线程——它照样把旧库的表清单
+# 写回新缓存并附上完整 TTL，切库后最长 15 分钟看到的是上一个库的表结构。
+_cache_generation = 0
 
 
 def _schedule_refresh(key: str, producer, args, kwargs):
@@ -42,10 +48,12 @@ def _schedule_refresh(key: str, producer, args, kwargs):
     请求结束即被 close。后台线程若复用该 Session 会抛错导致重建静默失败。
     因此这里在后台线程内自行新建 Session（用完关闭），避免复用已关闭的请求级 Session。
     """
+    global _cache_generation
     with _cache_lock:
         if _refreshing.get(key):
             return
         _refreshing[key] = True
+        _gen = _cache_generation
 
     def _worker():
         db = None
@@ -59,6 +67,9 @@ def _schedule_refresh(key: str, producer, args, kwargs):
             else:
                 value = producer(*args, **kwargs)
             with _cache_lock:
+                if _gen != _cache_generation:
+                    # 期间切过库：这份结果是旧库的，丢弃（下次请求按新库重建）
+                    return
                 _cache[key] = (time.time() + _CACHE_TTL, value, _heat_version)
         except Exception as e:
             # 重建失败：保留旧值，不写缓存（旧值仍在宽限期内可读）；
@@ -109,9 +120,13 @@ def _cached(key: str, producer, *args, **kwargs):
 
 def clear_knowledge_cache():
     """清空全部业务知识缓存（数据库切换后调用）"""
+    global _cache_generation
     with _cache_lock:
+        _cache_generation += 1
         _cache.clear()
-        # 复位在途刷新标记：否则后台刷新线程完成时会把「切库前」旧库数据写回新缓存
+        # 复位在途刷新标记：避免切库后同 key 长时间无法触发新刷新。
+        # 注意：光清标记挡不住**已经在跑**的线程，它靠 _cache_generation 比对
+        # 决定是否写回（见 _schedule_refresh）。
         _refreshing.clear()
 
 
@@ -1315,11 +1330,18 @@ def _build_terms(db: Session) -> Dict:
 # ========== 获取知识统计 ==========
 
 @router.get("/stats")
-def get_knowledge_stats(authorization: str = Header(None), db: Session = Depends(get_db)):
+def get_knowledge_stats(request: Request, authorization: str = Header(None), db: Session = Depends(get_db)):
     """统计业务知识库规模：场景数、表数、字段数、术语数
 
     权限：已登录非管理员按可见表计算规模（与 /api/tables/overview 一致），
     不泄露无权表的存在与规模。
+
+    2026-11-06 修复（接口恒 500）：`get_knowledge_terms` 的签名是
+    `(request, authorization, db)` 三个参数，这里原来只传了两个 ——
+    header 串被当成 request、Session 被当成 authorization、db 取到的是
+    Depends 对象本身。缓存未命中时 `_build_terms(Depends)` 在 `.get_bind()` 崩，
+    缓存命中时 `_acl_visible(Session)` 在 `authorization.lower()` 崩，
+    两条路都是 500，前端"知识库规模"卡片永远是空的。
     """
     from routers.tables import _acl_visible, _bare
     inspector = inspect(db.get_bind())
@@ -1343,7 +1365,7 @@ def get_knowledge_stats(authorization: str = Header(None), db: Session = Depends
         if key:
             scene_keys.add(key)
 
-    terms = get_knowledge_terms(authorization, db)["terms"]
+    terms = get_knowledge_terms(request, authorization, db)["terms"]
 
     return {
         "scene_count": len(scene_keys),

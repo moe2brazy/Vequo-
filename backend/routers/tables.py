@@ -127,6 +127,40 @@ async def import_csv(
     source_url: Optional[str] = Form(None),
 ):
     """支持上传 CSV、SQLite、ZIP、文件夹或直接使用远程 URL 导入"""
+    MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # 与 URL 导入分支一致
+
+    async def _save_upload(upload_file, dest_path: str) -> None:
+        """分块落盘，边写边计大小。
+
+        2026-11-06：原来是 `content = await upload_file.read()` 一次性读进内存，
+        再加 `list(csv.DictReader(f))` 与 params_list 各存一份，单次导入能吃数倍
+        文件大小的内存。URL 分支早就有 200MB 流式上限，上传分支一直没加。
+        """
+        total = 0
+        with open(dest_path, "wb") as fh:
+            while True:
+                chunk = await upload_file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    raise ValueError("单个文件超过 200MB 上限，请拆分后再导入")
+                fh.write(chunk)
+
+    def _done(payload: dict) -> dict:
+        """导入成功收尾：必须失效知识缓存。
+
+        2026-11-06：`_cached("tables_list", …)` 的 TTL 600s + 宽限 300s，
+        导入端点原样返回不清理 → 新导入的表在表列表/总览/关系图里最长 15 分钟不可见，
+        用户以为导入失败会重复导入（叠加内存问题更容易出事）。
+        """
+        try:
+            from routers.knowledge import clear_knowledge_cache
+            clear_knowledge_cache()
+        except Exception:
+            pass
+        return payload
+
     try:
         if source_type == "url" and source_url:
             # 仅允许 http/https 远程数据源；禁止把本地服务器文件路径当 URL 传入，
@@ -134,7 +168,7 @@ async def import_csv(
             if not re.match(r"^https?://", source_url.strip(), re.IGNORECASE):
                 raise HTTPException(status_code=400, detail="远程数据源仅支持 http/https URL")
             result = import_database_source(source_url, target_table_name=table_name or None)
-            return {"success": True, **result}
+            return _done({"success": True, **result})
 
         uploaded_files = list(files or [])
         if not uploaded_files:
@@ -148,23 +182,27 @@ async def import_csv(
             upload_file = uploaded_files[0]
             if hasattr(upload_file, "filename"):
                 filename = os.path.basename(upload_file.filename or "uploaded")
-                content = await upload_file.read()
             else:
                 filename = getattr(upload_file, "filename", "uploaded") or "uploaded"
-                content = upload_file.read() if hasattr(upload_file, "read") else b""
 
             suffix = os.path.splitext(filename)[1].lower()
             with tempfile.TemporaryDirectory() as tmp_dir:
                 temp_path = os.path.join(tmp_dir, filename or "uploaded")
                 os.makedirs(os.path.dirname(temp_path), exist_ok=True)
-                with open(temp_path, "wb") as tmp:
-                    tmp.write(content)
+                if hasattr(upload_file, "filename") and hasattr(upload_file, "read"):
+                    await _save_upload(upload_file, temp_path)
+                else:
+                    content = upload_file.read() if hasattr(upload_file, "read") else b""
+                    if len(content) > MAX_UPLOAD_BYTES:
+                        raise ValueError("单个文件超过 200MB 上限，请拆分后再导入")
+                    with open(temp_path, "wb") as tmp:
+                        tmp.write(content)
 
                 if suffix == ".csv":
                     result = import_csv_to_db(temp_path, table_name or (os.path.splitext(os.path.basename(temp_path))[0]))
                 else:
                     result = import_database_source(temp_path, target_table_name=table_name or None)
-            return {"success": True, **result}
+            return _done({"success": True, **result})
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             for upload_file in uploaded_files:
@@ -172,13 +210,16 @@ async def import_csv(
                     continue
                 filename = upload_file.filename or "uploaded"
                 filename = filename.replace("\\", "/").strip("/") or "uploaded"
+                # 2026-11-06：Windows 上 os.path.join(tmp_dir, "C:/x.csv") 会丢弃左侧、
+                # 返回 "C:/x.csv"，而 `..` 校验拦不住盘符绝对路径 → 可在临时目录之外
+                # 创建/覆盖文件。这里显式拒绝盘符与 UNC 前缀。
+                if re.match(r"^[A-Za-z]:", filename) or filename.startswith("//"):
+                    raise ValueError("上传文件名包含不安全的路径")
                 if any(part in {"", ".", ".."} for part in filename.split("/")):
                     raise ValueError("上传文件名包含不安全的路径")
-                content = await upload_file.read()
                 dest_path = os.path.join(tmp_dir, filename)
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-                with open(dest_path, "wb") as tmp:
-                    tmp.write(content)
+                await _save_upload(upload_file, dest_path)
 
             candidates = collect_import_candidate_files(tmp_dir)
             if not candidates:
@@ -188,7 +229,7 @@ async def import_csv(
             imported = []
             for path in candidates:
                 imported.append(import_database_source(path, target_table_name=effective_table_name))
-            return {"success": True, "mode": "folder", "files": imported}
+            return _done({"success": True, "mode": "folder", "files": imported})
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"导入失败: {str(exc)}")
 

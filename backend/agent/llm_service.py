@@ -868,7 +868,11 @@ def _existing_numeric_columns(tables) -> dict:
     tl = [t for t in tables if re.match(r"^[A-Za-z_][\w]*$", t)]
     if not tl:
         return {}
-    key = tuple(sorted(tl))
+    # 2026-11-06 修复（切库串数据）：key 原为「表名元组」，没有库维度也没有 TTL。
+    # 在 yans 问过 dim_equipment 之后切到另一个库（同名表），命中旧缓存 →
+    # 用上一个库的数值列去补列/判归属，生成不存在的列（报错）或漏补列。
+    # 同文件 _DIM_1TO1_CACHE / _DATA_RANGE_CACHE / 语义缓存都已带 db_key，这里是漏改项。
+    key = (_current_db_key(), tuple(sorted(tl)))
     if key in _EXISTING_NUMCOLS_CACHE:
         return _EXISTING_NUMCOLS_CACHE[key]
     out = {}
