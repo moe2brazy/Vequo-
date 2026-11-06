@@ -23,6 +23,7 @@ from __future__ import annotations
 import datetime
 import html as html_mod
 import logging
+import math
 import re
 import threading
 import time
@@ -157,8 +158,11 @@ def _kpi_html(section: dict) -> str:
             continue
         unit = "%" if re.search(r"率|占比", c) else ""
         try:
-            val_txt = f"{float(v):,}" if float(v) != int(float(v)) else f"{int(float(v)):,}"
-        except (TypeError, ValueError):
+            _fv = float(v)
+            if not math.isfinite(_fv):
+                continue  # NaN / Infinity：卡片不显示，避免 int() 抛 ValueError/OverflowError
+            val_txt = f"{_fv:,}" if _fv != int(_fv) else f"{int(_fv):,}"
+        except (TypeError, ValueError, OverflowError):
             val_txt = str(v)
         cards.append((c, val_txt, unit))
         if unit == "%" and not gauge:

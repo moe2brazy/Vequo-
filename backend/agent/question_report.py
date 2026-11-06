@@ -1415,8 +1415,19 @@ def _donut_svg(items: list[tuple[str, float]], unit: str = "") -> str:
     """环形占比图 + 图例（占比表）。"""
     if not items:
         return '<p class="empty">暂无可绘制的数据</p>'
-    items = [(k, max(0.0, v)) for k, v in items][:8]
-    total = sum(v for _, v in items) or 1
+    # 2026-11-06 修复（图表口径错）：原来是 `items[:8]` 之后再 `total = sum(...)`，
+    # 于是中心大字的「合计」只是**前 8 项之和**，各项占比也都按这个偏小的分母算 ——
+    # 分类超过 8 个时（停机原因 7 类、缺陷类型 8 类、产品 24 类）整张图都是错的，
+    # 而且看起来完全正常。改为：合计取全量，前 7 项 + 「其他」合成第 8 个扇区，
+    # 扇区仍闭合、占比分母正确。
+    raw = [(k, max(0.0, v)) for k, v in items]
+    total = sum(v for _, v in raw) or 1
+    if len(raw) > 8:
+        _head = raw[:7]
+        _rest = sum(v for _, v in raw[7:])
+        items = _head + [(f"其他（{len(raw) - 7} 类）", _rest)]
+    else:
+        items = raw
     w, h = 760, 258
     cx, cy, R, r = 132, 130, 96, 58
     p = [_svg_open(w, h)]

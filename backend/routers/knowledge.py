@@ -1297,7 +1297,16 @@ def _build_terms(db: Session) -> Dict:
                 definition = comment
             else:
                 definition = _generate_rich_definition(term_name, col_type, ktype, table_name, comment)
-            key = f"{term_name}：{definition[:30]}"
+            # 2026-11-06 修复：去重键必须含表名。
+            # 原来只用「术语名 + 释义前 30 字」，而同名字段在不同表里释义完全一致
+            # （line_id 在 mes_process_output / eqp_downtime_record / mes_work_order /
+            # dim_production_line 四张表都有；EXPERT_TERMS_ALL 命中时释义更是逐字相同），
+            # 于是只留第一条、mapped_table 固定成最先遍历到的那张表。三个后果：
+            #   ① 术语总数被压小，加表也不会增长（≈ 去重后的字段名个数）；
+            #   ② 点术语会跳到错误的表（mapped_table 是别人的表）；
+            #   ③ _acl_filter_terms 按 mapped_table 判权限 —— 这条术语挂在无权表上
+            #      就整条消失，即便用户有权的表里也有这个字段。
+            key = f"{table_name}.{term_name}：{definition[:30]}"
             if key in seen:
                 continue
             seen.add(key)
