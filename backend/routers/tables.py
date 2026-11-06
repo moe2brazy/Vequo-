@@ -1407,11 +1407,16 @@ def get_table_relationships(authorization: str = Header(None), db: Session = Dep
 
 
 @router.get("/search")
-def search_tables_api(q: str = "", limit: int = 8):
+def search_tables_api(q: str = "", limit: int = 8, db: Session = Depends(get_db)):
     """按关键词搜索表（命令面板 Ctrl+K 用）：匹配表名/别名/描述/字段注释。
 
     纯确定性关键词打分（复用 db.tools.match_tables_by_query），零 LLM、零缓存依赖，
     前端输入即搜。返回 [{table_name, label, description, keywords_matched}]。
+
+    2026-11-06 修复（切库后搜到上一个库的表）：match_tables_by_query 遍历的是
+    静态 TABLES 元数据，里面同时装着 yans 的 mes_* / eqp_* 与 123 库的 factory.*，
+    与当前连接无关。切到 123 库后仍会推荐 mes_work_order，点进去 404。
+    这里按「当前库真实存在的表」过滤一次。
     """
     q = (q or "").strip()
     if not q:
@@ -1419,6 +1424,16 @@ def search_tables_api(q: str = "", limit: int = 8):
     try:
         from db.tools import match_tables_by_query
         hits = match_tables_by_query(q)[:max(1, min(limit, 20))]
+        try:
+            # 直接反射当前连接的表名（不依赖 knowledge 模块的缓存函数——它不在本模块
+            # 名字空间里，首版写法直接 NameError 被 except 吞掉，过滤形同虚设）。
+            _insp = inspect(db.get_bind())
+            _cur = {str(n).split(".")[-1].lower() for n in _insp.get_table_names()}
+            if _cur:
+                hits = [t for t in hits
+                        if str(t.get("table_name") or "").split(".")[-1].lower() in _cur]
+        except Exception:
+            pass
         out = []
         for t in hits:
             name = str(t.get("table_name") or "")
