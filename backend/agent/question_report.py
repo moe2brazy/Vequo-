@@ -787,6 +787,24 @@ def _gen_sql_for_question(question: str, allowed_tables: set[str] | None) -> str
             return ""
         schema = "\n".join(blocks)
 
+        # ── 数据时间范围提示（2026-11-07 新增）──────────────────────
+        # 这个 prompt 原来对"时间"一个字都没提，模型只能按真实日历猜，
+        # 于是「本月」被写成 CURRENT_DATE 那一套、而演示库数据停在 2026-09-15，
+        # 取数直接 0 行。更糟的是它有时会自作主张给全量问题也套一个月份过滤，
+        # 用户看到的报告就永远是同一个月的。把库内真实区间喂进去，并明确
+        # 「所有时间 = 不加时间条件」，模型才有依据可依。
+        date_ctx = ""
+        try:
+            from agent.report_intent import _data_range
+            _lo, _hi = _data_range("production")
+            if _lo and _hi:
+                date_ctx = (
+                    f"\n数据时间范围：主业务表中的日期实际覆盖 {_lo} ~ {_hi}。\n"
+                    f"今天是 {datetime.date.today().isoformat()}，"
+                    f"但**不要假设数据延伸到今天**。\n")
+        except Exception:
+            date_ctx = ""
+
         sys_prompt = (
             "你是 SQL 生成器。根据用户的业务问题，写一条只读的 PostgreSQL SELECT 查询。\n"
             "硬约束：\n"
@@ -798,7 +816,14 @@ def _gen_sql_for_question(question: str, allowed_tables: set[str] | None) -> str
             "4. 分组行数控制在 3-20 行，用 ORDER BY 排序，不要写 LIMIT 1；\n"
             "5. 比率类字段统一输出成百分数（如 97.56 表示 97.56%）；\n"
             "6. 表之间靠 *_id 字段关联（如 line_id 关联产线表），需要显示名称时先 JOIN 维表；\n"
-            "7. 只输出 SQL 本身，不要解释、不要 markdown 代码块标记。\n\n"
+            "7. 只输出 SQL 本身，不要解释、不要 markdown 代码块标记；\n"
+            "8. 时间条件按用户原话处理，不要自己补：\n"
+            "   · 点名了年月/日期（如「2026年8月」「8月1日到8月31日」）→ 就用该区间；\n"
+            "   · 说「所有时间/全部/全量/历史」→ **不加任何时间过滤**，统计全表；\n"
+            "   · 说「本月/上个月/最近N天」→ 以上面给的数据实际末日为锚点推算，"
+            "不要用 CURRENT_DATE；\n"
+            "   · 完全没提时间 → 不要自作主张加月份或日期过滤。\n"
+            f"{date_ctx}\n"
             f"可用表与字段：\n{schema}"
         )
         msgs = [SystemMessage(content=sys_prompt),

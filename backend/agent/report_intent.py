@@ -15,9 +15,16 @@
 
 from __future__ import annotations
 
+import calendar
 import datetime
+import logging
 import re
 from dataclasses import dataclass, field
+
+_log = logging.getLogger("report_intent")
+
+# 数据区间缓存：key = kind|库名|日期，value = (取数时刻, lo, hi)
+_RANGE_CACHE: dict[str, tuple[float, str, str]] = {}
 
 # ── 词表 ──────────────────────────────────────────────────────────
 # 报告类名词：命中任一才进入候选。顺序无关，后面单独判类型。
@@ -49,6 +56,46 @@ _PERIOD_WORDS = [
 
 # 上一周期
 _PREV_RE = re.compile(r"(上|去|前一)(周|个月|月|年|季度|个季度)")
+
+# ── 显式时间区间：用户自己点名了时间，不能再按"默认本月"猜 ────────────
+# 2026-11-07 修复（P0）：这三类问法原来一条都不认，全部掉进 `_detect_period`
+# 的兜底 `return "month"`，再被数据水位钳到数据末日所在的那几天。实测：
+#   「生成所有时间的生产报告」   → 2026-09-09 ~ 2026-09-15
+#   「生成 2026 年 8 月的生产报告」→ 2026-09-09 ~ 2026-09-15（年份月份全丢）
+#   「2026 年 8 月 1 日到 8 月 31 日」→ 还是 2026-09-09 ~ 2026-09-15
+# 三条问法算出同一个区间，用户看到的就是"只出 9 月"。识别顺序必须是
+# 全量 > 显式区间 > 周期词，否则「生成所有时间的月报」会被"月报"抢走。
+_ALL_TIME_RE = re.compile(
+    r"(所有时间|全部时间|所有日期|全部日期|所有月份|全部月份|所有时段|全时段|"
+    r"全周期|全量|全部数据|所有数据|历史全部|全部历史|历史上全|有史以来|"
+    r"不限时间|不限日期|不限时段|时间不限|日期不限|从头到现在)"
+)
+
+_CN_MONTH = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
+             "七": 7, "八": 8, "九": 9, "十": 10, "十一": 11, "十二": 12}
+
+# 「日」级日期：2026年8月1日 / 2026-08-01 / 8月1日（无年，待推）
+_YMD_CN_RE = re.compile(r"((?:19|20)\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]")
+_YMD_ISO_RE = re.compile(r"((?:19|20)\d{2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})(?!\d)")
+_MD_RE = re.compile(r"(?<![\d年])(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]")
+
+# 「月」级：2026年8月 / 2026年八月份 / 2026-08 / 8月份（无年，待推）
+_YM_CN_RE = re.compile(
+    r"((?:19|20)\d{2})\s*年\s*(十一|十二|\d{1,2}|[一二三四五六七八九十])\s*月(?:份)?")
+_YM_ISO_RE = re.compile(r"((?:19|20)\d{2})\s*[-/.]\s*(\d{1,2})(?!\s*[-/.]\s*\d)")
+_M_ONLY_RE = re.compile(
+    r"(?<![\d年])(十一|十二|\d{1,2}|[一二三四五六七八九十])\s*月份?(?!\s*[\d日号])")
+
+# 各报告类型对应的「数据实际覆盖区间」查询。全量报告要的就是这个区间，
+# 显式年月也靠它推断该用哪个年份（库里只有 2026 年数据时，「8 月」就是 2026-08）。
+_RANGE_SQL = {
+    "production": "SELECT MIN(stat_date)::text AS lo, MAX(stat_date)::text AS hi "
+                  "FROM mes_process_output",
+    "quality": "SELECT MIN(inspection_date)::text AS lo, MAX(inspection_date)::text AS hi "
+               "FROM qms_inspection",
+    "equipment_defect": "SELECT MIN(start_time)::date::text AS lo, "
+                        "MAX(start_time)::date::text AS hi FROM eqp_downtime_record",
+}
 
 # ── 报告类型：按优先级匹配，先命中先定 ──
 _KIND_RULES: list[tuple[str, re.Pattern]] = [
@@ -90,9 +137,12 @@ class ReportRequest:
     adjusted: bool = False          # 区间是否被按数据水位重算过
     asof: str = ""                  # 库内数据最新日期（YYYY-MM-DD）
     original: str = ""              # 调整前的区间文案，供报告里说明
+    window_note: str = ""           # 区间本身的额外说明（如「该区间库内无数据」）
 
     def asof_note(self) -> str:
-        """区间被调整过时给用户的一句说明。没调整返回空串。"""
+        """区间被调整 / 有异常时给用户的一句说明。没有则返回空串。"""
+        if self.window_note:
+            return self.window_note
         if not self.adjusted:
             return ""
         return (f"库内数据截至 {self.asof}，本报告已按数据水位对齐统计区间"
@@ -100,6 +150,8 @@ class ReportRequest:
 
     @property
     def period_label(self) -> str:
+        if self.period == "none":
+            return "全部时间"
         return {
             "day": "当日", "week": "本周", "month": "本月",
             "quarter": "本季度", "half": "本半年", "year": "本年",
@@ -160,6 +212,10 @@ def _span(period: str, ref: datetime.date, prev: bool = False) -> tuple[str, str
         return ref.replace(month=1, day=1).isoformat(), ref.isoformat()
     if period == "year":
         return ref.replace(month=1, day=1).isoformat(), ref.isoformat()
+    if period == "none":
+        # 全量语义的区间由调用方按库内真实数据范围填（见 detect），
+        # 这里返回空串而不是"本月"——否则「所有时间」又会被悄悄缩成一个星期。
+        return "", ""
     # month / none 默认按本月算
     if period == "custom":
         # 交给调用方覆盖（这里给一个安全默认：近 30 天）
@@ -167,9 +223,174 @@ def _span(period: str, ref: datetime.date, prev: bool = False) -> tuple[str, str
     return ref.replace(day=1).isoformat(), ref.isoformat()
 
 
+def _cn_month(tok: str) -> int:
+    """把「8 / 08 / 八 / 十一」统一成 1-12，认不出返回 0。"""
+    tok = (tok or "").strip()
+    if tok in _CN_MONTH:
+        return _CN_MONTH[tok]
+    try:
+        v = int(tok)
+    except ValueError:
+        return 0
+    return v if 1 <= v <= 12 else 0
+
+
+def _collect_dates(q: str) -> list[tuple[int, int, int, int]]:
+    """抽出问句里所有「日」级日期，返回 [(位置, 年|0, 月, 日)]，按出现顺序。
+
+    先认带年份的写法，再认「8月1日」——用已占用区间过滤，避免
+    「2026年8月1日」被两条正则各算一遍。
+    """
+    found: list[tuple[int, int, int, int]] = []
+    spans: list[tuple[int, int]] = []
+    for rx, has_year in ((_YMD_CN_RE, True), (_YMD_ISO_RE, True)):
+        for m in rx.finditer(q):
+            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            if not (1 <= mo <= 12):
+                continue
+            try:
+                datetime.date(y, mo, d)      # 挡掉「8月32日」这类
+            except ValueError:
+                continue
+            found.append((m.start(), y, mo, d))
+            spans.append((m.start(), m.end()))
+    for m in _MD_RE.finditer(q):
+        if any(a <= m.start() < b for a, b in spans):
+            continue
+        mo, d = int(m.group(1)), int(m.group(2))
+        if not (1 <= mo <= 12):
+            continue
+        found.append((m.start(), 0, mo, d))
+    found.sort(key=lambda x: x[0])
+    return found
+
+
+def _data_range(kind: str) -> tuple[str, str]:
+    """取该报告类型下业务事实表的真实数据区间（结果缓存 5 分钟，按库隔离）。"""
+    import time as _t
+    key = f"{kind}|{_db_key()}|{_today()}"
+    hit = _RANGE_CACHE.get(key)
+    if hit and _t.time() - hit[0] < 300:
+        return hit[1], hit[2]
+    sql = _RANGE_SQL.get(kind) or _RANGE_SQL["production"]
+    lo = hi = ""
+    try:
+        from db.executor import execute_sql
+        r = execute_sql(sql)
+        if r.get("success") and r.get("rows"):
+            row = r["rows"][0]
+            lo = str(row.get("lo") or "")[:10]
+            hi = str(row.get("hi") or "")[:10]
+    except Exception as e:
+        _log.warning("数据区间探测失败（%s）：%s", kind, e)
+    for v in (lo, hi):
+        if v and len(v) != 10:
+            lo = hi = ""          # 只认 YYYY-MM-DD，半截字符串比没有更危险
+            break
+    _RANGE_CACHE[key] = (_t.time(), lo, hi)
+    return lo, hi
+
+
+def _db_key() -> str:
+    try:
+        from database import get_database_config
+        cfg = get_database_config() or {}
+        return str(cfg.get("database") or cfg.get("db") or "")
+    except Exception:
+        return ""
+
+
+def _resolve_year(month: int, lo: str, hi: str) -> int:
+    """没写年份的「8 月」该算哪一年。
+
+    优先当年；当年完全落在数据区间之外时，在数据覆盖的年份里找确实含这个月的
+    那一年（库内只有 2026 年数据，问「8 月」就该给 2026-08，而不是今年的 8 月）。
+    """
+    y = _today().year
+    if not lo or not hi:
+        return y
+    try:
+        ly, hy = int(lo[:4]), int(hi[:4])
+    except ValueError:
+        return y
+    if ly <= y <= hy:
+        return y
+    for yy in range(hy, ly - 1, -1):
+        last = calendar.monthrange(yy, month)[1]
+        if f"{yy:04d}-{month:02d}-01" <= hi and f"{yy:04d}-{month:02d}-{last:02d}" >= lo:
+            return yy
+    return y
+
+
+def _month_bounds(y: int, month: int) -> tuple[str, str]:
+    last = calendar.monthrange(y, month)[1]
+    return f"{y:04d}-{month:02d}-01", f"{y:04d}-{month:02d}-{last:02d}"
+
+
+def _explicit_range(q: str, kind: str) -> tuple[str, str] | None:
+    """解析问句里点明的具体时间区间，没有则 None。
+
+    优先级：日级区间 > 单日 > 年月 > 无年月份。
+    """
+    lo = hi = ""
+
+    def _range() -> tuple[str, str]:
+        """只有推年份时才查库，避免每句问话都多打一次数据库。"""
+        nonlocal lo, hi
+        if not lo and not hi:
+            lo, hi = _data_range(kind)
+        return lo, hi
+
+    dates = _collect_dates(q)
+    if dates:
+        def _abs(item):
+            _, y, mo, d = item
+            yy = y or _resolve_year(mo, *_range())
+            try:
+                return datetime.date(yy, mo, d)
+            except ValueError:
+                return None
+
+        ds = [x for x in (_abs(it) for it in dates) if x]
+        if ds:
+            # 两个以上取首尾（「8月1日到8月31日」）；只有一个就是那一天
+            return ds[0].isoformat(), ds[-1].isoformat()
+
+    m = _YM_CN_RE.search(q)
+    if m:
+        month = _cn_month(m.group(2))
+        if month:
+            return _month_bounds(int(m.group(1)), month)
+    m = _YM_ISO_RE.search(q)
+    if m:
+        month = _cn_month(m.group(2))
+        if month:
+            return _month_bounds(int(m.group(1)), month)
+    m = _M_ONLY_RE.search(q)
+    if m:
+        month = _cn_month(m.group(1))
+        if month:
+            return _month_bounds(_resolve_year(month, *_range()), month)
+    return None
+
+
+def _looks_explicit(q: str) -> bool:
+    """问句里是否点了具体时间（不查库的快速判断）。"""
+    return bool(_collect_dates(q) or _YM_CN_RE.search(q)
+                or _YM_ISO_RE.search(q) or _M_ONLY_RE.search(q))
+
+
 def _detect_period(q: str) -> tuple[str, bool]:
-    """返回 (period, prev)。没命中任何时间词时给 month —— 月报是最常见的默认口径。"""
+    """返回 (period, prev)。
+
+    顺序不能换：全量 > 显式区间 > 周期词 > 默认本月。
+    「生成所有时间的月报」里同时有"所有时间"和"月报"，必须判成全量。
+    """
     prev = bool(_PREV_RE.search(q))
+    if _ALL_TIME_RE.search(q):
+        return "none", False
+    if _looks_explicit(q):
+        return "custom", False
     for name, pat in _PERIOD_WORDS:
         if re.search(pat, q):
             return name, prev
@@ -189,9 +410,38 @@ _PREV_PREFIX = {"day": "昨日", "week": "上周", "month": "上月",
                 "quarter": "上季度", "half": "上期", "year": "上年"}
 
 
-def _build_title(kind: str, period: str, prev: bool) -> str:
-    """拼报告标题：生产+周报 → 生产周报；设备不良+月报 → 设备不良月报。"""
+def _is_full_month(start: str, end: str) -> bool:
+    """start/end 是否正好是一个自然整月。"""
+    try:
+        s = datetime.date.fromisoformat(start)
+        e = datetime.date.fromisoformat(end)
+    except ValueError:
+        return False
+    return (s.day == 1 and s.year == e.year and s.month == e.month
+            and e.day == calendar.monthrange(e.year, e.month)[1])
+
+
+def _build_title(kind: str, period: str, prev: bool,
+                 start: str = "", end: str = "") -> str:
+    """拼报告标题：生产+周报 → 生产周报；指定区间则把区间写进标题。
+
+    标题必须和内容对得上：用户要「2026 年 8 月」，标题就不能还写"生产月报"，
+    否则同一份报告隔一周再生成，看起来像同一期、数字却不同。
+    """
     label = _KIND_LABEL.get(kind, "经营")
+    if kind == "inventory" and period in ("custom", "none"):
+        # 库存是时点快照，模板固定取最新一期（SUM 全历史会放大几十倍）。
+        # 用户点了月份时标题必须说清这一点，不能挂着「2026 年 8 月」的名头
+        # 展示 9 月的库存水位。
+        return f"{label}报告（最新快照）"
+    if period == "none":
+        return f"{label}报告（全部时间）"
+    if period == "custom" and start and end:
+        if _is_full_month(start, end):
+            return f"{label}月报（{int(start[:4])}年{int(start[5:7])}月）"
+        if start == end:
+            return f"{label}日报（{start}）"
+        return f"{label}报告（{start} ~ {end}）"
     suffix = _PERIOD_SUFFIX.get(period)
     if not suffix:
         return f"{label}报告"
@@ -241,67 +491,69 @@ def detect(query: str) -> ReportRequest | None:
     if not matched_by:
         return None
 
-    period, prev = _detect_period(q)
     kind = _detect_kind(q)
+    period, prev = _detect_period(q)
     ref = _today()
-    start, end = _span(period, ref, prev)
+    window_note = ""
+
+    if period == "none":
+        # 全量：区间就是库内真实数据覆盖范围，不猜、不缩
+        lo, hi = _data_range(kind)
+        start, end = (lo, hi) if lo and hi else _span("month", ref, prev)
+        if not (lo and hi):
+            window_note = "未能读到库内数据的时间范围，已退回本月区间。"
+    elif period == "custom":
+        rng = _explicit_range(q, kind)
+        if rng:
+            start, end = rng
+        else:
+            period = "month"
+            start, end = _span(period, ref, prev)
+    else:
+        start, end = _span(period, ref, prev)
+
+    # ── 数据水位钳制 ──────────────────────────────────────────
     # 2026-10-05 修复（P0）：区间原本一律以「今天」收尾，但演示/私有库的
     # 数据往往滞后于今天 —— 实测 yans 库 mes_process_output 只有
     # 2026-08-01 ~ 2026-09-15，而「生产周报」算出的区间是 10-05~10-05，
     # 于是**所有章节都返回 0 行**，报告却显示「取数成功 6/6」，
     # 用户看到的是一份全空报告（去掉时间条件立刻有数据：投入 318 万、良率 97.56%）。
-    # 这里把区间末端钳制到库内实际数据末日，避免凭空造出空区间。
+    #
+    # 2026-11-07 二次修复（P0）：原实现把"整段超出数据"的区间按**等长平移**回退，
+    # 于是「上个月」（数据只到 09-15 时）被算成 08-16~09-15 —— 既不是"上个月"，
+    # 也不是任何一个自然月，标题却仍写"上月生产月报"。改成按**自然周期**回退到
+    # 数据末日所在的那一期，并在标题里写明原请求区间。
     data_max = _data_max_date()
-    clamped_note = ""
-    if data_max and end > data_max:
-        clamped_note = (f"（数据仅到 {data_max}，统计区间已自动收窄）")
+    if data_max and end > data_max and period not in ("none", "custom"):
+        req_span = f"{start} ~ {end}"
         if start > data_max:
-            # 整个区间都在数据之外 → 退回「以数据末日为终点」的等长区间
-            try:
-                span = datetime.date.fromisoformat(end) - datetime.date.fromisoformat(start)
-                end = data_max
-                start = (datetime.date.fromisoformat(data_max) - span).isoformat()
-            except Exception:
-                start = data_max
+            asof_d = datetime.date.fromisoformat(data_max)
+            start, end = _span(period, asof_d, False)
+            # 已经回退到"数据末日所在那一期"，标题里的「上月/上周」就不成立了，
+            # 否则会出现"上月生产月报"配着 09-01~09-15 这种自相矛盾的封面。
+            prev = False
+            window_note = (f"库内数据截至 {data_max}，原请求区间 {req_span} 无数据，"
+                           f"已改为最近可用区间 {start} ~ {end}。")
         else:
             end = data_max
-    title = _build_title(kind, period, prev) + clamped_note
+            window_note = f"库内数据截至 {data_max}，统计区间已收窄至 {start} ~ {end}。"
+
+    title = _build_title(kind, period, prev, start, end)
 
     return ReportRequest(
         kind=kind, label=_KIND_LABEL.get(kind, "经营"),
         period=period, title=title, start=start, end=end,
         query=query, matched_by=matched_by, prev=prev,
+        window_note=window_note,
     )
 
 
-_DATA_MAX_CACHE: dict[str, str] = {}
-
-
 def _data_max_date() -> str:
-    """取业务事实表里最新的日期（结果缓存 5 分钟）。
+    """业务事实表里最新的日期（复用 _data_range 的 5 分钟缓存）。
 
-    找不到任何带日期列的表时返回空串（不做钳制，保持原有行为）。
+    这是全局钳制用的水位，固定取生产事实表；按报告类型精确取区间请用 _data_range。
     """
-    import time as _t
-    key = str(_today())
-    hit = _DATA_MAX_CACHE.get("k")
-    if hit and _t.time() - _DATA_MAX_CACHE.get("ts", 0) < 300:
-        return _DATA_MAX_CACHE.get("v") or ""
-    val = ""
-    try:
-        from db.executor import execute_sql
-        r = execute_sql(
-            "SELECT MAX(stat_date)::text AS d FROM mes_process_output")
-        if r.get("success") and r.get("rows"):
-            v = str(r["rows"][0].get("d") or "")[:10]
-            if len(v) == 10:
-                val = v
-    except Exception:
-        val = ""
-    _DATA_MAX_CACHE["k"] = key
-    _DATA_MAX_CACHE["v"] = val
-    _DATA_MAX_CACHE["ts"] = _t.time()
-    return val
+    return _data_range("production")[1]
 
 
 def is_report_request(query: str) -> bool:

@@ -90,6 +90,31 @@ def _align_window(rr) -> None:
     if not asof:
         return
     end = _to_date(rr.end)
+
+    # ── 用户点名了区间：只能收窄，不能替换 ──────────────────────
+    # 2026-11-07 修复（P0）：原实现对 custom 也会走下面的 `_span(rr.period, asof)`
+    # 重算，而 _span("custom", ...) 的语义是"近 30 天"——用户点的「2026 年 8 月」
+    # 会被悄悄换成"数据末日往前 30 天"，封面却还显示 8 月。遇到这种情况只做两件事：
+    # 末端越过数据水位就截到水位；整段都在水位之后则原样保留并明说没有数据
+    # （不能给一份看起来有、实际全靠空值兜底的报告）。
+    if rr.period == "custom":
+        start = _to_date(rr.start)
+        if not start or not end:
+            return
+        if start > asof:
+            rr.asof = asof.isoformat()
+            if not rr.window_note:
+                rr.window_note = (
+                    f"所请求区间 {rr.start} ~ {rr.end} 库内没有数据"
+                    f"（数据截至 {asof.isoformat()}），各章取数为 0 行。")
+            return
+        if asof < end:
+            rr.original = f"{rr.start} ~ {rr.end}"
+            rr.end = asof.isoformat()
+            rr.asof = asof.isoformat()
+            rr.adjusted = True
+        return
+
     if not end or asof >= end:
         return
     from agent.report_intent import _span
@@ -354,10 +379,9 @@ def build_html(rr, data: dict, summary: str, user: str = "", db_name: str = "") 
             f'<span>生成人：{html_mod.escape(user or "—")}</span>',
             f'<span class="pill">取数成功 {ok_n}/{len(sections)} 章</span>']
     note = ""
-    if rr.adjusted:
-        note = (f'<div class="note">⚠️ 库内数据截至 {html_mod.escape(rr.asof)}，'
-                f"本报告已按数据水位对齐统计区间（原请求区间 "
-                f"{html_mod.escape(rr.original or rr.window_text())}）。</div>")
+    _note_txt = rr.asof_note()
+    if _note_txt:
+        note = f'<div class="note">⚠️ {html_mod.escape(_note_txt)}</div>'
 
     body: list[str] = []
 
@@ -481,7 +505,7 @@ def generate_events(query: str, rr, acl=None, user: dict | None = None):
                 return
             # 泛化请求（如只说"生成报告"）→ 走按问取数的即席报告链路兜底
             yield {"type": "step", "name": "按问取数", "detail": "按问题语义生成取数方案"}
-            yield from _adhoc_report_events(query, acl, username)
+            yield from _adhoc_report_events(query, acl, username, rr)
             return
 
         yield {"type": "step", "name": "模板取数",
@@ -505,6 +529,9 @@ def generate_events(query: str, rr, acl=None, user: dict | None = None):
         answer = (f"已生成《{rr.title}》，统计区间 {rr.window_text()}，"
                   f"{ok_n} 个章节取数成功（共 {n_rows} 行明细）。"
                   f"报告包含总体结论、分章图示与明细表，已打开预览，可下载 Word / PDF。")
+        _note = rr.asof_note()
+        if _note:
+            answer += f"\n\n说明：{_note}"
         try:
             from auth import audit
             audit("report_by_question", username=username, query=str(query)[:60],
@@ -526,25 +553,42 @@ def generate_events(query: str, rr, acl=None, user: dict | None = None):
             pass
 
 
-def _adhoc_report_events(query: str, acl, username: str):
-    """泛化报告请求的兜底：复用 question_report 的按问取数链路。"""
+def _adhoc_report_events(query: str, acl, username: str, rr=None):
+    """泛化报告请求的兜底：复用 question_report 的按问取数链路。
+
+    2026-11-07 修复（P0）：原来把 rr 丢掉了，只用原始问句去让 LLM 写 SQL。
+    「生成所有时间的报告」这种没有业务词的问法，区间全靠模型自己猜——
+    它不知道库里数据停在哪，按 CURRENT_DATE 一算就是 0 行。这里把
+    report_intent 已经算准的 [start, end] 明确写进问题，模型照抄即可。
+    """
     try:
         from agent import question_report as QR
+        q2 = query
+        if rr is not None and rr.start and rr.end:
+            q2 = f"{query}（统计区间 {rr.start} 至 {rr.end}，请按此区间取数）"
         data = QR.collect_question_data(
-            query, "", acl.allowed_tables if acl is not None else None,
+            q2, "", acl.allowed_tables if acl is not None else None,
             (acl.row_filters or None) if acl is not None else None,
             200, acl)
         if not data.get("ok"):
             raise RuntimeError(str(data.get("error") or "未能为这个问题取到数据"))
         sections = QR.split_sections(
-            QR.analyze_sync(query, data["columns"], data["rows"],
+            QR.analyze_sync(q2, data["columns"], data["rows"],
                             data.get("table", ""), data.get("sql", "")))
-        html = QR.build_report_html(query, data, sections, user=username, db_name=_db_name())
-        title = f"{query[:24]} 分析报告"
+        html = QR.build_report_html(query, data, sections,
+                                    user=username, db_name=_db_name())
+        title = rr.title if rr is not None else f"{query[:24]} 分析报告"
         rid = save_report_html(title, html, username)
+        n_rows = data.get("row_count", 0)
+        ans = f"已生成《{title}》，{len(sections)} 个章节、{n_rows} 行取数明细，已打开预览。"
+        if rr is not None and rr.start and rr.end:
+            ans = (f"已生成《{title}》，统计区间 {rr.start} ~ {rr.end}，"
+                   f"{len(sections)} 个章节、{n_rows} 行取数明细，已打开预览。")
+            _note = rr.asof_note()
+            if _note:
+                ans += f"\n\n说明：{_note}"
         yield {"type": "done", "response": {
-            "type": "report", "query": query,
-            "answer": f"已按你的问题生成分析报告（{len(sections)} 个章节），已打开预览。",
+            "type": "report", "query": query, "answer": ans,
             "report_title": title, "report_html": html, "report_id": rid,
         }}
     except Exception as e:
