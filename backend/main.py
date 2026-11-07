@@ -259,15 +259,25 @@ def save_llm_config_api(req: LLMConfigRequest):
     """保存 LLM 配置（热生效）；test_only=True 只测试连接"""
     from config import update_llm_config, test_llm_connection, get_llm_config
 
-    # 用户未填写 api_key 时，保留当前生效的 key（避免清空系统默认 DeepSeek key）
-    if not req.api_key:
-        req.api_key = get_llm_config()["api_key"]
+    # 只提交请求里**显式给出**的字段。Pydantic 会给缺省字段填上模型默认值
+    # （model="deepseek-flash" / temperature=0.2 / base_url="https://api.deepseek.com/v1"），
+    # 一旦把 model_dump() 全量下发给 update_llm_config，只改 base_url 的请求会顺带把
+    # model 与 temperature 一起重置成默认值。
+    # 2026-11-07 实测：只 POST {"base_url": "..."} 就把 .env 里的
+    # LLM_MODEL=qwen3.8-flash 改成了 deepseek-flash、LLM_TEMPERATURE 从 0.0 变成 0.2。
+    # 前端表单每次都提交全量字段，所以这个问题只在直接调接口 / 部分更新时暴露。
+    patch = {k: getattr(req, k) for k in getattr(req, "model_fields_set", set())
+             if k != "test_only" and getattr(req, k) is not None}
+
+    # 用户未填写 api_key 时，保留当前生效的 key（避免清空系统默认 key）
+    if not patch.get("api_key"):
+        patch["api_key"] = get_llm_config()["api_key"]
 
     # 先临时应用配置用于测试
     if req.test_only:
         from config import LLM_CONFIG
         backup = dict(LLM_CONFIG)
-        update_llm_config(req.model_dump())
+        update_llm_config(patch)
         try:
             ok, msg = test_llm_connection()
             return {"success": ok, "message": msg}
@@ -277,7 +287,7 @@ def save_llm_config_api(req: LLMConfigRequest):
             from config import _persist_llm_config
             _persist_llm_config()
 
-    update_llm_config(req.model_dump())
+    update_llm_config(patch)
     # 保存后测试
     ok, msg = test_llm_connection()
     cfg = get_llm_config()
