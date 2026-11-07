@@ -1193,7 +1193,13 @@
 
 
 
-        <div v-if="activeTabView === 'sample'" class="flex-1 overflow-y-auto px-4 py-2 relative">
+        <!-- 全部数据的工具条：AI 翻译 + 时间筛选。
+             必须留在滚动容器「外面」—— 原先它和表格表头都写 sticky top-0，
+             表头 z-10 高于筛选条 z-[3]，同处一个滚动容器时两者抢同一位置：
+             筛选条贴着顶部不动，下面数据行从它半透明背景里滑过去，看上去
+             就是「时间筛选按钮和下面的数据重合」。移出来后工具条常驻可见，
+             滚动区归表头独占，两边不再互相压。 -->
+        <div v-if="activeTabView === 'sample'" class="px-4 pt-2">
         <!-- AI 字段翻译（仅非 yans 库、可编辑角色；翻译写回列备注，表头随之显示中文） -->
         <div v-if="canAiTranslate" class="flex items-center justify-end px-1 pb-1.5">
           <button
@@ -1203,7 +1209,7 @@
           >><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z" /> <path d="M5 3v4" /> <path d="M19 17v4" /> <path d="M3 5h4" /> <path d="M17 19h4" /> </svg></span>{{ translating ? 'AI 翻译中…' : ' AI 翻译字段（写入中文备注）' }}</button>
         </div>
         <!-- 时间筛选（近 N 天 / 自定义起止；仅该表含时间列时显示） -->
-        <div v-if="timeColOptions.length" class="sticky top-0 z-[3] flex flex-wrap items-center gap-x-3 gap-y-1 px-1 py-1.5 border-b border-gray-100 bg-gray-50/95 text-xs text-gray-600 mb-2">
+        <div v-if="timeColOptions.length" class="flex flex-wrap items-center gap-x-3 gap-y-1 px-1 py-1.5 rounded border border-gray-200 bg-gray-50 text-xs text-gray-600 mb-2">
           <span class="text-gray-400"><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <rect width="18" height="18" x="3" y="4" rx="2" /> <path d="M16 2v4" /> <path d="M8 2v4" /> <path d="M3 10h18" /> </svg></span> 时间筛选</span>
           <select v-model="timeFilterCol" @change="onTimeFilterChange" class="px-1.5 py-1 border border-gray-200 rounded text-xs bg-white max-w-48">
             <option v-for="c in timeColOptions" :key="c.name" :value="c.name">{{ c.label }}</option>
@@ -1221,6 +1227,9 @@
           <button v-if="timeFilterActive" @click="clearTimeFilter" class="text-gray-400 hover:text-gray-600"><span class="eico" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <path d="M18 6 6 18" /> <path d="m6 6 12 12" /> </svg></span> 清除筛选</button>
           <span v-else class="text-gray-300">显示全部时间</span>
         </div>
+        </div>
+
+        <div v-if="activeTabView === 'sample'" class="flex-1 overflow-auto px-4 pb-2 relative">
 
 
 
@@ -1240,7 +1249,9 @@
 
 
 
-          <div v-if="currentTableData.sample_data?.length" class="overflow-x-auto">
+          <!-- 不要再套一层 overflow-x-auto：那会自己变成一个不滚动的 scrollport，
+               把表头的 sticky 困在里面失效（滚动后列名跟着滚走）。横纵向滚动统一交给外层。 -->
+          <div v-if="currentTableData.sample_data?.length">
 
 
 
@@ -1248,11 +1259,11 @@
 
 
 
-              <thead>
+              <thead class="bg-gray-50 sticky top-0 z-10">
 
 
 
-                <tr class="text-left text-gray-400 bg-gray-50 sticky top-0 z-10">
+                <tr class="text-left text-gray-400 bg-gray-50">
 
 
 
@@ -1268,7 +1279,7 @@
 
 
 
-                    class="px-2 py-1.5 font-normal text-sm cursor-pointer select-none group hover:bg-gray-100" @click="toggleSort(col.name)"
+                    class="px-2 py-1.5 font-normal text-sm cursor-pointer select-none group bg-gray-50 hover:bg-gray-100" @click="toggleSort(col.name)"
 
 
 
