@@ -190,8 +190,13 @@ rec("顶到加载上限", "samples=5000", "含「5000 行加载上限」",
     "5000 行加载上限" in text_of(big), "5000 行加载上限" in text_of(big))
 
 perfect = dict(REG); perfect["metrics"] = {"R²": 0.9992, "RMSE": 0.1, "MAE": 0.1}
-rec("接近满分要自查", "R²=0.9992", "含「接近满分」",
-    "接近满分" in text_of(perfect), "接近满分" in text_of(perfect))
+t_perfect = text_of(perfect)
+# 2026-11-09：R²>=0.999 改走「疑似账面恒等式」分支，不再轻描淡写提醒自查。
+# 真实库上 good_qty = input - defect - rework，R²=1.0 却配「可以直接拿来做量级预估」
+# 是误导。新口径必须点明不能当预测用，且不能再出现那句乐观结论。
+rec("满分不再夸解释力", "R²=0.9992", "含「不能当预测用」且不含「可以直接拿来做量级预估」",
+    ("不能当预测用" in t_perfect, "可以直接拿来做量级预估" in t_perfect),
+    "不能当预测用" in t_perfect and "可以直接拿来做量级预估" not in t_perfect)
 
 joined = dict(REG); joined["join_note"] = "「实际产量」不在 mes_work_order 里，已按 work_order_id 从 mes_process_output 汇总 good_qty（SUM）后作为预测目标"
 rec("跨表来源写进限制", "join_note", "含「跨表」或「汇总」",

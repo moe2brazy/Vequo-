@@ -398,8 +398,19 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
         # 2026-10-01 修复（P1）：多分类逻辑回归的 coef_ 形状是 (n_classes, n_features)，
         # 原实现只取第 0 类系数（=「类0 vs 其余」的判别方向），标题却是「特征重要性」，
         # 大小和方向都可能误导。多分类按各类系数绝对值取均值聚合。
+        #
+        # 2026-11-09 修复：X 经 StandardScaler、y 没有 —— coef_ 的单位是
+        # 「y 单位 / 该特征的标准差」，数值约等于 原始偏导 × 特征标准差。
+        # 实测 mes_process_output 上 input_qty=451.93 / defect_qty=22.01 /
+        # rework_qty=4.07，恰好对上三列标准差 450.63 / 22.27 / 7.55 ——
+        # 那是各列自己的波动幅度，不是「谁更重要」。拿量纲不同的系数排名、
+        # 再算「占 95%」，数学上不成立，业务方也完全读不懂。
+        # 归一化成合计为 1 的相对权重，与树模型 feature_importances_ 同量纲。
         import numpy as _np
         coef = _np.abs(m.coef_).mean(axis=0) if m.coef_.ndim > 1 else _np.abs(m.coef_)
+        total = float(_np.sum(coef))
+        if total > 0:
+            coef = coef / total
         importance = {features[i]: round(float(coef[i]), 4) for i in range(len(features))}
     # 与 metrics 对称：importance 里的 NaN 会变成裸 NaN 非法 JSON，
     # 前端 JSON.parse 直接抛错、整个结果卡卡在「建模中」。

@@ -118,6 +118,16 @@ def _cn(table: str, col: str) -> str:
     return c
 
 
+def _plain(label: str) -> str:
+    """剥掉「中文（english）」里的英文括号，正文只留中文。
+
+    结果卡上字段清单已经列过一次英文列名，解读正文再重复三遍
+    「投入数量（input_qty）」只会把句子撑得读不动。第一处对照保留括号，
+    后面叙述一律用纯中文名。
+    """
+    return re.sub(r"（[A-Za-z0-9_.\-]+）", "", label or "")
+
+
 def _task_of(result: dict) -> str:
     mt = str(result.get("model_type") or "").lower()
     if mt in ("kmeans",):
@@ -147,6 +157,7 @@ def build_facts(result: dict) -> dict:
     facts = {
         "task": task,
         "model": str(result.get("model_label") or result.get("model_type") or "模型"),
+        "model_type": str(result.get("model_type") or ""),
         "table": table,
         "target": _cn(table, result.get("target") or ""),
         "features": [_cn(table, f) for f in (result.get("features") or [])],
@@ -195,6 +206,14 @@ def build_facts(result: dict) -> dict:
         facts["panel"] = int(_num(metrics.get("总样本")) or samples)
         facts["grade"] = "已标注"
 
+    # ── 账面恒等式 / 特征泄漏判定 ──
+    # 回归拟合度顶到 0.999 以上，通常不是模型强，而是目标列本来就能由输入列
+    # 算出来（实测 mes_process_output：合格数 = 投入数 − 不良数 − 返工数 − 小损耗，
+    # R²=1.0、RMSE=0.28）。这时「解释力很强，可以直接拿来做量级预估」是误导，
+    # 必须反过来讲。阈值取 0.999 是为了不误伤计划量→实际产出那类真关系（R²≈0.998）。
+    _r2 = facts.get("metric_value")
+    facts["suspect_leak"] = bool(task == "regression" and _r2 is not None and _r2 >= 0.999)
+
     # ── 驱动因素：按重要性绝对值排，给前三项和它们的合计占比 ──
     pairs = []
     for k, v in importance.items():
@@ -230,7 +249,11 @@ def build_facts(result: dict) -> dict:
         # 而"用返工数预测不良数"这类近亲特征会顶到 0.9999，必须提醒自查。
         # 这条排在样本量前面：它影响的是"这个结果能不能信"，比样本多少更急。
         if task == "regression" and mv is not None and mv >= 0.999:
-            cav.append("指标接近满分，先确认目标列的等价字段有没有混进特征。")
+            if facts.get("suspect_leak"):
+                cav.append("想让它真的能预测，得换一类问题：用不受目标影响的因素"
+                           "（设备状态、班次、停机时长）当输入，别用账目的组成部分。")
+            else:
+                cav.append("指标接近满分，先确认目标列的等价字段有没有混进特征。")
         if task == "classification" and mv is not None and mv >= 0.999:
             cav.append("准确率接近满分，先确认有没有把结果类字段当成特征。")
         if samples >= 5000:
@@ -239,7 +262,7 @@ def build_facts(result: dict) -> dict:
             cav.append(f"有效样本只有 {samples} 行，量级偏小，结论更像是这批数据里的规律。")
         elif samples and samples < 1000:
             cav.append(f"有效样本 {samples} 行，属于中小样本，换一批数据先重训一次再下结论。")
-        if facts["drivers"]:
+        if facts["drivers"] and not facts.get("suspect_leak"):
             cav.append("特征重要性只说明这个字段在模型里被用得多，不等于改它就能改结果。")
     facts["caveats"] = cav[:4]
     return facts
@@ -253,6 +276,8 @@ def rule_text(facts: dict) -> str:
     task = facts.get("task") or "regression"
     target = facts.get("target") or "目标值"
     feats = facts.get("features") or []
+    plain_target = _plain(target)
+    plain_feats = [_plain(f) for f in feats]
     samples = facts.get("samples") or 0
     mv = facts.get("metric_value")
     grade = facts.get("grade") or ""
@@ -266,13 +291,31 @@ def rule_text(facts: dict) -> str:
         if len(feats) > 4:
             feat_txt += " 等 %d 项" % len(feats)
         if task == "regression":
-            body = f"用「{feat_txt}」预测「{target}」，样本 {samples:,} 行"
-            if facts.get("test_rows"):
-                body += f"，留出 {facts['test_rows']:,} 行做检验，这部分没参与训练"
-            lines.append(body + "。")
+            if facts.get("suspect_leak"):
+                pf = "、".join(plain_feats[:4]) if plain_feats else "所选特征"
+                lines.append(f"这次用 {samples:,} 条记录，让模型学「{pf}」和"
+                             f"「{plain_target}」之间的关系，其中留出 "
+                             f"{facts.get('test_rows', 0):,} 条做检验，没参与训练。")
+            else:
+                body = f"用「{feat_txt}」预测「{target}」，样本 {samples:,} 行"
+                if facts.get("test_rows"):
+                    body += f"，留出 {facts['test_rows']:,} 行做检验，这部分没参与训练"
+                lines.append(body + "。")
             if mv is not None and mv < 0:
                 lines.append(f"模型的表现比直接用平均值猜还差（R² **{_fmt(mv, 2)}**），"
                              f"这套特征解释不了「{target}」的波动，建议换特征或换算法。")
+            elif facts.get("suspect_leak"):
+                # 拟合度顶到满分时，最忌讳还夸「解释力很强，可以直接拿来做量级预估」。
+                # 实测 mes_process_output 的合格数就是投入−不良−返工，R²=1.0 是账本，
+                # 不是模型能力。这里把结论翻过来讲，并说清为什么不能拿来预测未来。
+                lines.append(f"**这个结果不能当预测用**：拟合度 **{_fmt(mv * 100, 1)}%**、"
+                             f"平均只差 **±{_fmt(facts.get('rmse'), 1)}**，"
+                             "等于把账本原样抄了一遍。")
+                lines.append(f"这几个输入字段几乎能直接算出「{plain_target}」——"
+                             "这种满分通常说明输入里就含着目标的组成部分，"
+                             "模型没有学到新规律，只是把这笔账复述了一次。")
+                lines.append("它能用来核对有没有录错，回答不了「下个月能产多少」："
+                             "下个月投入多少还不知道，模型没有可以代入的数。")
             elif mv is not None:
                 s = f"模型能解释 **{_fmt(mv * 100, 1)}%** 的「{target}」波动，解释力{grade}"
                 if note:
@@ -321,7 +364,14 @@ def rule_text(facts: dict) -> str:
 
     drivers = facts.get("drivers") or []
     n_total = facts.get("n_importance") or len(drivers)
-    if drivers and n_total == 1:
+    if facts.get("suspect_leak") and drivers:
+        # 账面恒等式下，系数大小只反映各列的量纲，排名是假信息。
+        # 与其摆三个读不懂的数字，不如直接说清它们的业务关系。
+        lines.append("【这几个字段是什么关系】")
+        lines.append("· 这几个字段是同一笔账的收支项，少一个都算不出"
+                     f"「{plain_target}」，所以不必再比谁更重要，"
+                     "权重排名在这里没有意义。")
+    elif drivers and n_total == 1:
         # 只有一个特征时，"占全部特征的 100%" 是句废话，直接说清模型靠什么判断
         lines.append("【主要驱动因素】")
         lines.append(f"· 「{drivers[0]['name']}」是唯一的输入特征，模型完全靠它判断，"
