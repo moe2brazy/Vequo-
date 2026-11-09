@@ -135,8 +135,9 @@ rec("出 pred_samples", "", "1 行", len(rows), len(rows) == 1)
 if rows:
     v = float(rows[0]["预测"])
     rec("预测值落在 1100~1300", "", "1100~1300", v, 1100 <= v <= 1300)
-    rec("输入用英文特征名", "", "input_qty", rows[0]["输入"],
-        "input_qty" in rows[0]["输入"] and "1200" in rows[0]["输入"])
+    rec("输入列是业务可读的中文名", "", "投入数量 / input_qty + 1200", rows[0]["输入"],
+        ("投入数量" in rows[0]["输入"] or "input_qty" in rows[0]["输入"])
+        and ("1,200" in rows[0]["输入"] or "1200" in rows[0]["输入"]))
 else:
     rec("预测值落在 1100~1300", "", "1100~1300", "无行", False)
 ex = mr.get("explain") or ""

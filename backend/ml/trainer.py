@@ -590,6 +590,21 @@ def _safe_metrics(d: dict) -> dict:
     return out
 
 
+def _svg_for_web(svg: str) -> str:
+    """把 matplotlib 的 SVG 收拾成前端能原样显示的样子。
+
+    2026-11-09：结果卡的 sanitizeSvg 按 XSS 白名单会整段删掉 <style> 和
+    <metadata>。matplotlib 在 <style> 里放了一句全局线条规则，删掉虽不致于
+    让图变黑块（颜色/线条都在内联 style 属性里），但端点样式会丢。这里先把
+    那句规则内联到根 <svg> 的 style 属性，再去掉两个标签 —— 前端再过滤也不影响。
+    """
+    import re
+    svg = re.sub(r"<style[^>]*>.*?</style>", "", svg, flags=re.S)
+    svg = re.sub(r"<metadata>.*?</metadata>", "", svg, flags=re.S)
+    return re.sub(r"<svg ", '<svg style="stroke-linejoin:round;stroke-linecap:butt" ',
+                  svg, count=1)
+
+
 def _plot_importance(importance: dict, title: str) -> str:
     if not importance: return ""
     font = _get_zh_font()
@@ -611,7 +626,8 @@ def _plot_importance(importance: dict, title: str) -> str:
     finally:
         plt.close(fig)
     buf.seek(0); svg = buf.read().decode()
-    return svg[svg.index("<svg"):] if svg.startswith("<?xml") else svg
+    svg = svg[svg.index("<svg"):] if svg.startswith("<?xml") else svg
+    return _svg_for_web(svg)
 
 def _plot_pred_vs_actual(y_true, y_pred) -> str:
     font = _get_zh_font()
@@ -626,7 +642,8 @@ def _plot_pred_vs_actual(y_true, y_pred) -> str:
     finally:
         plt.close(fig)
     buf.seek(0); svg = buf.read().decode()
-    return svg[svg.index("<svg"):] if svg.startswith("<?xml") else svg
+    svg = svg[svg.index("<svg"):] if svg.startswith("<?xml") else svg
+    return _svg_for_web(svg)
 
 def list_trained_models() -> list[dict]:
     # 只列出当前库的模型（key 带 db_key 前缀，切库后自动隔离）

@@ -109,8 +109,9 @@ rec("预测值接近 380（线性外推）", "plan_qty=400 → 385", "375~395", 
 r_cn = predict_rows("计划数量=200 时的预测结果")
 rows_cn = (r_cn.get("ml_result") or {}).get("pred_samples") or []
 cn_in = rows_cn[0]["输入"] if rows_cn else ""
-rec("中文列名映射到英文特征", "计划数量=200", 'plan_qty', cn_in,
-    "plan_qty" in cn_in and "200" in cn_in)
+# 输入列现在给业务看中文名（「计划数量 200」），不再是调试用的 JSON
+rec("中文列名映射到真实特征", "计划数量=200", "中文或英文特征名 + 200", cn_in,
+    ("plan_qty" in cn_in or "计划" in cn_in) and "200" in cn_in)
 
 
 print("\n=== 3. 缺特征与空输入 ===")

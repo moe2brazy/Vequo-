@@ -1453,7 +1453,9 @@ const renderAgentResult = (data: any, msg?: any): string => {
       // 把「预测目标 + 用到的特征」摆出来：一眼能看出它选对了字段
       const tgt = data.target || mr.target
       const feats = data.features || mr.features
-      let subLine = `样本 ${mr.samples ?? '-'} 条`
+      // 推理结果卡没有 samples，旧代码会显示「样本 - 条」，演示屏幕上像个坏掉的占位符
+      let subLine = (mr.samples != null && mr.samples !== '')
+        ? `样本 ${mr.samples} 条` : '基于刚训练好的模型'
       if (tgt) subLine += ` · 预测目标 ${tgt}`
       html += `<div class="text-xs text-gray-500 mb-1">${esc(subLine)}</div>`
       if (Array.isArray(feats) && feats.length) {

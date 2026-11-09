@@ -12136,18 +12136,15 @@ class LLMService:
             return
 
         result = predict(model_name, values)
-        row = {"输入": json.dumps(values, ensure_ascii=False),
-               "预测": result.get("label", result.get("prediction"))}
-        if result.get("warnings"):
-            # 2026-10-01：缺特征/未见过的类别不再静默，结果卡「备注」列直接说明
-            row["备注"] = "；".join(result["warnings"])
         # 人话结论：用户问的是「能出多少」，只丢一行「输入/预测」表格等于没回答。
         # 数字全部取自本次预测 + 训练时留存的指标，确定性生成，不调 LLM、不编数。
         # 聚类/异常检测/分类没有「产出」这回事，结论必须换说法，否则会写出
         # 「合格数量约 簇 2」这种荒谬句子。
         mt = str(model.get("model_type") or "").lower()
         label = model.get("label") or model_name
-        explain_text = ""
+        metrics = model.get("metrics") or {}
+        is_numeric_task = not (mt in ("kmeans", "isolation") or "准确率" in metrics)
+        explain_text, inputs, pred_display = "", "", ""
         try:
             from ml.interpret import _cn, _plain, _fmt
             tbl = model.get("table", "")
@@ -12156,6 +12153,10 @@ class LLMService:
             raw_pred = result.get("prediction")
             pred_txt = (_fmt(raw_pred) if isinstance(raw_pred, (int, float))
                         else str(result.get("label", "")))
+            # 表格统一两位小数；分类/聚类保留文字标签
+            pred_display = (f"{float(raw_pred):.2f}"
+                            if is_numeric_task and isinstance(raw_pred, (int, float))
+                            else str(result.get("label") or result.get("prediction") or ""))
             if mt == "kmeans":
                 lines = [f"按刚训好的「{label}」分组：{inputs} → "
                          f"归到{result.get('label', '某一组')}。",
@@ -12164,22 +12165,34 @@ class LLMService:
                 lines = [f"按刚训好的「{label}」判别：{inputs} → "
                          f"判为「{result.get('label', '')}」。",
                          "异常检测给的是离群标记，不是产量或合格数。"]
-            elif "准确率" in (model.get("metrics") or {}):
+            elif "准确率" in metrics:
                 lines = [f"按刚训好的「{label}」判别：{inputs} → "
                          f"判为「{result.get('label', '')}」。",
                          "分类给的是类别，不是数量。"]
             else:
                 tgt_cn = _plain(_cn(tbl, model.get("target", ""))) or "结果"
-                rmse = (model.get("metrics") or {}).get("RMSE")
+                rmse, mae = metrics.get("RMSE"), metrics.get("MAE")
                 lines = [f"按刚训好的「{label}」估：{inputs} → {tgt_cn}约 {pred_txt}。"]
+                # 与训练结果卡同一套口径：RMSE 是均方根误差，MAE 才是平均偏差。
+                # 写成「平均偏差 ±15.89」会和结果卡上的 MAE 13.14 当场对不上。
                 if rmse is not None:
-                    lines.append(f"模型在留出检验数据上的平均偏差约 ±{_fmt(rmse)}。")
+                    err = f"模型在留出检验数据上的均方根误差约 ±{_fmt(rmse)}（RMSE）"
+                    if mae is not None:
+                        err += f"，平均绝对偏差约 ±{_fmt(mae)}（MAE）"
+                    lines.append(err + "。")
                 lines.append("这是根据历史记录学到的关系做的量级估计，不是实际产出承诺。")
             if result.get("warnings"):
                 lines.append("注意：" + "；".join(result["warnings"]))
             explain_text = "\n".join(lines)
         except Exception:
             explain_text = ""
+        # 表格是给业务看的：输入列写中文名 + 数值，别把
+        # {"input_qty": 1200.0} 这种调试 JSON 摆到演示屏幕上。
+        row = {"输入": inputs or json.dumps(values, ensure_ascii=False),
+               "预测": pred_display or str(result.get("label", result.get("prediction")))}
+        if result.get("warnings"):
+            # 2026-10-01：缺特征/未见过的类别不再静默，结果卡「备注」列直接说明
+            row["备注"] = "；".join(result["warnings"])
         yield {"type": "done",
                "response": {
                    "type": "ml_result",
