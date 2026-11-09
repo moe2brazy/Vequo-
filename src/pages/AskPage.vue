@@ -1461,14 +1461,24 @@ const renderAgentResult = (data: any, msg?: any): string => {
       } else {
         html += '<div class="text-xs text-gray-400 mb-2"></div>'
       }
+      // 模型解读：结论先行。后端把指标、驱动因素、样本量翻成业务话术
+      //（规则路径兜底，LLM 只换措辞且要过数字白名单），样式复用数据问答的结论区。
+      // 文案里已经交代了数据折损与跨表来源，下面两个提示条就不再重复一遍。
+      const explainText = mr.explain || data.explain || ''
+      if (explainText) {
+        html += `<div class="anl-conclusion" data-anl="1">
+          <div class="anl-conclusion-title"><span class="anl-conclusion-dot"></span>模型解读</div>
+          <div class="anl-conclusion-body">${renderAnalysis(explainText)}</div>
+        </div>`
+      }
       // 跨表取数说明（如"工单表的实际产量记在工序产量表里，按工单号汇总后当目标"）：
       // 目标来自另一张表时必须说清楚，否则"预测目标 good_qty"会让人以为选错了表
-      if (mr.join_note) {
+      if (!explainText && mr.join_note) {
         html += `<div class="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1 mb-2">${esc(mr.join_note)}</div>`
       }
       // 数据说明（如"原始 5000 行，剔除含缺失值记录后剩余 3200 行（缺失最多：xxx）"）：
       // 建模数据量骤减时给出原因，避免"有效数据不足"类问题无从解释
-      if (mr.data_note) {
+      if (!explainText && mr.data_note) {
         html += `<div class="text-xs text-gray-600 bg-gray-50 border border-gray-200 rounded px-2 py-1 mb-2">${esc(mr.data_note)}</div>`
       }
       if (mr.metrics && Object.keys(mr.metrics).length > 0) {
@@ -2190,7 +2200,7 @@ const sendMessage = async (presetText?: string | Event, opts?: { noConfirm?: boo
               'SQL生成': '生成 SQL', 'SQL执行': '执行查询', 'SQL重试': '修复 SQL',
               '兜底SQL': '使用备选查询', '结果复核': '复核结果', '图表生成': '生成图表',
               '记忆检索': '检索历史记忆', '思考中': '思考', 'ML建模': '建模准备',
-              'ML方案设计': '设计建模方案', '意图分类': '分类意图',
+              'ML方案设计': '设计建模方案', 'ML解读': '归纳建模结论', '意图分类': '分类意图',
               'AI推理': 'AI 推理生成方案', '语义缓存': '命中语义缓存',
             }
             streamingStep.value = `正在${stepLabel[payload.name || ''] || payload.name || '分析'}…`

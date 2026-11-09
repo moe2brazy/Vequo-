@@ -11935,10 +11935,23 @@ class LLMService:
                 "name": result["model_name"], "features": fields, "target": target,
                 "label": result["model_label"],
             })
+            # 结果解读：把指标、驱动因素、样本量翻译成业务能看懂的话。
+            # 规则路径先出文案（零延迟），LLM 只负责换措辞且要过数字白名单校验，
+            # 全程包在 try 里 —— 解读是锦上添花，不能因为它把训练结果一起带走。
+            yield {"type": "step", "name": "ML解读", "detail": "正在把指标翻译成业务结论…"}
+            explain_text, explain_src = "", ""
+            try:
+                from ml.interpret import explain_ml_result
+                _ex = explain_ml_result(result, self.query)
+                explain_text, explain_src = _ex.get("text", ""), _ex.get("source", "")
+            except Exception as _e:
+                logging.getLogger("nl2sql").info("ML 结果解读生成失败（不影响训练结果）: %s", _e)
             yield {"type": "done",
                    "response": {
                        "type": "ml_result",
-                       "ml_result": {"success": True, **result},
+                       "ml_result": {"success": True, **result,
+                                     "explain": explain_text,
+                                     "explain_source": explain_src},
                        "model_name": result["model_name"],
                        "features": fields,
                        "target": target,

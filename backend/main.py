@@ -2358,6 +2358,14 @@ def ml_train(req: TrainRequest):
         raise HTTPException(status_code=400, detail=f"不支持的模型类型: {req.model_type}")
     try:
         result = train_model(req.table, req.target, req.features, req.model_type, req.params)
+        # 与问析链路同一套解读（规则兜底 + LLM 换措辞），接口直调也能拿到结论
+        try:
+            from ml.interpret import explain_ml_result
+            _ex = explain_ml_result(result)
+            result["explain"] = _ex.get("text", "")
+            result["explain_source"] = _ex.get("source", "")
+        except Exception as _e:
+            logging.getLogger("ml_trainer").info("结果解读生成失败（不影响训练结果）: %s", _e)
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

@@ -7,7 +7,8 @@ from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, IsolationForest
 from sklearn.cluster import KMeans
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import r2_score, accuracy_score, f1_score, silhouette_score
+from sklearn.metrics import (r2_score, accuracy_score, f1_score, silhouette_score,
+                             mean_absolute_error, mean_squared_error)
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 import matplotlib
 matplotlib.use("Agg")
@@ -53,6 +54,21 @@ def _clamp_train_params(params: dict | None) -> dict:
             continue  # 非数值直接丢弃
         cleaned[key] = max(lo, min(hi, val))
     return cleaned
+
+
+def _reg_metrics(y_true, y_pred) -> dict:
+    """回归任务的指标组。
+
+    只给 R² 业务方读不懂：0.89 到底是"差 1 件"还是"差 1 千件"说不出来。
+    补 RMSE 和 MAE，结果解读里才能写「预测值平均偏离 ±N」。
+    RMSE 对离群点更敏感，MAE 更接近日常感受，两个都留着。
+    """
+    mse = float(mean_squared_error(y_true, y_pred))
+    return {
+        "R²": round(float(r2_score(y_true, y_pred)), 4),
+        "RMSE": round(mse ** 0.5, 2),
+        "MAE": round(float(mean_absolute_error(y_true, y_pred)), 2),
+    }
 
 
 def _split_table_ref(table_name: str) -> str:
@@ -267,7 +283,7 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
         m = LinearRegression()
         m.fit(X_train, y_train)
         y_pred = m.predict(X_test)
-        metrics = {"R²": round(r2_score(y_test, y_pred), 4)}
+        metrics = _reg_metrics(y_test, y_pred)
 
     elif model_type == "decision_tree":
         is_clf = task == "classification" or (le_target is not None)
@@ -280,7 +296,7 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
             m = DecisionTreeRegressor(max_depth=5, random_state=42)
             m.fit(X_train, y_train)
             y_pred = m.predict(X_test)
-            metrics = {"R²": round(r2_score(y_test, y_pred), 4)}
+            metrics = _reg_metrics(y_test, y_pred)
 
     elif model_type == "random_forest":
         is_clf = task == "classification" or (le_target is not None)
@@ -293,7 +309,7 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
             m = RandomForestRegressor(n_estimators=100, max_depth=8, random_state=42)
             m.fit(X_train, y_train)
             y_pred = m.predict(X_test)
-            metrics = {"R²": round(r2_score(y_test, y_pred), 4)}
+            metrics = _reg_metrics(y_test, y_pred)
 
     elif model_type == "logistic":
         m = LogisticRegression(max_iter=1000, random_state=42)
@@ -378,6 +394,8 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
         "features": features,
         "target": target,
         "samples": len(df),
+        # 表名：结果解读要拿它去 field_semantics 查字段中文名（同一字段在不同表可能叫法不同）
+        "table": table,
         "charts": charts,
         # 缺失值剔除说明（无剔除为空串）：让"有效数据不足"类问题可解释
         "data_note": data_note,
