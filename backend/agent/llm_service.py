@@ -6514,6 +6514,57 @@ def _looks_like_write_request(q: str) -> bool:
     return any(re.search(p, q) for p in _WRITE_ACTION_PATTERNS)
 
 
+# ── 建模续问推理（P0）：训练完照着结果卡提示问「投入数量=1200 能出多少」──────
+# 2026-11-09 修复：这句里没有任何建模词（「能出多少」不含"预测"），规则分类只见
+# weak_data 的「多少」→ 判 data → LLM 复核也判 data → 走 SQL 查 SUM(input_qty)
+# = 3,187,009，再配一段「无法回答」的分析。_respond_ml() 里的续问判定根本没机会跑：
+# 结果卡自己印的提示，用户照做反而答非所问。
+# 判据从严，五条同时满足才算：已有模型 / 有「字段=数值」/ 该字段能落到模型特征 /
+# 无训练类动词 / 无查询类动词 / 非未来时间外推。宁可漏判（退回旧行为），不可误吞查询。
+_FOLLOWUP_TRAIN_RE = re.compile(r"训练|建模|拟合|重新训|再训|\bfit\b", re.I)
+_FOLLOWUP_QUERY_RE = re.compile(
+    r"查询|统计|列出|明细|排行|排名|筛选|查看|看看|记录|对比|汇总|趋势|分布|"
+    r"占比|图表|导出|有多少条|分别是|按.{0,6}(?:分组|排序)")
+_FOLLOWUP_FUTURE_RE = re.compile(r"下个?月|下个?季度|下周|未来|明年|后年|今后")
+_FOLLOWUP_ASSIGN_RE = re.compile(
+    r"([\u4e00-\u9fa5A-Za-z_][\u4e00-\u9fa5A-Za-z0-9_]{0,19})\s*[=:：是]\s*(-?\d+(?:\.\d+)?)")
+
+
+def _looks_like_ml_followup_predict(q: str) -> bool:
+    """刚训完模型后的续问推理：「投入数量=1200 能出多少」。
+
+    模块级函数，意图分类与 _respond_ml 共用同一套判据，避免「路由判成 ml、
+    执行端却不认」的缝隙。_get_last_ml_model 在文件后段定义，运行时取用无碍。
+    """
+    q = (q or "").strip()
+    if not q or len(q) > 80:
+        return False
+    if _FOLLOWUP_TRAIN_RE.search(q) or _FOLLOWUP_QUERY_RE.search(q):
+        return False
+    if _FOLLOWUP_FUTURE_RE.search(q):
+        return False
+    try:
+        model = _get_last_ml_model() or {}
+    except Exception:
+        return False
+    feats = [f for f in (model.get("features") or []) if isinstance(f, str) and f]
+    if not feats:
+        return False
+    try:
+        from agent.ml_plan import resolve_column
+        cols = [{"name": f} for f in feats]
+        for m in _FOLLOWUP_ASSIGN_RE.finditer(q):
+            phrase = re.sub(r"^[当把将按照依据基于以看如果假如若]+", "", m.group(1).strip())
+            if phrase in feats:
+                return True
+            col, _score = resolve_column(phrase, cols, numeric_only=False, strict=False)
+            if col:
+                return True
+    except Exception:
+        return False
+    return False
+
+
 def _classify_intent_rule(query: str) -> tuple[str, bool]:
     """规则分类，返回 (intent, confident)。confident=False 时交给 LLM 复核。"""
     q = query.strip()
@@ -6530,6 +6581,11 @@ def _classify_intent_rule(query: str) -> tuple[str, bool]:
         return "write", True
 
     has_data = any(w in q for w in _STRONG_DATA)
+
+    # 0.5 建模续问推理：必须排在 ML 强词与 data 判定之前。这类问句里没有任何
+    #     建模词，靠关键词表永远判不出 ml；高置信返回，跳过 LLM 复核（也更省时）。
+    if _looks_like_ml_followup_predict(q):
+        return "ml", True
 
     # 1. ML 建模（明确的建模意图词优先于闲聊词，避免"你好，帮我训练个模型"被吞成 chat）
     for w in _ML_WORDS_STRONG:
@@ -11709,19 +11765,11 @@ class LLMService:
     def _looks_like_ml_predict(self) -> bool:
         """这句是不是「基于刚训练好的模型做一次推理」。
 
-        三个条件同时满足才算，宁可漏判也不误判：误判会把「用计划量=1200
-        那批数据训练模型」这类真训练需求拦在门外。
+        与意图分类共用 _looks_like_ml_followup_predict（同一套判据），
+        否则会出现「路由判成 ml、执行端不认」的缝隙。判据刻意从严：
+        误判会把「用计划量=1200 那批数据训练模型」这类真训练需求拦在门外。
         """
-        try:
-            if not _get_last_ml_model():
-                return False
-        except Exception:
-            return False
-        q = self.query or ""
-        if re.search(r"训练|建模|拟合|重新训|再训|\bfit\b", q, re.I):
-            return False
-        return bool(re.search(
-            r"[\u4e00-\u9fa5A-Za-z_][\u4e00-\u9fa5A-Za-z0-9_]{0,19}\s*[=:：是]\s*-?\d+(?:\.\d+)?", q))
+        return _looks_like_ml_followup_predict(self.query or "")
 
     # 未来时间外推词：这类问法要的是「按日期往后推」，和建模模块的能力
     # （已知几个字段 → 估同一条记录的另一个字段）不是一回事。
@@ -11999,6 +12047,8 @@ class LLMService:
             _set_last_ml_model({
                 "name": result["model_name"], "features": fields, "target": target,
                 "label": result["model_label"],
+                # 续问推理要拿训练时的误差量级和表名说人话（不重训、不查库）
+                "metrics": result.get("metrics") or {}, "table": table,
             })
             # 结果解读：把指标、驱动因素、样本量翻译成业务能看懂的话。
             # 规则路径先出文案（零延迟），LLM 只负责换措辞且要过数字白名单校验，
@@ -12067,6 +12117,29 @@ class LLMService:
         if result.get("warnings"):
             # 2026-10-01：缺特征/未见过的类别不再静默，结果卡「备注」列直接说明
             row["备注"] = "；".join(result["warnings"])
+        # 人话结论：用户问的是「能出多少」，只丢一行「输入/预测」表格等于没回答。
+        # 数字全部取自本次预测 + 训练时留存的指标，确定性生成，不调 LLM、不编数。
+        explain_text = ""
+        try:
+            from ml.interpret import _cn, _plain, _fmt
+            tbl = model.get("table", "")
+            tgt_cn = _plain(_cn(tbl, model.get("target", ""))) or "结果"
+            inputs = "、".join(
+                f"{_plain(_cn(tbl, k))} {_fmt(v)}" for k, v in values.items())
+            raw_pred = result.get("prediction")
+            pred_txt = (_fmt(raw_pred) if isinstance(raw_pred, (int, float))
+                        else str(result.get("label", "")))
+            rmse = (model.get("metrics") or {}).get("RMSE")
+            lines = [f"按刚训好的「{model.get('label') or model_name}」估："
+                     f"{inputs} → {tgt_cn}约 {pred_txt}。"]
+            if rmse is not None:
+                lines.append(f"模型在留出检验数据上的平均偏差约 ±{_fmt(rmse)}。")
+            lines.append("这是根据历史记录学到的关系做的量级估计，不是实际产出承诺。")
+            if result.get("warnings"):
+                lines.append("注意：" + "；".join(result["warnings"]))
+            explain_text = "\n".join(lines)
+        except Exception:
+            explain_text = ""
         yield {"type": "done",
                "response": {
                    "type": "ml_result",
@@ -12074,6 +12147,9 @@ class LLMService:
                        "success": True,
                        "model": {"name": model_name, "label": model.get("label", model_name)},
                        "metrics": {},
+                       "features": feats,
+                       "target": model.get("target", ""),
+                       "explain": explain_text,
                        "pred_samples": [row],
                    },
                    "model_name": model_name,

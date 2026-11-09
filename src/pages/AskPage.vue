@@ -1465,9 +1465,12 @@ const renderAgentResult = (data: any, msg?: any): string => {
       //（规则路径兜底，LLM 只换措辞且要过数字白名单），样式复用数据问答的结论区。
       // 文案里已经交代了数据折损与跨表来源，下面两个提示条就不再重复一遍。
       const explainText = mr.explain || data.explain || ''
+      // 续问推理只有 pred_samples、没有训练指标，标题别再叫「模型解读」
+      const isInference = !!(mr.pred_samples && mr.pred_samples.length &&
+                             !(mr.metrics && Object.keys(mr.metrics).length))
       if (explainText) {
         html += `<div class="anl-conclusion" data-anl="1">
-          <div class="anl-conclusion-title"><span class="anl-conclusion-dot"></span>模型解读</div>
+          <div class="anl-conclusion-title"><span class="anl-conclusion-dot"></span>${isInference ? '推理结果' : '模型解读'}</div>
           <div class="anl-conclusion-body">${renderAnalysis(explainText)}</div>
         </div>`
       }
@@ -1502,7 +1505,13 @@ const renderAgentResult = (data: any, msg?: any): string => {
         html += '<div class="text-xs text-gray-400 mt-2 mb-1">预测结果</div>'
         html += renderTable(Object.keys(mr.pred_samples[0]), mr.pred_samples.slice(0, 10))
       }
-      html += '<div class="text-xs text-gray-400 mt-2">继续问"预测"可基于该模型推理；格式如：字段=数值</div>'
+      // 提示必须能照抄：给一个基于真实特征名的例子（英文列名必命中判定）。
+      // 原来那句「格式如：字段=数值」太抽象，用户照它问出的「投入数量=1200 能出多少」
+      // 因为不含建模词被判成普通查询，答了一堆不相干的 SUM。
+      const feat0 = (Array.isArray(feats) && feats.length) ? feats[0] : ''
+      html += feat0
+        ? `<div class="text-xs text-gray-400 mt-2">接着问「${esc(feat0)}=1200 能出多少」就能用这个模型估一条新记录（中文字段名也认，如「投入数量=1200」）</div>`
+        : '<div class="text-xs text-gray-400 mt-2">接着问「字段名=数值」可基于这个模型推理</div>'
     } else {
       html += `<div class="text-sm text-red-500">${esc(data.error || data.ml_result?.error || 'ML 执行失败')}</div>`
     }
