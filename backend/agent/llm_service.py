@@ -11783,7 +11783,10 @@ class LLMService:
             if ev["type"] == "thought":
                 yield ev  # 转发 token 流给前端
             elif ev["type"] == "intent":
-                intent = ev.get("intent")
+                # 校验器判非法（valid=False）时不采纳这份方案，让它落到 agent/ml_plan
+                # 的规则兜底。原来只看 intent 里有没有 data_request，非法模型名会被
+                # 当成「AI 方案」采纳，最后静默降级成线性回归还显示「方案已生成」。
+                intent = ev.get("intent") if ev.get("valid") else None
                 gen_err = ev.get("error", "")
         # 2026-09-20 修复：LLM 方案空/解析失败时**不再拿空 dict 往下跑**。
         # 旧行为：`intent={}` 照样进训练流程，于是"目标撞上关键词列、特征落一排 ID、

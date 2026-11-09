@@ -170,6 +170,8 @@ def validate_ml_intent(intent: dict) -> tuple[bool, str, dict]:
                 dropped_ops.append(op)
                 continue
             params = step.get("params", {})
+            if not isinstance(params, dict):
+                params = {}  # LLM 给了 null / 数组，后续 params.get 会抛 AttributeError
             if op == "dropna":
                 ratio = params.get("max_drop_ratio", 0.3)
                 try:
@@ -199,6 +201,8 @@ def validate_ml_intent(intent: dict) -> tuple[bool, str, dict]:
         else:
             model_def = ALLOWED_MODELS[model_name]
             user_params = mt.get("params", {})
+            if not isinstance(user_params, dict):
+                user_params = {}  # params=null 会让 `pname in user_params` 抛 TypeError
             # 校验参数范围
             sanitized_params = {}
             for pname, pdef in model_def["params"].items():
@@ -229,7 +233,9 @@ def validate_ml_intent(intent: dict) -> tuple[bool, str, dict]:
         try:
             max_rows = int(max_rows)
             os_spec["max_rows"] = max(1, min(max_rows, 1000))
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
+            # json.loads 会接受 Infinity / 1e400，int(inf) 抛 OverflowError，
+            # 原来只捕 ValueError/TypeError，异常会穿透流式生成器的解析调用。
             os_spec["max_rows"] = 100
 
     if dropped_ops:
@@ -275,17 +281,15 @@ def _parse_ml_intent(raw: str) -> tuple[dict, str]:
         if src.rstrip().endswith("```"):
             src = src.rstrip()[:-3]
 
-    # 提取 JSON 对象
-    match = re.search(r'\{[\s\S]*\}', src)
-    if not match:
-        # 输出里连一个花括号都没有（空输出 / 被截断 / 只回了段中文话术）——
-        # 这条信息比 json.loads("") 的 "Expecting value: line 1 column 1" 有用得多
+    # 只取第一个完整 JSON 对象。原贪婪正则 `\{[\s\S]*\}` 会一直吃到最后一个 }，
+    # 方案 JSON 后面跟一句解释、或输出里出现第二个对象时，json.loads 直接报
+    # "Extra data"，整轮方案作废。raw_decode 能自动停在第一个完整对象的结束处。
+    start = src.find("{")
+    if start < 0:
         return {}, f"LLM 未返回 JSON（输出 {len(src)} 字：{src[:80]!r}）"
-    raw_json = match.group(0)
-
     try:
-        intent = json.loads(raw_json)
-    except json.JSONDecodeError as e:
+        intent = json.JSONDecoder().raw_decode(src[start:])[0]
+    except (json.JSONDecodeError, ValueError) as e:
         return {}, f"LLM 生成的 JSON 格式无效: {str(e)}"
 
     valid, err, corrected = validate_ml_intent(intent)
@@ -310,8 +314,11 @@ def generate_ml_intent(query: str, schema_context: str, table_name: str = "") ->
         }
 
     if err:
+        # 校验器判出非法方案（模型不在白名单、参数越界…）时不能标 valid=True：
+        # 主链路只看 intent 里有没有 data_request，非法方案会被当成「AI 方案」采纳，
+        # 最后静默降级成线性回归，界面还写着「方案已生成」。
         return {
-            "valid": True,
+            "valid": False,
             "warning": err,
             "intent": intent,
         }
@@ -351,7 +358,13 @@ def generate_ml_intent_stream(query: str, schema_context: str, table_name: str =
 
     yield {"type": "thought_done", "step": "ML方案设计"}
 
-    intent, err = _parse_ml_intent(full.strip())
+    # 流式路径原来没有异常边界：LLM 输出 Infinity / params:null 时，
+    # _parse_ml_intent 抛的 OverflowError / AttributeError 会穿透整个生成器，
+    # 连 agent/ml_plan 的规则兜底都走不到。这里兜住，转成一次可重试的空方案。
+    try:
+        intent, err = _parse_ml_intent(full.strip())
+    except Exception as e:
+        intent, err = {}, f"意图解析异常: {e}"
     if not intent:
         # 首轮没拿到可用方案 —— 最常见的两种：思考 token 吃光 max_tokens（content 恒空）、
         # 上游抖动返回空串。再试一次：不流式、预算加大、开 JSON 模式（dashscope/deepseek
@@ -366,12 +379,15 @@ def generate_ml_intent_stream(query: str, schema_context: str, table_name: str =
         except Exception as e:
             logger.warning("ML 意图重试调用异常: %s", e)
         if retry_text:
-            intent2, err2 = _parse_ml_intent(retry_text)
+            try:
+                intent2, err2 = _parse_ml_intent(retry_text)
+            except Exception as e:
+                intent2, err2 = {}, f"重试解析异常: {e}"
             if intent2:
                 yield {"type": "thought", "step": "ML方案设计", "text": "（首轮无输出，已重试成功）"}
                 intent, err = intent2, err2
 
     if err:
-        yield {"type": "intent", "valid": True, "intent": intent, "error": err, "warning": err}
+        yield {"type": "intent", "valid": False, "intent": None, "error": err, "warning": err}
     else:
         yield {"type": "intent", "valid": True, "intent": intent, "error": ""}

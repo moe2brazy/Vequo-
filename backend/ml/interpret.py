@@ -281,6 +281,11 @@ def rule_text(facts: dict) -> str:
                 if facts.get("rmse") is not None:
                     lines.append(f"预测值与真实值平均偏离 **±{_fmt(facts['rmse'], 1)}** 左右"
                                  f"（RMSE），不是每个点都对得上。")
+            else:
+                # _safe_metrics 会把 NaN 指标转成 None（小样本 / 常数列常见）。
+                # 不给一句明示，用户会以为模型表现正常，下面的驱动因素仍照常输出。
+                lines.append("本次评估指标算不出来（目标可能接近常数，或有效样本太少），"
+                             "下面关于驱动因素的判断只作参考，先别拿它做决策。")
         else:
             body = f"按「{feat_txt}」判断「{target}」属于哪一类，样本 {samples:,} 行"
             if facts.get("test_rows"):
@@ -293,6 +298,9 @@ def rule_text(facts: dict) -> str:
                 if note:
                     s += f"，{note}"
                 lines.append(s + "。")
+            else:
+                lines.append("本次准确率无法计算（有效样本太少或目标类别不足），"
+                             "下面关于驱动因素的判断只作参考。")
 
     elif task == "clustering":
         lines.append("【这次聚类做了什么】")

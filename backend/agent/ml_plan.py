@@ -40,6 +40,11 @@ logger = logging.getLogger(__name__)
 # 「工单的实际产量」误命中 work_order_id。命中数越多越可信（见 resolve_column）。
 CN_EN_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("实际",   ("actual", "real", "finished")),
+    # 否定限定词必须排在正向词之前，靠长度优先消费（见 unmatched_discriminator）。
+    # 实测「不合格数量」曾因 "合格" in "不合格" 为真，把目标落到 good_qty，
+    # 而 defect_qty 反而被 strict 跳过，结论正好反过来。
+    ("非计划", ("unplanned",)),
+    ("不合格", ("defect", "bad", "ng")),
     ("计划",   ("plan",)),
     ("目标",   ("target", "plan")),
     ("合格",   ("good", "qualified", "ok")),
@@ -225,9 +230,13 @@ def unmatched_discriminator(phrase: str, column: str) -> str:
     "实际产量"只靠"产量"撞上 plan_qty 的 qty 是假命中，实际量根本不在这张表。
     """
     nl = (column or "").lower()
-    for cn, needles in CN_EN_HINTS:
-        if cn in _GENERIC_QUANTITY_WORDS or cn not in (phrase or ""):
+    rest = phrase or ""
+    # 长词优先 + 命中即从短语里消费掉：否则「不合格」里的「合格」会被当作第二个
+    # 正向限定词再检查一次，导致 defect_qty 被误判、good_qty 反而通过。
+    for cn, needles in sorted(CN_EN_HINTS, key=lambda kv: -len(kv[0])):
+        if cn in _GENERIC_QUANTITY_WORDS or cn not in rest:
             continue
+        rest = rest.replace(cn, "", 1)
         if not any(_token_match(n, nl) for n in needles):
             return cn
     return ""
@@ -254,9 +263,11 @@ def resolve_column(phrase: str, columns: list[dict], numeric_only: bool = False,
             continue
         nl = name.lower()
         score = 3 if (nl and nl in pl) else 0
-        for cn, needles in CN_EN_HINTS:
-            if cn in phrase and any(_token_match(n, nl) for n in needles):
+        rest = phrase
+        for cn, needles in sorted(CN_EN_HINTS, key=lambda kv: -len(kv[0])):
+            if cn in rest and any(_token_match(n, nl) for n in needles):
                 score += 1
+                rest = rest.replace(cn, "", 1)
         if not score:
             continue
         rank = _quantity_rank(name)

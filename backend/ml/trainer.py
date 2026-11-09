@@ -34,14 +34,22 @@ MODEL_TYPES = {
     "isolation":    {"name": "孤立森林",     "type": "anomaly"},
 }
 
-# ML 训练参数白名单 + 取值范围钳制（对齐 ml/executor 的安全约束，防止恶意参数打爆资源）
+# ML 训练参数白名单 + 取值范围钳制（防止恶意参数打爆资源）
+# 2026-11-09 补齐：原来只有聚类/异常检测两项，其余四类的超参传进来会被静默丢弃，
+# 用户以为设了 n_estimators=5，实际仍是硬编码的 100，界面还没有任何回执。
+# 现在四类都能配，但不传时的默认值与原硬编码完全一致（见下方各模型分支）。
 _ALLOWED_TRAIN_PARAMS = {
     "n_clusters": (2, 100),        # KMeans 聚类数：2~100（k=1 无意义，轮廓系数恒 -1）
     "contamination": (0.01, 0.5),  # IsolationForest 异常比例：(0, 0.5]
+    "n_estimators": (10, 500),     # 随机森林树数量
+    "max_depth": (1, 20),          # 决策树 / 随机森林最大深度
+    "max_iter": (100, 5000),       # 逻辑回归最大迭代
 }
+_INT_TRAIN_PARAMS = {"n_clusters", "n_estimators", "max_depth", "max_iter"}
 
 def _clamp_train_params(params: dict | None) -> dict:
     """只透传白名单内参数，并对数值做 min/max 钳制（未知/非法参数丢弃，用默认值）"""
+    import math as _math
     if not params:
         return {}
     cleaned = {}
@@ -52,7 +60,13 @@ def _clamp_train_params(params: dict | None) -> dict:
             val = float(params[key])
         except (ValueError, TypeError):
             continue  # 非数值直接丢弃
-        cleaned[key] = max(lo, min(hi, val))
+        # NaN / ±inf 能被 float() 接受，但 min/max 对 nan 的比较恒为 False，
+        # 实测 n_clusters=nan → 钳到 100 → 再被样本数钳成 29 个簇，轮廓系数 0.0125。
+        # 这类值必须整项丢弃回退默认，不能钳成边界值。
+        if not _math.isfinite(val):
+            continue
+        val = max(lo, min(hi, val))
+        cleaned[key] = int(round(val)) if key in _INT_TRAIN_PARAMS else val
     return cleaned
 
 
@@ -181,6 +195,23 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
     #   还写着「缺失值已按列中位数补齐」，自相矛盾。
     # 现在：全 NaN 列直接剔除；补齐后再校验，仍有 NaN 的列也剔除。
     rows_before = len(df)
+    # 2026-11-09 修复：整列全空的字段既不能当特征也不能当目标。
+    # 旧行为有两个坑：① 按数值列剔除 df 的列却没同步 features，df[features] 抛 KeyError；
+    # ② 全 NULL 的列是 object dtype，连剔除都不发生，被 LabelEncoder 编成常数特征，
+    #    实测能训出 R²=1.0 的假模型而界面毫无提示。两种都必须在这里拦住。
+    _empty_cols = [c for c in df.columns if df[c].isna().all()]
+    if target and target in _empty_cols:
+        raise ValueError(f"目标列「{target}」全为空值，无法训练，请换一个字段")
+    _lost = [f for f in features if f in _empty_cols]
+    if _lost:
+        raise ValueError(f"特征列全为空值，无法用于建模：{', '.join(_lost)}（请换成有数据的字段）")
+    _absent = [f for f in features if f not in df.columns]
+    if _absent:
+        raise ValueError(f"特征列在表里不存在：{', '.join(_absent)}")
+    if target and task != "clustering" and target not in df.columns:
+        raise ValueError(f"目标列「{target}」不在表 {table} 里，请换一个字段")
+    if _empty_cols:
+        df = df.drop(columns=_empty_cols)
     _na_counts = df.isna().sum()
     _num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     if task in ("clustering", "anomaly"):
@@ -212,7 +243,10 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
         _worst = _na_counts.idxmax()
         data_note = f"原始 {rows_before} 行，缺失值已按列中位数补齐（缺失最多：{_worst}）"
     # 脱敏：剥离敏感列（对齐 ml/executor）；目标/特征列涉敏则直接拒绝训练
-    dropped = [c for c in df.columns if any(s in c.lower() for s in _SENSITIVE_COLUMNS)]
+    # 精确列名匹配，不能用子串：实测 "key" 会命中 is_key_process（关键工序标识）、
+    # keyword、monkey，把正常业务列当成敏感字段拒绝训练，且 dropped 恒等于
+    # features+target 的子集，下面 df.drop 那行实际永远不可达。
+    dropped = [c for c in df.columns if c.lower() in _SENSITIVE_COLUMNS]
     if dropped:
         missing = [c for c in (features + ([target] if target else [])) if c in dropped]
         if missing:
@@ -239,6 +273,12 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
     is_clf = False
     if target and task != "clustering":
         y_raw = df[target]
+        # 线性回归的目标必须是数值：文本目标会在 sklearn 内部转成 float 时抛
+        # "could not convert string to float"，英文异常经端点 str(e) 原样上屏。
+        if task == "regression" and not pd.api.types.is_numeric_dtype(y_raw):
+            raise ValueError(
+                f"「{target}」是文本字段，线性回归需要数值型目标；"
+                "请换成数值字段，或改用决策树／随机森林（它们可自动按分类处理）")
         if task == "classification" or (task == "both" and not pd.api.types.is_numeric_dtype(y_raw)):
             le_target = LabelEncoder()
             y = le_target.fit_transform(y_raw.astype(str))
@@ -288,12 +328,12 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
     elif model_type == "decision_tree":
         is_clf = task == "classification" or (le_target is not None)
         if is_clf:
-            m = DecisionTreeClassifier(max_depth=5, random_state=42)
+            m = DecisionTreeClassifier(max_depth=params.get("max_depth", 5), random_state=42)
             m.fit(X_train, y_train)
             y_pred = m.predict(X_test)
             metrics = {"准确率": round(accuracy_score(y_test, y_pred), 4), "F1": round(f1_score(y_test, y_pred, average="weighted"), 4)}
         else:
-            m = DecisionTreeRegressor(max_depth=5, random_state=42)
+            m = DecisionTreeRegressor(max_depth=params.get("max_depth", 5), random_state=42)
             m.fit(X_train, y_train)
             y_pred = m.predict(X_test)
             metrics = _reg_metrics(y_test, y_pred)
@@ -301,18 +341,20 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
     elif model_type == "random_forest":
         is_clf = task == "classification" or (le_target is not None)
         if is_clf:
-            m = RandomForestClassifier(n_estimators=100, max_depth=8, random_state=42)
+            m = RandomForestClassifier(n_estimators=params.get("n_estimators", 100),
+                                       max_depth=params.get("max_depth", 8), random_state=42)
             m.fit(X_train, y_train)
             y_pred = m.predict(X_test)
             metrics = {"准确率": round(accuracy_score(y_test, y_pred), 4), "F1": round(f1_score(y_test, y_pred, average="weighted"), 4)}
         else:
-            m = RandomForestRegressor(n_estimators=100, max_depth=8, random_state=42)
+            m = RandomForestRegressor(n_estimators=params.get("n_estimators", 100),
+                                      max_depth=params.get("max_depth", 8), random_state=42)
             m.fit(X_train, y_train)
             y_pred = m.predict(X_test)
             metrics = _reg_metrics(y_test, y_pred)
 
     elif model_type == "logistic":
-        m = LogisticRegression(max_iter=1000, random_state=42)
+        m = LogisticRegression(max_iter=params.get("max_iter", 1000), random_state=42)
         m.fit(X_train, y_train)
         y_pred = m.predict(X_test)
         metrics = {"准确率": round(accuracy_score(y_test, y_pred), 4), "F1": round(f1_score(y_test, y_pred, average="weighted"), 4)}
@@ -359,6 +401,9 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
         import numpy as _np
         coef = _np.abs(m.coef_).mean(axis=0) if m.coef_.ndim > 1 else _np.abs(m.coef_)
         importance = {features[i]: round(float(coef[i]), 4) for i in range(len(features))}
+    # 与 metrics 对称：importance 里的 NaN 会变成裸 NaN 非法 JSON，
+    # 前端 JSON.parse 直接抛错、整个结果卡卡在「建模中」。
+    importance = _safe_metrics(importance)
 
     # 保存模型（key 按库隔离，切库后旧库模型不可见）
     name = f"{model_type}_{table}_{target or 'nosup'}"
@@ -370,7 +415,9 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
 
     # 可视化
     charts = {}
-    charts["importance"] = _plot_importance(importance, info["name"])
+    # _safe_metrics 会把非有限值转成 None，画图前先剔除，避免 abs(None) 抛 TypeError
+    charts["importance"] = _plot_importance(
+        {k: v for k, v in importance.items() if v is not None}, info["name"])
     if model_type not in ("kmeans", "isolation") and y_test is not None and y_pred is not None:
         # 2026-10-03 修复：分类任务的 y 是 LabelEncoder 编码后的 0..K-1 整数，
         # 直接画图横轴是「0/1/2」而不是「合格/不合格/缺陷」，用户完全看不懂。
@@ -408,7 +455,11 @@ def train_model(table: str, target: str, features: list[str], model_type: str,
 def _ident_ok(name: str) -> bool:
     """表名/列名白名单校验（拼进 SQL 前的最后一道，和 llm_service._get_db_columns 同口径）"""
     import re
-    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name or ""))
+    # schema.table 是合法表名（get_numeric_tables 对非 public schema 会带前缀），
+    # 逐段校验，与 _split_table_ref 同口径；否则跨表建模在非 public schema 下全被否掉。
+    parts = (name or "").split(".")
+    return bool(parts[0]) and all(
+        re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", p or "") for p in parts)
 
 
 def is_unique_column(table: str, column: str, limit: int = 5000) -> bool:
@@ -481,9 +532,15 @@ def predict(model_name: str, data: dict) -> dict:
                 warnings.append(f"「{f}」的取值 {val!r} 未在训练数据中出现过，已按类别「{le.classes_[0]}」处理")
                 val = le.transform([le.classes_[0]])[0]
         try:
-            X.append(float(val) if val is not None else 0)
+            _v = float(val) if val is not None else 0.0
         except (ValueError, TypeError):
             raise ValueError(f"预测输入字段 '{f}' 的值无法转为数值: {val!r}")
+        # float('nan') / float('inf') 都不抛异常，会一路进 scaler.transform，
+        # 最后由 sklearn 抛 "Input X contains NaN" 之类的英文内部错误糊到界面。
+        import math as _math
+        if not _math.isfinite(_v):
+            raise ValueError(f"预测输入字段 '{f}' 必须是有限数值，收到 {val!r}")
+        X.append(_v)
     # 传 DataFrame 保持与训练时 fit 的特征名一致（传 list 会触发 sklearn 的
     # "X does not have valid feature names" 警告刷屏控制台）
     X_scaled = scaler.transform(pd.DataFrame([X], columns=features))
