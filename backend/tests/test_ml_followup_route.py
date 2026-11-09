@@ -33,7 +33,7 @@ from sklearn.preprocessing import StandardScaler
 from ml.trainer import _MODEL_STORE, _store_key
 from agent.llm_service import (
     LLMService, _set_last_ml_model, _classify_intent, _classify_intent_rule,
-    _looks_like_ml_followup_predict,
+    _looks_like_ml_followup_predict, _ml_next_prompt,
 )
 
 PASS, FAIL = 0, 0
@@ -147,6 +147,56 @@ rec("结论不承诺实际产出", "", "不是实际产出承诺", ex, "不是�
 rec("结果带 features 供前端拼提示", "", "input_qty", mr.get("features"),
     "input_qty" in (mr.get("features") or []))
 rec("推理结果不带训练指标", "", "{}", mr.get("metrics"), mr.get("metrics") == {})
+
+
+print("\n=== 5. 续问提示按任务类型分发 ===")
+cases = [
+    ("回归", {"model_type": "linear", "features": ["input_qty"], "metrics": {"R²": 0.9988}},
+     "input_qty=1200 能出多少"),
+    ("聚类", {"model_type": "kmeans", "features": ["input_qty", "good_qty"],
+             "metrics": {"轮廓系数": 0.4532}}, "input_qty=1200 归到哪一组"),
+    ("异常检测", {"model_type": "isolation", "features": ["input_qty"],
+               "metrics": {"异常比例": 0.1}}, "input_qty=1200 是不是异常"),
+    ("分类", {"model_type": "logistic", "features": ["sample_qty"],
+             "metrics": {"准确率": 0.9}}, "sample_qty=1200 会判成哪一类"),
+]
+for name, res, expect in cases:
+    got = _ml_next_prompt(res)
+    rec(f"{name}提示：{expect}", name, expect, got, got == expect)
+rec("无特征时不给提示", "", "", _ml_next_prompt({"features": []}),
+    _ml_next_prompt({"features": []}) == "")
+
+
+print("\n=== 6. 聚类模型的续问不写「约 簇 2」 ===")
+
+
+class _FakeKMeans:
+    def predict(self, X):
+        return [2]
+
+
+_km_cols = ["input_qty", "good_qty", "defect_qty", "rework_qty"]
+_km_X = pd.DataFrame({c: [100.0, 200.0, 300.0] for c in _km_cols})
+_NAME_KM = "unit_test_kmeans"
+_MODEL_STORE[_store_key(_NAME_KM)] = {
+    "model": _FakeKMeans(), "encoders": {}, "scaler": StandardScaler().fit(_km_X),
+    "le_target": None, "features": _km_cols, "model_type": "kmeans",
+    "model_label": "KMeans聚类",
+}
+_set_last_ml_model({
+    "name": _NAME_KM, "features": _km_cols, "target": "", "label": "KMeans聚类",
+    "model_type": "kmeans", "table": "mes_process_output",
+    "metrics": {"轮廓系数": 0.4532, "聚类数": 3},
+})
+last_km = None
+for ev in LLMService("input_qty=1200 能出多少")._ml_predict({}):
+    if ev.get("type") == "done":
+        last_km = ev
+ex_km = ((last_km or {}).get("response", {}).get("ml_result") or {}).get("explain") or ""
+rec("聚类续问出结论", "", "非空", ex_km[:60], bool(ex_km))
+rec("结论说归到某组", "", "归到", ex_km, "归到" in ex_km)
+rec("不写「约 簇」", "", "不含", ex_km, "约 簇" not in ex_km)
+rec("不写产出承诺", "", "不含", ex_km, "产出承诺" not in ex_km)
 
 print(f"\n{'=' * 56}\nTOTAL pass={PASS} fail={FAIL}")
 sys.exit(1 if FAIL else 0)

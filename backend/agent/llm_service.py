@@ -6565,6 +6565,28 @@ def _looks_like_ml_followup_predict(q: str) -> bool:
     return False
 
 
+def _ml_next_prompt(result: dict) -> str:
+    """结果卡末尾「接着问…」的例子，按任务类型生成，前端只负责显示。
+
+    2026-11-09：原来前端无条件拼「{第一个特征}=1200 能出多少」，于是 KMeans、
+    IsolationForest 的结果卡也写着「估一条新记录」—— 它们没有目标列，根本估不出
+    产出；推理结果卡自己又贴一遍，纯噪音。统一在这里给可照抄的正确问法。
+    """
+    feats = [f for f in (result.get("features") or []) if isinstance(f, str) and f]
+    if not feats:
+        return ""
+    f0 = feats[0]
+    mt = str(result.get("model_type") or "").lower()
+    if mt == "kmeans":
+        return f"{f0}=1200 归到哪一组"
+    if mt == "isolation":
+        return f"{f0}=1200 是不是异常"
+    # 分类任务的 metrics 有「准确率」，回归是 R²/RMSE/MAE
+    if "准确率" in (result.get("metrics") or {}):
+        return f"{f0}=1200 会判成哪一类"
+    return f"{f0}=1200 能出多少"
+
+
 def _classify_intent_rule(query: str) -> tuple[str, bool]:
     """规则分类，返回 (intent, confident)。confident=False 时交给 LLM 复核。"""
     q = query.strip()
@@ -12047,8 +12069,9 @@ class LLMService:
             _set_last_ml_model({
                 "name": result["model_name"], "features": fields, "target": target,
                 "label": result["model_label"],
-                # 续问推理要拿训练时的误差量级和表名说人话（不重训、不查库）
+                # 续问推理要拿训练时的误差量级、模型类型和表名说人话（不重训、不查库）
                 "metrics": result.get("metrics") or {}, "table": table,
+                "model_type": result.get("model_type", ""),
             })
             # 结果解读：把指标、驱动因素、样本量翻译成业务能看懂的话。
             # 规则路径先出文案（零延迟），LLM 只负责换措辞且要过数字白名单校验，
@@ -12066,7 +12089,8 @@ class LLMService:
                        "type": "ml_result",
                        "ml_result": {"success": True, **result,
                                      "explain": explain_text,
-                                     "explain_source": explain_src},
+                                     "explain_source": explain_src,
+                                     "next_prompt": _ml_next_prompt(result)},
                        "model_name": result["model_name"],
                        "features": fields,
                        "target": target,
@@ -12119,22 +12143,38 @@ class LLMService:
             row["备注"] = "；".join(result["warnings"])
         # 人话结论：用户问的是「能出多少」，只丢一行「输入/预测」表格等于没回答。
         # 数字全部取自本次预测 + 训练时留存的指标，确定性生成，不调 LLM、不编数。
+        # 聚类/异常检测/分类没有「产出」这回事，结论必须换说法，否则会写出
+        # 「合格数量约 簇 2」这种荒谬句子。
+        mt = str(model.get("model_type") or "").lower()
+        label = model.get("label") or model_name
         explain_text = ""
         try:
             from ml.interpret import _cn, _plain, _fmt
             tbl = model.get("table", "")
-            tgt_cn = _plain(_cn(tbl, model.get("target", ""))) or "结果"
             inputs = "、".join(
                 f"{_plain(_cn(tbl, k))} {_fmt(v)}" for k, v in values.items())
             raw_pred = result.get("prediction")
             pred_txt = (_fmt(raw_pred) if isinstance(raw_pred, (int, float))
                         else str(result.get("label", "")))
-            rmse = (model.get("metrics") or {}).get("RMSE")
-            lines = [f"按刚训好的「{model.get('label') or model_name}」估："
-                     f"{inputs} → {tgt_cn}约 {pred_txt}。"]
-            if rmse is not None:
-                lines.append(f"模型在留出检验数据上的平均偏差约 ±{_fmt(rmse)}。")
-            lines.append("这是根据历史记录学到的关系做的量级估计，不是实际产出承诺。")
+            if mt == "kmeans":
+                lines = [f"按刚训好的「{label}」分组：{inputs} → "
+                         f"归到{result.get('label', '某一组')}。",
+                         "分组只按数值相似度归堆，不代表这一组是好还是坏。"]
+            elif mt == "isolation":
+                lines = [f"按刚训好的「{label}」判别：{inputs} → "
+                         f"判为「{result.get('label', '')}」。",
+                         "异常检测给的是离群标记，不是产量或合格数。"]
+            elif "准确率" in (model.get("metrics") or {}):
+                lines = [f"按刚训好的「{label}」判别：{inputs} → "
+                         f"判为「{result.get('label', '')}」。",
+                         "分类给的是类别，不是数量。"]
+            else:
+                tgt_cn = _plain(_cn(tbl, model.get("target", ""))) or "结果"
+                rmse = (model.get("metrics") or {}).get("RMSE")
+                lines = [f"按刚训好的「{label}」估：{inputs} → {tgt_cn}约 {pred_txt}。"]
+                if rmse is not None:
+                    lines.append(f"模型在留出检验数据上的平均偏差约 ±{_fmt(rmse)}。")
+                lines.append("这是根据历史记录学到的关系做的量级估计，不是实际产出承诺。")
             if result.get("warnings"):
                 lines.append("注意：" + "；".join(result["warnings"]))
             explain_text = "\n".join(lines)
@@ -12147,6 +12187,7 @@ class LLMService:
                        "success": True,
                        "model": {"name": model_name, "label": model.get("label", model_name)},
                        "metrics": {},
+                       "model_type": mt,
                        "features": feats,
                        "target": model.get("target", ""),
                        "explain": explain_text,

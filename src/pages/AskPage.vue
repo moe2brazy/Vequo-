@@ -1505,13 +1505,15 @@ const renderAgentResult = (data: any, msg?: any): string => {
         html += '<div class="text-xs text-gray-400 mt-2 mb-1">预测结果</div>'
         html += renderTable(Object.keys(mr.pred_samples[0]), mr.pred_samples.slice(0, 10))
       }
-      // 提示必须能照抄：给一个基于真实特征名的例子（英文列名必命中判定）。
-      // 原来那句「格式如：字段=数值」太抽象，用户照它问出的「投入数量=1200 能出多少」
-      // 因为不含建模词被判成普通查询，答了一堆不相干的 SUM。
-      const feat0 = (Array.isArray(feats) && feats.length) ? feats[0] : ''
-      html += feat0
-        ? `<div class="text-xs text-gray-400 mt-2">接着问「${esc(feat0)}=1200 能出多少」就能用这个模型估一条新记录（中文字段名也认，如「投入数量=1200」）</div>`
-        : '<div class="text-xs text-gray-400 mt-2">接着问「字段名=数值」可基于这个模型推理</div>'
+      // 提示只在「训练结果卡」出现，问法由后端按任务类型给（next_prompt）。
+      // 旧版无条件拼「{feat0}=1200 能出多少」，聚类/异常检测也照贴 —— 它们没有
+      // 目标列，估不出产出；推理结果卡自己又贴一遍，等于每张卡都有同一句。
+      if (!isInference) {
+        const nextQ = mr.next_prompt || data.next_prompt || ''
+        if (nextQ) {
+          html += `<div class="text-xs text-gray-400 mt-2">接着问「${esc(nextQ)}」就能用这个模型推一条新记录（中文字段名也认）</div>`
+        }
+      }
     } else {
       html += `<div class="text-sm text-red-500">${esc(data.error || data.ml_result?.error || 'ML 执行失败')}</div>`
     }

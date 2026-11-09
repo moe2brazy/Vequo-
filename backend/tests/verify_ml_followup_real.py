@@ -25,6 +25,7 @@ print("训练:", res["model_label"], res["metrics"], "features=", res["features"
 _set_last_ml_model({
     "name": res["model_name"], "features": res["features"], "target": res["target"],
     "label": res["model_label"], "metrics": res["metrics"], "table": TABLE,
+    "model_type": res.get("model_type", ""),
 })
 
 q = "投入数量=1200 能出多少"
