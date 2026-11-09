@@ -11706,11 +11706,39 @@ class LLMService:
                             "tables": db_tables,
                             "total_rows": total_rows}}
 
+    def _looks_like_ml_predict(self) -> bool:
+        """这句是不是「基于刚训练好的模型做一次推理」。
+
+        三个条件同时满足才算，宁可漏判也不误判：误判会把「用计划量=1200
+        那批数据训练模型」这类真训练需求拦在门外。
+        """
+        try:
+            if not _get_last_ml_model():
+                return False
+        except Exception:
+            return False
+        q = self.query or ""
+        if re.search(r"训练|建模|拟合|重新训|再训|\bfit\b", q, re.I):
+            return False
+        return bool(re.search(
+            r"[\u4e00-\u9fa5A-Za-z_][\u4e00-\u9fa5A-Za-z0-9_]{0,19}\s*[=:：是]\s*-?\d+(?:\.\d+)?", q))
+
     def _respond_ml(self) -> Generator[dict, None, None]:
         """对话式机器学习建模：自然语言 → 训练/预测 → 返回指标与图表"""
         from ml.trainer import train_model, get_numeric_tables
 
         yield {"type": "step", "name": "ML建模", "detail": "正在理解建模需求…"}
+
+        # 0. 续问推理优先，且必须在「找表 / LLM 设计建模方案」之前判定。
+        # 2026-11-09 修复：原判定在方案生成之后，条件是 LLM 给出的 intent_type == "predict"。
+        # 但「计划数量=1200 时的预测结果」这类续问会被 LLM 判成一次训练任务，于是系统
+        # 去解析「结果」这个不存在的列，报「『结果』在 mes_work_order 里没有对应的数值列」——
+        # 结果卡上那句「继续问预测可基于该模型推理」的提示，按它照做反而报错。
+        # 现在不依赖 LLM 分类：已有模型 + 句子里带「字段=数值」+ 没有训练类动词 → 直接推理。
+        # 顺带省掉一次方案生成的 LLM 往返（实测 20 秒以上）。
+        if self._looks_like_ml_predict():
+            yield from self._ml_predict({})
+            return
 
         # 1. 匹配候选表（优先关键词匹配，回退到可建模表列表）
         try:
