@@ -322,8 +322,19 @@ def rule_text(facts: dict) -> str:
                     s += f"，{note}"
                 lines.append(s + "。")
                 if facts.get("rmse") is not None:
-                    lines.append(f"预测值与真实值平均偏离 **±{_fmt(facts['rmse'], 1)}** 左右"
-                                 f"（RMSE），不是每个点都对得上。")
+                    # 别把 RMSE 叫「平均偏离」：它是误差平方再开方，对大误差加权，
+                    # 数值上恒 ≥ MAE。实测这组 RMSE 14.76 / MAE 10.57，写成
+                    # 「平均偏离 ±14.8」会让人以为每条平均差 14.8 件，对不上账。
+                    err = f"检验集上的均方根误差 **±{_fmt(facts['rmse'], 1)}**（RMSE）"
+                    if facts.get("mae") is not None:
+                        err += f"，平均绝对偏差 **±{_fmt(facts['mae'], 1)}**（MAE）"
+                    lines.append(err + "，个别记录会差得比这更多。")
+                if mv >= 0.99 and len(feats) == 1:
+                    # 单输入 + 接近满分的拟合，多半是账本关系（实测
+                    # good_qty ≈ input_qty − 不良 − 返工 − 损耗），不是模型找到了
+                    # 生产规律。不否定结果，只把核对义务写进解读，答辩时经得起问。
+                    lines.append("拟合度接近满分时先核对一件事：如果目标本来就能由这个输入"
+                                 "加减几个数算出来，模型复述的是记账规则，不是找到了生产规律。")
             else:
                 # _safe_metrics 会把 NaN 指标转成 None（小样本 / 常数列常见）。
                 # 不给一句明示，用户会以为模型表现正常，下面的驱动因素仍照常输出。
