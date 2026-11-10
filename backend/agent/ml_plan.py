@@ -167,7 +167,11 @@ def numeric_feature_pool(columns: list[dict]) -> list[str]:
 
 # ====== 问句解析 =========================================================
 
-_FEATURE_MARKERS = ("根据", "依据", "按照", "基于", "以", "看")
+# 「按」必须排在「按照」之后：rfind 从后往前找，先命中的标记才生效，
+# 「按照投入数量」不能被拆成「照投入数量」。2026-11-10 补「按」：
+# 演示句「用工序产量表按投入数量预测合格数量」原来解析不出特征，
+# 只能靠 AI 方案施舍，AI 一旦多给几列就变成账本恒等式。
+_FEATURE_MARKERS = ("根据", "依据", "按照", "按", "基于", "以", "看")
 _CLAUSE_SPLIT = re.compile(r"[，,。;；!！?？\n]")
 _PREDICT_WORDS = ("预测", "预估", "推算")
 
@@ -374,9 +378,13 @@ def build_fallback_intent(query: str, table: str, columns: list[dict]) -> dict:
                 features.append(fcol)
         if features:
             notes.append(f"特征来自问句「{feat_phrase}」→ {'、'.join(features)}")
-    for c in numeric:
-        if c != target and c not in features:
-            features.append(c)
+    # 问句点名了特征就不再补全（与 apply_query_override 同一条规矩）。
+    # 旧行为无条件补齐所有数值列，于是「按投入数量预测合格数量」会带上
+    # defect_qty / rework_qty，三列账本凑成恒等式，R²=1.0 —— 满分假模型。
+    if not features:
+        for c in numeric:
+            if c != target and c not in features:
+                features.append(c)
     if not features:
         features = [c for c in pool if c != target][:8]
     features = features[:8]
@@ -453,9 +461,12 @@ def apply_query_override(intent: dict, query: str, columns: list[dict]) -> tuple
     feat_cols = resolve_feature_columns(feat_phrase, columns) if feat_phrase else []
     feat_cols = [c for c in feat_cols if c != target]
     if feat_cols:
-        fields = [f for f in (dr.get("fields") or []) if isinstance(f, str)]
-        dr["fields"] = feat_cols + [f for f in fields if f not in feat_cols and f != target]
-        notes.append(f"特征补入 {'、'.join(feat_cols)}")
+        # 问句点名了依据列 → 只用手点的，丢掉 AI 额外塞的列。
+        # 旧行为是「点名列排最前 + 保留其余」，实测线上把「按投入数量预测合格数量」
+        # 补成 投入/不良/返工/班次 四列，三列账本凑成恒等式，R²=1.0，
+        # 模型变成复述记账规则 —— 看着满分，其实不能当预测用。
+        dr["fields"] = feat_cols
+        notes.append(f"特征按问句收敛为 {'、'.join(feat_cols)}")
 
     real = {c.get("name") for c in columns}
     drop_set = {c.get("name") for c in columns
